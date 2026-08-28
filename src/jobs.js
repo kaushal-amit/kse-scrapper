@@ -259,7 +259,18 @@ async function fastLoop(runId) {
 
   let fired = 0;
   let snapshots = 0;
+  let shapeErrors = 0;
   const toPush = [];
+
+  // Evaluation is off for this process — a shape mismatch does not fix itself
+  // mid-session. The writer above still ran.
+  if (evaluationDisabled) {
+    return {
+      extracted: 0, inserted: 0, rejected: 0,
+      status: 'PARTIAL',
+      skipped: 'evaluation disabled after repeated shape errors',
+    };
+  }
 
   for (const { symbol, slot } of held) {
     const { rows } = await query(
@@ -271,7 +282,40 @@ async function fastLoop(runId) {
     if (rows.length < 2) continue;          // nothing to compare yet
     const [now, prev] = rows;
 
-    for (const hit of signals.evaluate(prev, now)) {
+    /**
+     * A SHAPE ERROR MEANS THE CHECKS ARE MEANINGLESS.
+     *
+     * It throws rather than degrading, because a row of the wrong shape makes
+     * every check silently return null — which is how three of the seven could
+     * not fire for weeks while the system looked normal.
+     *
+     * But a shape mismatch needs a redeploy to fix, so retrying it every 20
+     * seconds is 810 identical failures in one session, burying every other log
+     * line. After 20 consecutive, evaluation stops for THIS PROCESS: one loud
+     * line naming the column, then silence.
+     *
+     * The writer keeps running. symbol_minute still fills, so nothing is lost
+     * from the record — only the evaluation of it.
+     */
+    let hits;
+    try {
+      hits = signals.evaluate(prev, now);
+      shapeErrors = 0;
+    } catch (err) {
+      if (!err.shapeError) throw err;
+      shapeErrors += 1;
+      lastShapeError = err;
+      if (shapeErrors >= SHAPE_ERROR_LIMIT) {
+        evaluationDisabled = true;
+        log.error('signals.fast: evaluation DISABLED for this process after '
+          + `${SHAPE_ERROR_LIMIT} consecutive shape errors. symbol_minute rows `
+          + `are still being written.\n  Missing column: ${(err.missingColumns || []).join(', ')}`
+          + '\n  Restart after fixing the writer.');
+      }
+      continue;
+    }
+
+    for (const hit of hits) {
       // ON CONFLICT DO NOTHING: the loop may see the same pair twice if a
       // capture is late, and one condition is one signal.
       const res = await query(
@@ -309,7 +353,12 @@ async function fastLoop(runId) {
    * With held.length there, both read as "8 examined, none fired" and a dead
    * writer is indistinguishable from a quiet market.
    */
-  return { extracted: snapshots, inserted: fired, rejected: 0 };
+  return {
+    extracted: snapshots,
+    inserted: fired,
+    rejected: 0,
+    ...(shapeErrors ? { status: 'PARTIAL', shapeErrors } : {}),
+  };
 }
 
 /**
@@ -324,6 +373,18 @@ async function fastLoop(runId) {
  * The count carries the time, so no clock is needed — at 20 seconds a tick, 180
  * runs IS an hour.
  */
+/**
+ * Shape-error state, per process.
+ *
+ * PARTIAL rather than SKIPPED when disabled: the writer ran and evaluation did
+ * not, which is exactly what PARTIAL means. SKIPPED already means "outside the
+ * window or wrong mode", and overloading it would make "why did signals skip"
+ * a two-answer question.
+ */
+const SHAPE_ERROR_LIMIT = Number(process.env.SIG_SHAPE_ERROR_LIMIT || 20);
+let evaluationDisabled = false;
+let lastShapeError = null;
+
 let fastLoopEmptyRuns = 0;
 const fastLoopSeenToday = new Map();
 

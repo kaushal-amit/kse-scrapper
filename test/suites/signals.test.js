@@ -1,9 +1,40 @@
 // The seven checks, at their thresholds and just either side of them.
 const sig=require('../../src/signals');
 let p=0,n=0;const ck=(t,c,x)=>{n++;if(c)p++;else console.log('  FAIL:',t,JSON.stringify(x))};
-const snap=(o={})=>({symbol:'ABAR',bid:175,bid_qty:50000,offer:177,offer_qty:50000,
-  last_price:176,volume:1000000,trades:100,bid_age_secs:3600,captured_at:new Date(),...o});
+// ─── THE FIXTURE IS BUILT FROM THE TABLE, NOT WRITTEN BY HAND ──────────────
+//
+// The previous version returned an object with `volume` — a column
+// symbol_minute does not have. Every one of these 32 assertions passed while
+// WALL_PLACED, WALL_PULLED and FROZEN could never fire on a real row.
+//
+//   A test that constructs its own input proves the logic.
+//   It proves nothing about the wiring.
+//
+// snap() now starts from the ACTUAL column list, so a property that does not
+// exist cannot be introduced by a fixture.
+const db=require('../../src/db/pool');
+let COLS=[];
+const snap=(o={})=>{
+  const r={};
+  for(const c of COLS) r[c]=null;
+  Object.assign(r,{symbol:'ABAR',bid:175,bid_qty:50000,offer:177,offer_qty:50000,
+    last_price:176,volume_delta:0,bid_age_secs:3600,ts:new Date()});
+  for(const k of Object.keys(o)){
+    if(!(k in r)) throw new Error(`fixture used \`${k}\`, which is not a symbol_minute column`);
+    r[k]=o[k];
+  }
+  return r;
+};
 const names=(r)=>r.map(x=>x.signal).sort();
+
+(async()=>{
+COLS=(await db.query(
+  "select column_name from information_schema.columns where table_name='symbol_minute' order by ordinal_position"
+)).rows.map(r=>r.column_name);
+ck('the fixture is built from '+COLS.length+' real columns', COLS.length===18, COLS.length);
+ck('and symbol_minute has NO `volume` column — the bug', !COLS.includes('volume'));
+ck('it has volume_delta instead', COLS.includes('volume_delta'));
+
 
 // ── 10 · NO PROTECTION, bid < 20,000 ──
 ck('19,999 fires', !!sig.noProtection(snap(),snap({bid_qty:19999})));
@@ -31,19 +62,19 @@ ck('zero offer_qty does not divide by zero',
    sig.buyersRatio(snap({offer_qty:0}),snap({offer_qty:0}))===null);
 
 // ── 12/13 · WALL PLACED / PULLED, only WITHOUT volume ──
-const placed=sig.wallPlaced(snap({offer_qty:50000,volume:1000000}),
-                            snap({offer_qty:250000,volume:1000000}));
+const placed=sig.wallPlaced(snap({offer_qty:50000,volume_delta:0}),
+                            snap({offer_qty:250000,volume_delta:0}));
 ck('offer grows with no volume -> WALL_PLACED', !!placed, placed);
 ck('added size reported', placed && placed.added===200000, placed&&placed.added);
 ck('offer grows WITH volume -> not a wall',
-   sig.wallPlaced(snap({offer_qty:50000,volume:1000000}),
-                  snap({offer_qty:250000,volume:1005000}))===null);
-const pulled=sig.wallPulled(snap({offer_qty:250000,volume:1000000}),
-                            snap({offer_qty:50000,volume:1000000}));
+   sig.wallPlaced(snap({offer_qty:50000,volume_delta:0}),
+                  snap({offer_qty:250000,volume_delta:5000}))===null);
+const pulled=sig.wallPulled(snap({offer_qty:250000,volume_delta:0}),
+                            snap({offer_qty:50000,volume_delta:0}));
 ck('offer falls with no volume -> WALL_PULLED', !!pulled, pulled);
 ck('offer falls WITH volume -> ordinary trading',
-   sig.wallPulled(snap({offer_qty:250000,volume:1000000}),
-                  snap({offer_qty:50000,volume:1200000}))===null);
+   sig.wallPulled(snap({offer_qty:250000,volume_delta:0}),
+                  snap({offer_qty:50000,volume_delta:200000}))===null);
 
 // ── 14 · BAIT BID, > 100,000 and < 5 minutes old ──
 ck('150k at 60s fires', !!sig.baitBid(snap(),snap({bid_qty:150000,bid_age_secs:60})));
@@ -56,40 +87,60 @@ ck('an OLD big bid is a real buyer, not bait',
 
 // ── 15 · FROZEN, both > 100,000 with no volume ──
 ck('both large, nothing traded -> FROZEN',
-   !!sig.frozen(snap({volume:1000000}),snap({bid_qty:150000,offer_qty:150000,volume:1000000})));
+   !!sig.frozen(snap({volume_delta:0}),snap({bid_qty:150000,offer_qty:150000,volume_delta:0})));
 ck('both large but TRADING -> not frozen',
-   sig.frozen(snap({volume:1000000}),snap({bid_qty:150000,offer_qty:150000,volume:1000500}))===null);
+   sig.frozen(snap({volume_delta:0}),snap({bid_qty:150000,offer_qty:150000,volume_delta:500}))===null);
 ck('only one side large -> not frozen',
-   sig.frozen(snap({volume:1000000}),snap({bid_qty:150000,offer_qty:50000,volume:1000000}))===null);
+   sig.frozen(snap({volume_delta:0}),snap({bid_qty:150000,offer_qty:50000,volume_delta:0}))===null);
 
 // ── 16 · BID EMPTY, a small print moved the price DOWN ──
-const empty=sig.bidEmpty(snap({last_price:176,volume:1000000}),
-                         snap({last_price:175,volume:1000050}));
+const empty=sig.bidEmpty(snap({last_price:176,volume_delta:0}),
+                         snap({last_price:175,volume_delta:50}));
 ck('50 shares moved it down -> BID_EMPTY', !!empty, empty);
 ck('share count reported', empty && empty.shares===50, empty&&empty.shares);
 ck('a LARGE sell moving it down is the market working',
-   sig.bidEmpty(snap({last_price:176,volume:1000000}),
-                snap({last_price:175,volume:1050000}))===null);
+   sig.bidEmpty(snap({last_price:176,volume_delta:0}),
+                snap({last_price:175,volume_delta:50000}))===null);
 ck('price UP does not fire',
-   sig.bidEmpty(snap({last_price:175,volume:1000000}),
-                snap({last_price:176,volume:1000050}))===null);
+   sig.bidEmpty(snap({last_price:175,volume_delta:0}),
+                snap({last_price:176,volume_delta:50}))===null);
 ck('no trade at all does not fire',
-   sig.bidEmpty(snap({last_price:176,volume:1000000}),
-                snap({last_price:175,volume:1000000}))===null);
+   sig.bidEmpty(snap({last_price:176,volume_delta:0}),
+                snap({last_price:175,volume_delta:0}))===null);
 
-// ── cumulative volume going BACKWARDS is unknown, not negative ──
-ck('a volume reset reads as unknown',
-   sig.tradedBetween(snap({volume:1000000}),snap({volume:5}))===null);
+// ── a NEGATIVE delta is unknown, not negative trading ──
+//
+// A counter reset or a bad read. Treated as unknown so the wall checks, which
+// require traded === 0, do not fire on nonsense.
+ck('a negative volume_delta reads as unknown, so no wall fires',
+   sig.wallPlaced(snap({offer_qty:50000,volume_delta:0}),
+                  snap({offer_qty:250000,volume_delta:-1}))===null);
+ck('and FROZEN does not fire on it either',
+   sig.frozen(snap({volume_delta:0}),
+              snap({bid_qty:150000,offer_qty:150000,volume_delta:-1}))===null);
+
 
 // ── evaluate(): every check runs, none short-circuits ──
 const both=sig.evaluate(
-  snap({bid_qty:50000,offer_qty:250000,volume:1000000}),
-  snap({bid_qty:15000,offer_qty:50000,volume:1000000}));
+  snap({bid_qty:50000,offer_qty:250000,volume_delta:0}),
+  snap({bid_qty:15000,offer_qty:50000,volume_delta:0}));
 ck('a thin bid AND a pulled wall are BOTH reported',
    names(both).join()==='NO_PROTECTION,WALL_PULLED', names(both));
 ck('each signal carries the symbol', both.every(s=>s.symbol==='ABAR'));
 ck('a quiet book produces nothing', sig.evaluate(snap(),snap()).length===0);
 ck('a missing previous snapshot is safe', sig.evaluate(null,snap()).length===0);
 
+// ── EVERY column signals.js reads must exist on the table ──
+//
+// The general form of the bug: not "does it read volume", but "does it read
+// anything the table does not have". The next phantom property fails here.
+for(const c of sig.REQUIRED_COLUMNS){
+  ck('signals.js reads `'+c+'` — and the table has it', COLS.includes(c), {column:c});
+}
+ck('a wrong-shaped row THROWS rather than returning nothing',
+   (()=>{try{sig.evaluate({last_price:1},{last_price:1});return false;}catch(e){return e.shapeError===true;}})());
+
 console.log(`\nsignals: ${p}/${n}`);
+await db.close();
 process.exit(p===n?0:1);
+})();

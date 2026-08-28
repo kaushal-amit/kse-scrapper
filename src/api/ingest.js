@@ -291,19 +291,56 @@ function createRouter() {
       // THE STATE, from depth_watchlist. Slot order is priority order: the
       // client sweeps in order and stops at its time budget, so pre-day slots
       // 1-3 are swept before wake-ups.
+      /*
+       * The sweep list — TRADEABLE symbols only.
+       *
+       * ─── THREE FILTERS, TWO COLUMNS, DELIBERATELY DIFFERENT ────────────────────
+       *
+       *   symbol_day        is_primary      history keeps a delisted stock
+       *   market_day        is_tradeable    breadth excludes it
+       *   /depth-symbols    is_tradeable    never sweep it
+       *
+       * A symbol is primary but NOT tradeable for two distinct reasons: it sits on
+       * the Auction Market, or it is DELISTED. Both are correct. is_primary is never
+       * set false by either — BAREEQ keeps its 8 sessions in symbol_day and simply
+       * stops counting in breadth.
+       *
+       * This looks like an inconsistency and is not one. Do not "fix" it.
+       */
       const { rows } = await query(`
-        SELECT w.slot_no, w.symbol, w.slot_type, i.code
+        SELECT w.slot_no, w.symbol, w.slot_type,
+               i.code, i.is_tradeable, i.broker_status, i.market
           FROM depth_watchlist w
           LEFT JOIN LATERAL (
-            -- is_primary: never offer a depth slot to a phantom. KFIN had one
-            -- row, one day, price 0 and volume 0.
-            SELECT code FROM instruments
-             WHERE symbol = w.symbol AND code IS NOT NULL AND is_primary LIMIT 1
+            SELECT code, is_tradeable, broker_status, market FROM instruments
+             WHERE symbol = w.symbol LIMIT 1
           ) i ON true
          WHERE w.trading_date = $1 AND w.symbol IS NOT NULL AND w.released_at IS NULL
+           -- NEVER OFFER A SLOT TO A SYMBOL THAT CANNOT BE TRADED.
+           --
+           -- Delisted, or on the auction market: sweeping its book costs one of
+           -- eight slots and returns something nobody can act on. Unknown
+           -- symbols are kept — a new listing has no registry row yet.
+           AND NOT EXISTS (
+             SELECT 1 FROM instruments i2
+              WHERE i2.symbol = w.symbol AND i2.is_tradeable = false)
          ORDER BY w.slot_no`, [day]);
 
-      const preDay = rows.filter((r) => r.slot_type === 'PRE_DAY').length;
+      // A slot can be held by a symbol that has since become untradeable.
+      // Silently shrinking the list from 8 to 7 is exactly the class of thing
+      // that goes unnoticed for a month, so each drop is named with its reason.
+      const usable = [];
+      for (const r of rows) {
+        if (r.is_tradeable === false) {
+          const why = r.broker_status === 'DELISTED' ? 'DELISTED'
+            : r.market === 'Auction Market' ? 'Auction Market' : 'not primary';
+          logDroppedOnce(day, r.symbol, why);
+          continue;
+        }
+        usable.push(r);
+      }
+
+      const preDay = usable.filter((r) => r.slot_type === 'PRE_DAY').length;
       if (!preDay && clock.isTradingDay(new Date())) {
         // A warning, not a failure: no pre-day picks is a legitimate choice,
         // and the day runs on wake-ups alone. Silent would be wrong.
@@ -314,11 +351,12 @@ function createRouter() {
       }
 
       return res.json({
-        symbols: rows.map((r) => ({ symbol: r.symbol, code: r.code, slot: r.slot_no })),
+        symbols: usable.map((r) => ({ symbol: r.symbol, code: r.code, slot: r.slot_no })),
         source: 'depth_watchlist',
         trading_date: day,
         pre_day: preDay,
-        wakeup: rows.length - preDay,
+        wakeup: usable.length - preDay,
+        dropped: rows.length - usable.length,
       });
     } catch (err) {
       log.error('depth-symbols failed', { err: err.message });
@@ -378,6 +416,21 @@ function createRouter() {
    * changed rather than the date it was last confirmed — which is what makes
    * "UNMATCHED since 26 July" distinguishable from "UNMATCHED since today".
    */
+  /**
+   * Once per symbol per day. The endpoint is polled every 15 seconds; saying it
+   * every time would bury it, and saying it once per process would hide it
+   * after a restart.
+   */
+  const droppedSeen = new Map();
+  function logDroppedOnce(day, symbol, why) {
+    const key = `${day}|${symbol}`;
+    if (droppedSeen.has(key)) return;
+    droppedSeen.clear();          // yesterday's keys are of no use
+    droppedSeen.set(key, true);
+    log.warn(`depth-symbols: dropped ${symbol} from the sweep — is_tradeable false (${why})`,
+      { symbol, reason: why, day });
+  }
+
   async function markBrokerStatus(symbols, status) {
     if (!symbols.length) return;
     try {

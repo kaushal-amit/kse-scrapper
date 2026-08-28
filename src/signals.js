@@ -25,13 +25,81 @@ const BAIT_MAX_AGE_SECS = Number(process.env.SIG_BAIT_MAX_AGE_SECS || 300);
 const TINY_TRADE_SHARES = Number(process.env.SIG_TINY_TRADE_SHARES || 100);
 
 /** Volume traded between two snapshots. Volume is cumulative for the session. */
+/**
+ * The columns evaluate() reads off a symbol_minute row.
+ *
+ * Listed rather than inferred so a missing one can be NAMED. "Invalid row
+ * shape" sends someone reading code; "row is missing volume_delta" sends them
+ * to the right line.
+ */
+const REQUIRED_COLUMNS = [
+  'last_price', 'bid', 'bid_qty', 'offer', 'offer_qty', 'volume_delta',
+  'bid_age_secs',
+];
+
+/**
+ * Reject a row that is not a symbol_minute row.
+ *
+ * ─── WHY THIS THROWS RATHER THAN COPES ─────────────────────────────────────
+ * A tolerant version would have hidden the bug this was written for: for weeks
+ * tradedBetween read `volume` — a column symbol_minute does not have — and
+ * WALL_PLACED, WALL_PULLED and FROZEN returned null on every evaluation. Four
+ * of seven checks worked and the system looked normal.
+ *
+ * A fallback would have made a quote-shaped row work, nobody would have
+ * noticed the real one did not, and it would have surfaced in production
+ * instead of in a test.
+ */
+function assertRowShape(row, which) {
+  if (!row || typeof row !== 'object') {
+    throw new Error(`signals.evaluate: ${which} row is not an object.`);
+  }
+  const missing = REQUIRED_COLUMNS.filter((c) => !(c in row));
+  if (missing.length) {
+    const err = new Error(
+      `signals.evaluate: ${which} row is missing \`${missing.join('`, `')}\`. `
+      + `Expected a symbol_minute row (${REQUIRED_COLUMNS.length} required columns). `
+      + `Got ${Object.keys(row).length} properties.`);
+    // Tagged so the fast loop can COUNT these specifically. A shape error is
+    // not the same as a database error and must not be swallowed with one.
+    err.shapeError = true;
+    err.missingColumns = missing;
+    throw err;
+  }
+}
+
+/**
+ * Shares traded between two observations.
+ *
+ * ─── READ volume_delta, NOT A CUMULATIVE ───────────────────────────────────
+ * This used to compute now.volume - prev.volume. symbol_minute has 18 columns
+ * and `volume` is NOT one of them — it stores volume_delta, already the
+ * difference.
+ *
+ * So prev.volume was undefined on every real row, this returned null, and
+ * WALL_PLACED, WALL_PULLED and FROZEN returned null on EVERY evaluation.
+ * Three of the seven checks could never fire. Not on a bad tick — ever.
+ *
+ * The 32 unit tests passed throughout, because each built its own input object
+ * with a `volume` property the real row shape does not have. A test that
+ * constructs its own input proves the logic and nothing about the wiring.
+ *
+ * The cumulative form is still accepted: the fast loop reads symbol_minute, but
+ * an ad-hoc caller may hold quote rows, and refusing those would trade one
+ * silent failure for another.
+ */
 function tradedBetween(prev, now) {
-  if (prev.volume === null || now.volume === null
-    || prev.volume === undefined || now.volume === undefined) return null;
-  const delta = Number(now.volume) - Number(prev.volume);
-  // A cumulative counter going backwards is a reset or a bad read, not
-  // negative volume. Treated as unknown rather than as a fall.
-  return delta < 0 ? null : delta;
+  // volume_delta IS the difference. symbol_minute has 18 columns and `volume`
+  // is not one of them — computing now.volume - prev.volume read undefined on
+  // every real row.
+  //
+  // A null delta means UNKNOWN, not zero: after a process restart the previous
+  // cumulative is not yet known, and the three volume-keyed checks must go
+  // SILENT rather than fire on a guess.
+  if (now.volume_delta === null || now.volume_delta === undefined) return null;
+  const d = Number(now.volume_delta);
+  // A counter going backwards is a reset or a bad read, not negative volume.
+  return Number.isFinite(d) && d >= 0 ? d : null;
 }
 
 const n = (v) => (v === null || v === undefined || v === '' ? null : Number(v));
@@ -194,14 +262,11 @@ const CHECKS = [
   noProtection, buyersRatio, wallPlaced, wallPulled, baitBid, frozen, bidEmpty,
 ];
 
-/**
- * Run every check over one pair of snapshots.
- *
- * All seven run — the first match does not stop the rest. A thin bid AND a
- * pulled wall at the same moment is a different situation from either alone,
- * and stopping early would hide the combination.
- */
 function evaluate(prev, now) {
+  if (prev === null || prev === undefined) return [];
+  assertRowShape(prev, 'previous');
+  assertRowShape(now, 'current');
+
   if (!prev || !now) return [];
   const out = [];
   for (const check of CHECKS) {
@@ -224,6 +289,10 @@ function evaluate(prev, now) {
 }
 
 module.exports = {
+  REQUIRED_COLUMNS,
+  assertRowShape,
+  assertRowShape,
+  REQUIRED_COLUMNS,
   evaluate,
   noProtection,
   buyersRatio,

@@ -31,11 +31,37 @@ const COLUMNS = [
   'regime', 'computed_at',
 ];
 
-/** Every symbol_day row for the session. */
+/**
+ * Every TRADEABLE symbol_day row for the session.
+ *
+ * ─── THREE FILTERS, TWO COLUMNS, DELIBERATELY DIFFERENT ────────────────────
+ *
+ *   symbol_day        is_primary      history keeps a delisted stock
+ *   market_day        is_tradeable    breadth excludes it
+ *   /depth-symbols    is_tradeable    never sweep it
+ *
+ * A symbol is primary but NOT tradeable for two distinct reasons: it sits on
+ * the Auction Market, or it is DELISTED. Both are correct. is_primary is never
+ * set false by either — BAREEQ keeps its 8 sessions in symbol_day and simply
+ * stops counting in breadth.
+ *
+ * This looks like an inconsistency and is not one. Do not "fix" it.
+ *
+ * ─── UNKNOWN SYMBOLS ARE KEPT ──────────────────────────────────────────────
+ * NOT EXISTS, not a join: a symbol with no instruments row yet — a new listing
+ * — must still count. Dropping it would let an absence in the registry delete
+ * a fact in the quotes, which is the same error as writing an empty row to
+ * represent an absence, in the other direction.
+ */
 async function loadDay(day) {
   const { rows } = await query(
-    `SELECT symbol, chg_fils, chg_1d, trades, total_volume, data_quality
-       FROM symbol_day WHERE trading_date = $1`, [day]);
+    `SELECT sd.symbol, sd.chg_fils, sd.chg_1d, sd.trades, sd.total_volume,
+            sd.data_quality
+       FROM symbol_day sd
+      WHERE sd.trading_date = $1
+        AND NOT EXISTS (
+          SELECT 1 FROM instruments i
+           WHERE i.symbol = sd.symbol AND i.is_tradeable = false)`, [day]);
   return rows;
 }
 
