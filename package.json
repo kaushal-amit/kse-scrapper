@@ -1,0 +1,45 @@
+{
+  "name": "kse-scraper",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Scrapes Boursa Kuwait market data from TradingView and the AWSAT broker terminal into PostgreSQL.",
+  "main": "src/index.js",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "db:create": "node scripts/create-db.js",
+    "migrate": "node src/db/migrate.js",
+    "migrate:status": "node src/db/migrate.js --status",
+    "db:rebase": "node scripts/db-rebase.js",
+    "setup": "npm run db:create && npm run migrate",
+    "run:once": "node src/runOnce.js",
+    "collect": "node scripts/collect.js",
+    "awsat:discover": "node scripts/awsat-discover.js",
+    "awsat:login-state": "node scripts/awsat-login-state.js",
+    "migrate:inspect": "node scripts/migrate-inspect.js",
+    "migrate:quotes": "node scripts/migrate-quotes.js",
+    "migrate:all": "node scripts/migrate-all.js",
+    "seed:instruments": "node scripts/seed-instruments.js",
+    "seed:depthslots": "node scripts/seed-depth-slots.js",
+    "check:data": "node scripts/check-data.js",
+    "backfill:symbolday": "node scripts/backfill-symbol-day.js",
+    "backfill:marketday": "node scripts/backfill-market-day.js",
+    "fix:markets": "node scripts/fix-markets.js",
+    "fix:labels": "node scripts/fix-market-labels.js",
+    "tv:probe": "node scripts/probe-tradingview.js",
+    "tv:login": "node scripts/save-tradingview-cookies.js",
+    "test": "node test/all.js",
+    "check": "node --check src/index.js && node --check src/scheduler.js && echo 'syntax ok'",
+    "test:one": "node test/run.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "node-cron": "^3.0.3",
+    "pg": "^8.12.0",
+    "playwright": "^1.47.0",
+    "ws": "^8.21.3"
+  }
+}
