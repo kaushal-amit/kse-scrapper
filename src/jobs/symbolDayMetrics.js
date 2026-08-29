@@ -23,7 +23,49 @@
  * of 1, and no conversion happens anywhere.
  */
 
-/** Sessions whose prints count toward a close. Mirrors closing_sessions(). */
+/**
+ * THE CLOSE IS A PRECEDENCE ORDER, NOT A SESSION LIST.
+ *
+ * A list plus "latest by created_at" picks whichever session happened to be
+ * captured last, which is not the same as the best available close. CABLE on
+ * 2 August has a Close-Of-Day at 1650 captured at 10:17 and an auction print at
+ * 1648 captured later in the file — ordering by time reaches the auction and
+ * never gets to the official close.
+ *
+ * Highest tier present wins; within a tier, the latest capture. Stated here
+ * rather than left to DISTINCT ON, because three identical Close-Of-Day rows at
+ * 10:15, 10:16 and 10:17 must resolve deterministically.
+ *
+ * '' sits with Trading: it is a JULY CAPTURE DEFECT, not an exchange state —
+ * those rows are 09:00-12:59 continuous trading whose label was not captured.
+ * NULL is excluded entirely: those are 14:13-14:23 Friday reads, after the
+ * close on a non-trading day, and their volume is cumulative rather than new.
+ */
+const CLOSE_TIERS = new Map([
+  ['Close-Of-Day', 1],
+  ['Closing', 2],
+  ['Trading at Last', 3],
+  ['Close Auction Acceptance', 4],
+  ['Trading', 5],
+  ['', 5],
+]);
+
+const TIER_NAME = ['', 'CLOSE_OF_DAY', 'CLOSING', 'TRADING_AT_LAST', 'AUCTION', 'TRADING'];
+
+/**
+ * THE RANGE IS A DIFFERENT SET FROM THE CLOSE.
+ *
+ * Everything from 13:00 clears at one price, so feeding it into a high or low
+ * measures the auction rather than the session. TIJARA on 9 August: a 3-fil
+ * continuous range became 9 because one auction print of 849,788 shares cleared
+ * eight fils below the 12:59 price.
+ *
+ * CB Auction IS included — 581 rows, 26.8 million shares, real trading after a
+ * circuit breaker. CATTL's 24 August low of 217 was set in one.
+ */
+const RANGE_SESSIONS = new Set(['Trading', 'CB Auction', '']);
+
+/** Kept for the tests that assert the old four-session set still resolves. */
 const CLOSING_SESSIONS = new Set([
   'Trading', 'Close Auction Acceptance', 'Trading at Last', 'Close-Of-Day',
 ]);
@@ -71,13 +113,17 @@ function volumeSteps(rows) {
 
 /** OHLC across EVERY row of the day, auction included. */
 function priceBlock(rows) {
-  const sorted = ordered(rows);
+  // Only the sessions where a price is the session's own — see RANGE_SESSIONS.
+  const sorted = ordered(rows).filter((r) => {
+    if (r.session === null || r.session === undefined) return false;
+    return RANGE_SESSIONS.has(String(r.session).trim());
+  });
   const prices = sorted.map((r) => n(r.last_price)).filter((p) => p !== null && p > 0);
   if (!prices.length) return { open_px: null, high_px: null, low_px: null };
   return {
     open_px: prices[0],
-    // High and low must include the auction: CATTL's 24 August low was set in
-    // a circuit-breaker auction, not in continuous trading.
+    // CB Auction is in RANGE_SESSIONS, so CATTL's 24 August low of 217 counts.
+    // The CLOSING auction is not: it clears at one price and is not a range.
     high_px: Math.max(...prices),
     low_px: Math.min(...prices),
   };
@@ -91,44 +137,40 @@ function priceBlock(rows) {
  * an unlabelled print is more likely a gap in capture than one the exchange
  * meant to exclude.
  */
-function closePrice(rows) {
-  const eligible = ordered(rows).filter((r) => {
+function closeRow(rows) {
+  let best = null;
+  let bestTier = 99;
+  for (const r of ordered(rows)) {
     const px = n(r.last_price);
-    if (px === null || px <= 0) return false;
-    return r.session === null || r.session === undefined
-      || CLOSING_SESSIONS.has(String(r.session).trim());
-  });
-  if (!eligible.length) return null;
-  return n(eligible[eligible.length - 1].last_price);
+    if (px === null || px <= 0) continue;
+    if (r.session === null || r.session === undefined) continue;   // Friday reads
+    const tier = CLOSE_TIERS.get(String(r.session).trim());
+    if (tier === undefined) continue;                              // Pre-Auction etc.
+    // Highest tier wins; within a tier the LATEST, and `ordered` ascends.
+    if (tier < bestTier || tier === bestTier) {
+      if (tier <= bestTier) { best = r; bestTier = tier; }
+    }
+  }
+  return best;
+}
+
+function closePrice(rows) {
+  const r = closeRow(rows);
+  return r ? n(r.last_price) : null;
 }
 
 /**
- * WHICH session the close came from.
+ * WHICH tier the close came from.
  *
- * Through 27 July the scraper stopped at 12:59 Kuwait, half an hour before the
- * close, so Close-Of-Day never existed to capture and close_px is the last
- * continuous Trading print — wrong by a fil or two on every symbol for ten
- * consecutive days.
- *
- * data_quality = THIN already says "something was wrong". This says exactly
- * what, so a caller can decide for itself whether a Trading-sourced close is
- * good enough for what it is doing.
+ * Through 27 July the scraper stopped at 12:59, so Close-Of-Day never existed
+ * to capture and close_px is the last continuous print — the TIJARA
+ * 172-instead-of-176 error, systematically, on every symbol for ten days.
+ * data_quality = THIN says something was wrong; this says exactly what.
  */
 function closeSource(rows) {
-  const eligible = ordered(rows).filter((r) => {
-    const px = n(r.last_price);
-    if (px === null || px <= 0) return false;
-    return r.session === null || r.session === undefined
-      || CLOSING_SESSIONS.has(String(r.session).trim());
-  });
-  if (!eligible.length) return null;   // close_px is NULL too; no fifth value
-
-  const session = String(eligible[eligible.length - 1].session || '').trim();
-  if (session === 'Close-Of-Day') return 'CLOSE_OF_DAY';
-  if (session === 'Trading at Last') return 'TRADING_AT_LAST';
-  if (session === 'Close Auction Acceptance') return 'AUCTION';
-  // 'Trading', or an unlabelled row: the last continuous print, not the close.
-  return 'TRADING';
+  const r = closeRow(rows);
+  if (!r) return null;                 // close_px is NULL too; no fifth value
+  return TIER_NAME[CLOSE_TIERS.get(String(r.session).trim())];
 }
 
 function hasCloseOfDay(rows) {
@@ -249,6 +291,108 @@ function movementBlock(rows) {
 }
 
 /**
+ * The SHAPE of a session's trading, not its totals.
+ *
+ * ─── VOLUME DELTA, NOT last_qty ────────────────────────────────────────────
+ * Measured both against six known outcomes. They disagree in SIGN on two, and
+ * last_qty gets both backwards:
+ *
+ *     TIJARA 16 Aug   173 -> 181, free    delta 4.99    last_qty 0.71
+ *     MRC    16 Aug   fell that week      delta 0.17    last_qty 2.14
+ *
+ * last_qty is one print sampled at capture time; at 60-second polling that is a
+ * single trade out of dozens. The delta is everything that traded in the step.
+ *
+ * ─── THE COUNTS ARE STORED, NOT USED AS A THRESHOLD ────────────────────────
+ * A minimum would have discarded the best evidence: MRC on 16 August had 7
+ * up-moves and 9 down, below any sensible gate, and it preceded the fall by six
+ * days while buy_sell_ratio read positive. A gate can demand ten a side; the
+ * analysis can look at seven and know it is seven.
+ *
+ * ─── THE SPLIT IS 11:15 ────────────────────────────────────────────────────
+ * The session runs 09:00-13:30, so its midpoint is 11:15, not noon. Named
+ * first/second half for that reason — a column called am_ that changes at 11:15
+ * is the moves_2plus mistake, where the name said one thing and the rule did
+ * another.
+ */
+const SESSION_MIDPOINT_MIN = 11 * 60 + 15;     // 11:15 Kuwait
+
+function flowBlock(rows) {
+  const steps = volumeSteps(rows);
+
+  let upShares = 0;
+  let downShares = 0;
+  let nUp = 0;
+  let nDown = 0;
+  let turnover = 0;
+  let firstHalf = 0;
+  let secondHalf = 0;
+  let firstMinutes = new Set();
+  let secondMinutes = new Set();
+
+  for (const { prev, now, traded } of steps) {
+    const before = n(prev.last_price);
+    const after = n(now.last_price);
+
+    // Value traded in this step, in KD. Prices are fils; 1 KD = 1000 fils.
+    if (after !== null) turnover += (traded * after) / 1000;
+
+    // Kuwait is UTC+3 with no daylight saving.
+    const k = new Date(new Date(now.created_at).getTime() + 3 * 3600_000);
+    const minuteOfDay = k.getUTCHours() * 60 + k.getUTCMinutes();
+    const stamp = `${k.getUTCHours()}:${k.getUTCMinutes()}`;
+    if (minuteOfDay < SESSION_MIDPOINT_MIN) { firstHalf += traded; firstMinutes.add(stamp); }
+    else { secondHalf += traded; secondMinutes.add(stamp); }
+
+    if (before === null || after === null || after === before) continue;
+    if (after > before) { upShares += traded; nUp += 1; }
+    else { downShares += traded; nDown += 1; }
+  }
+
+  const avgUp = nUp ? upShares / nUp : null;
+  const avgDown = nDown ? downShares / nDown : null;
+  const round = (v) => (v === null ? null : Number(v.toFixed(4)));
+
+  return {
+    avg_uptick_shares: round(avgUp),
+    avg_downtick_shares: round(avgDown),
+    // NULL rather than Infinity when nothing sold: a ratio with no denominator
+    // is not a large ratio, it is an unknown one.
+    uptick_ratio: (avgUp !== null && avgDown) ? Number((avgUp / avgDown).toFixed(4)) : null,
+    n_upticks: nUp,
+    n_downticks: nDown,
+    turnover_kd: round(turnover),
+    first_half_shares_per_min: firstMinutes.size ? round(firstHalf / firstMinutes.size) : null,
+    second_half_shares_per_min: secondMinutes.size ? round(secondHalf / secondMinutes.size) : null,
+  };
+}
+
+/**
+ * FULL, SHORT or CB_ONLY.
+ *
+ * Fourteen of 29 captured days ended at 12:59 or earlier, so their ranges are
+ * as truncated as their closes and nothing said so. Range drives rangeOverCost
+ * and several gates, which makes an unmarked short range a wrong gate.
+ */
+function rangeSource(rows) {
+  const usable = rows.filter((r) => {
+    if (r.session === null || r.session === undefined) return false;
+    return RANGE_SESSIONS.has(String(r.session).trim());
+  });
+  if (!usable.length) return null;
+
+  const onlyCb = usable.every((r) => String(r.session).trim() === 'CB Auction');
+  if (onlyCb) return 'CB_ONLY';
+
+  // Did continuous trading reach 13:10? Kuwait is UTC+3.
+  const latest = Math.max(...usable.map((r) => {
+    const k = new Date(new Date(r.created_at).getTime() + 3 * 3600_000);
+    return k.getUTCHours() * 60 + k.getUTCMinutes();
+  }));
+  return latest >= 13 * 60 + 10 ? 'FULL' : 'SHORT';
+}
+
+/**
  * buy_sell_ratio, and the reason it is often NULL.
  *
  * A stock that sits at the offer classifies EVERY print as buying. GFH sits
@@ -322,6 +466,11 @@ function tickBandCrossed(closePx, highPx) {
 module.exports = {
   ordered,
   volumeSteps,
+  flowBlock,
+  rangeSource,
+  closeRow,
+  RANGE_SESSIONS,
+  CLOSE_TIERS,
   priceBlock,
   closePrice,
   closeSource,

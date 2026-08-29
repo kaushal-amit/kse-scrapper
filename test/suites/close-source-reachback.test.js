@@ -30,9 +30,14 @@ ck('close_px IS NULL already says there was none — no NONE value',
 
 // ── an unlabelled row still counts, and reads as TRADING ──
 const unlabelled=day([row({last_price:200}),row({last_price:205,session:null})]);
-ck('a NULL session is included in the close', M.closePrice(unlabelled)===205);
+// NULL is now excluded (Friday post-close reads); '' is included at the
+// TRADING tier (July capture defect on continuous trading).
+ck('a NULL session is EXCLUDED', M.closePrice(unlabelled)===200, M.closePrice(unlabelled));
+T=0;
+const blank=day([row({last_price:200}),row({last_price:205,session:''})]);
+ck('a BLANK session IS included', M.closePrice(blank)===205);
 ck('and reads as TRADING — not a claim it was the official close',
-   M.closeSource(unlabelled)==='TRADING');
+   M.closeSource(blank)==='TRADING');
 
 // ── the reach-back rule, as arithmetic ──
 // 28 Jul close 100 · 29 Jul close 110 · 30 Jul NO close · 2 Aug close 120

@@ -27,6 +27,7 @@ const { query } = require('../db/pool');
 const clock = require('../market/clock');
 const log = require('../logger');
 const M = require('./symbolDayMetrics');
+const T = require('../config/thresholds');
 
 /** Columns written. Anything absent from here is deliberately left NULL. */
 const COLUMNS = [
@@ -40,6 +41,11 @@ const COLUMNS = [
   'bought_at_offer', 'sold_at_bid', 'shares_inside_spread',
   'trades_at_offer', 'trades_at_bid', 'pct_at_offer', 'buy_sell_ratio',
   'minutes_captured', 'coverage_pct', 'data_quality', 'source', 'close_source',
+  'range_source',
+  // The shape of the session's trading, not its totals. Logged, never gated.
+  'avg_uptick_shares', 'avg_downtick_shares', 'uptick_ratio',
+  'n_upticks', 'n_downticks', 'turnover_kd',
+  'first_half_shares_per_min', 'second_half_shares_per_min',
   'family', 'tick_band_crossed', 'computed_at',
 ];
 
@@ -139,16 +145,39 @@ async function previousCloses(day) {
    * Beyond that prev_close stays NULL, and prev_session_gap_days makes the
    * reach visible whenever it exceeds a day.
    */
+  const cutoffHHMM = T.get('close_capture_min_hhmm');
+  const cutoffMinutes = Math.floor(cutoffHHMM / 100) * 60 + (cutoffHHMM % 100);
+
   const { rows } = await query(`
-    WITH candidates AS (
-      -- Every prior session where this symbol had a usable close, most recent
-      -- first, keeping only the 5 nearest.
+    WITH ends AS (
+      SELECT trading_date, max(created_at) AS last_capture
+        FROM awsat_market_quotes WHERE trading_date < $1
+       GROUP BY trading_date
+    ),
+    usable AS (
+      -- A SESSION WHOSE CAPTURE STOPPED EARLY CANNOT SUPPLY A CLOSE.
+      --
+      -- 30 July captured 09:00-10:14 Kuwait: its last print is a mid-morning
+      -- price wearing a close's name, three hours before the session ended.
+      -- Storing it is right (TRADING, THIN); reaching back TO it is not.
+      --
+      -- The cut is close_capture_min_hhmm = 12:30. End times cluster at 12:59 —
+      -- ten July days missing only the closing auction — while 30 July ends at
+      -- 10:14 and 26 August at 12:23. 12:30 falls in the empty gap, so it is
+      -- the midpoint of a real discontinuity rather than a number fitted to the
+      -- data.
+      SELECT trading_date FROM ends
+       WHERE (extract(hour FROM (last_capture AT TIME ZONE 'Asia/Kuwait')) * 60
+            + extract(minute FROM (last_capture AT TIME ZONE 'Asia/Kuwait'))) >= $2
+    ),
+    candidates AS (
       SELECT symbol, trading_date, close_px,
              row_number() OVER (PARTITION BY symbol ORDER BY trading_date DESC) AS back
         FROM (
           SELECT DISTINCT ON (q.symbol, q.trading_date)
                  q.symbol, q.trading_date, q.last_price AS close_px
             FROM awsat_market_quotes q
+            JOIN usable u ON u.trading_date = q.trading_date
            WHERE q.trading_date < $1
              AND q.last_price IS NOT NULL AND q.last_price > 0
              AND (q.session IS NULL OR q.session = ANY(closing_sessions()))
@@ -156,7 +185,7 @@ async function previousCloses(day) {
         ) withClose
     )
     SELECT symbol, trading_date AS prev_day, close_px AS prev_close
-      FROM candidates WHERE back = 1`, [day]);
+      FROM candidates WHERE back = 1`, [day, cutoffMinutes]);
 
   const out = new Map();
   for (const r of rows) {
@@ -175,25 +204,39 @@ async function closesFiveSessionsBack(day) {
   /**
    * The same rule, five sessions back.
    *
-   * Counting sessions that produced no close would make chg_5d measure four
-   * sessions while claiming five — the same silent miscount as chg_1d spanning
-   * a gap, and the reason prev_session_gap_days exists.
+   * Counting a session that could not supply a close would make chg_5d measure
+   * four sessions while claiming five — the same silent miscount as chg_1d
+   * spanning a gap. "Usable for a close" must mean ONE thing.
    */
+  const cutoffHHMM = T.get('close_capture_min_hhmm');
+  const cutoffMinutes = Math.floor(cutoffHHMM / 100) * 60 + (cutoffHHMM % 100);
+
   const { rows } = await query(`
-    WITH candidates AS (
+    WITH ends AS (
+      SELECT trading_date, max(created_at) AS last_capture
+        FROM awsat_market_quotes WHERE trading_date < $1
+       GROUP BY trading_date
+    ),
+    usable AS (
+      SELECT trading_date FROM ends
+       WHERE (extract(hour FROM (last_capture AT TIME ZONE 'Asia/Kuwait')) * 60
+            + extract(minute FROM (last_capture AT TIME ZONE 'Asia/Kuwait'))) >= $2
+    ),
+    candidates AS (
       SELECT symbol, trading_date, close_px,
              row_number() OVER (PARTITION BY symbol ORDER BY trading_date DESC) AS back
         FROM (
           SELECT DISTINCT ON (q.symbol, q.trading_date)
                  q.symbol, q.trading_date, q.last_price AS close_px
             FROM awsat_market_quotes q
+            JOIN usable u ON u.trading_date = q.trading_date
            WHERE q.trading_date < $1
              AND q.last_price IS NOT NULL AND q.last_price > 0
              AND (q.session IS NULL OR q.session = ANY(closing_sessions()))
            ORDER BY q.symbol, q.trading_date DESC, q.created_at DESC
         ) withClose
     )
-    SELECT symbol, close_px AS px FROM candidates WHERE back = 5`, [day]);
+    SELECT symbol, close_px AS px FROM candidates WHERE back = 5`, [day, cutoffMinutes]);
   const out = new Map();
   for (const r of rows) out.set(r.symbol, Number(r.px));
   return out;
@@ -213,6 +256,8 @@ function buildRow(symbol, day, rows, marketMedian) {
     ...price,
     close_px: close,
     close_source: M.closeSource(rows),
+    range_source: M.rangeSource(rows),
+    ...M.flowBlock(rows),
     day_range: (price.high_px !== null && price.low_px !== null)
       ? price.high_px - price.low_px : null,
     total_volume: volume.total_volume,

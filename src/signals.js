@@ -19,10 +19,13 @@
  */
 
 /**
- * ─── THE THRESHOLDS COME FROM kb_threshold ─────────────────────────────────
- * These were env vars read at module load, which meant changing one needed a
- * restart and changing it everywhere needed a deploy. They now come from the
- * table, loaded once at boot.
+ * ─── THE THRESHOLDS COME FROM src/config/thresholds.js ─────────────────────
+ * They were env vars read at module load, then briefly a database table. Both
+ * were wrong for different reasons: env vars lose the provenance, and a table
+ * owned by the BACKEND meant this capture service refused to boot when that
+ * table was missing.
+ *
+ * A file carries the CR that set each number and cannot fail to load.
  *
  * Read through a getter rather than captured at module load: the module is
  * required before load() runs, so a captured value would be whatever the
@@ -31,23 +34,15 @@
  * The VALUES are unchanged, so every one of the 32 checks behaves exactly as
  * before. Only where the number lives has moved.
  */
-const T = require('./kb/thresholds');
+const T = require('./config/thresholds');
 
-const th = (key, envVar, fallback) => {
-  // Before load() — a unit test requiring this module directly, or a tool that
-  // runs pre-seed — fall back rather than throw.
-  if (!T.isLoaded()) {
-    const v = envVar ? process.env[envVar] : undefined;
-    return v === undefined || v === '' ? fallback : Number(v);
-  }
-  return T.get(key);
-};
-
-const NO_PROTECTION_BID = () => th('sig_no_protection_bid', 'SIG_NO_PROTECTION_BID', 20_000);
-const BUYERS_RATIO = () => th('sig_buyers_ratio', 'SIG_BUYERS_RATIO', 1.6);
-const BIG_QTY = () => th('sig_big_qty', 'SIG_BIG_QTY', 100_000);
-const BAIT_MAX_AGE_SECS = () => th('sig_bait_max_age_secs', 'SIG_BAIT_MAX_AGE_SECS', 300);
-const TINY_TRADE_SHARES = () => th('sig_tiny_trade_shares', 'SIG_TINY_TRADE_SHARES', 100);
+// Read through getters rather than captured at module load, so an env override
+// applied before boot still takes effect.
+const NO_PROTECTION_BID = () => T.get('sig_no_protection_bid');
+const BUYERS_RATIO = () => T.get('sig_buyers_ratio');
+const BIG_QTY = () => T.get('sig_big_qty');
+const BAIT_MAX_AGE_SECS = () => T.get('sig_bait_max_age_secs');
+const TINY_TRADE_SHARES = () => T.get('sig_tiny_trade_shares');
 
 /** Volume traded between two snapshots. Volume is cumulative for the session. */
 /**

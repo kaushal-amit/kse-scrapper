@@ -22,8 +22,16 @@ ck('S2: Close Auction Acceptance counts',
    m.closePrice(day([row({last_price:175,volume:1}),row({last_price:170,volume:2,session:'Close Auction Acceptance'})]))===170);
 ck('an unknown session is EXCLUDED',
    m.closePrice(day([row({last_price:200,volume:1}),row({last_price:999,volume:2,session:'Suspended'})]))===200);
-ck('a NULL session is INCLUDED',
-   m.closePrice(day([row({last_price:200,volume:1}),row({last_price:210,volume:2,session:null})]))===210);
+// A NULL session is now EXCLUDED. Those rows are 14:13-14:23 Friday reads —
+// after the close on a non-trading day, carrying cumulative volume rather than
+// new trading. The BLANK label is the one that counts, at the TRADING tier:
+// 09:00-12:59 continuous trading whose label was not captured in July.
+ck('a NULL session is EXCLUDED — a Friday read is not a close',
+   m.closePrice(day([row({last_price:200,volume:1}),row({last_price:210,volume:2,session:null})]))===200);
+ck("a BLANK label IS included — a July capture defect, not an exchange state",
+   m.closePrice(day([row({last_price:200,volume:1}),row({last_price:210,volume:2,session:''})]))===210);
+ck('and it reads as TRADING',
+   m.closeSource(day([row({last_price:210,volume:2,session:''})]))==='TRADING');
 
 // ── CATTL · high must include the CB auction ──
 const cattl=day([
@@ -31,9 +39,17 @@ const cattl=day([
   row({last_price:133,volume:3000,session:'Close Auction Acceptance'}),
 ]);
 const pb=m.priceBlock(cattl);
-ck('CATTL: low includes the auction (133)', pb.low_px===133, pb);
-ck('CATTL: high across all rows (280)', pb.high_px===280, pb);
-ck('open is the first capture', pb.open_px===250, pb);
+// The CLOSING auction is excluded from the range: everything from 13:00 clears
+// at one price, so feeding it in measures the auction, not the session. TIJARA
+// 9 Aug read 9 fils that way against a 3-fil continuous range.
+ck('the CLOSING auction is excluded from the range', pb.low_px===250, pb);
+ck('high from continuous trading (280)', pb.high_px===280, pb);
+ck('open is the first continuous capture', pb.open_px===250, pb);
+// But a CB Auction IS included — real trading after a circuit breaker, and
+// CATTL's 24 August low of 217 was set in one.
+T=0;
+const cb=[row({last_price:250,volume:1000}),row({last_price:217,volume:2000,session:'CB Auction'})];
+ck('a CB Auction low DOES count', m.priceBlock(cb).low_px===217, m.priceBlock(cb));
 
 // ── THE VOLUME GATE ──
 const quoteOnly=day([row({last_price:100,volume:5000}),row({last_price:105,volume:5000})]);

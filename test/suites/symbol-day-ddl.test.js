@@ -30,7 +30,15 @@ let p=0,n=0;const ck=(t,c,x)=>{n++;if(c)p++;else console.log('  FAIL:',t,JSON.st
   // Trading print rather than the official close.
   // +4 from 031: markup, resumed, lift, hit — the fields the front end reads
   // that had no column. resumed stays NULL: unknown, not "never suspended".
-  ck('98 columns after migration 031', sd.length===98, sd.length);
+  // +9 from 032: range_source and the eight flow columns.
+  ck('107 columns after migration 032', sd.length===107, sd.length);
+  ck('range_source present — an unmarked short range is a wrong gate',
+     !!name('range_source'));
+  for (const c of ['avg_uptick_shares','avg_downtick_shares','uptick_ratio',
+    'n_upticks','n_downticks','turnover_kd',
+    'first_half_shares_per_min','second_half_shares_per_min']) {
+    ck(c + ' present', !!name(c));
+  }
   for (const c of ['markup','resumed','lift','hit']) {
     ck(c + ' present', !!name(c));
   }

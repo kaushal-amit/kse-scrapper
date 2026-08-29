@@ -23,11 +23,12 @@
 
 const { query } = require('./db/pool');
 const preflight = require('./db/preflight');
+const T = require('./config/thresholds');
 const clock = require('./market/clock');
 const log = require('./logger');
 
-const PACE_MIN = Number(process.env.WAKEUP_PACE_MIN || 3.0);
-const TRADES_MIN = Number(process.env.WAKEUP_TRADES_MIN || 20);
+const PACE_MIN = T.get('wakeup_pace_min');
+const TRADES_MIN = T.get('wakeup_trades_min');
 const BASELINE_DAYS = Number(process.env.WAKEUP_BASELINE_DAYS || 10);
 const WAKEUP_SLOTS = [4, 5, 6, 7, 8];
 
