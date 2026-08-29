@@ -467,34 +467,48 @@ function createRouter() {
        * cannot move under a capture.
        */
       /**
-       * The comparison is done in SQL, not in JavaScript.
+       * IS TODAY A SESSION? ASK THE QUOTES, NOT market_day.
        *
-       * ─── WHY ────────────────────────────────────────────────────────────
-       * The driver returns trading_date as a Date object, and
-       * String(new Date(...)) gives "Fri Aug 28 2026 21:00:00 GMT+0000". Slicing
-       * ten characters off that yields "Fri Aug 2", which can never equal
-       * "2026-08-29" — so isSessionDay was ALWAYS false and every capture filed
-       * as STALE, whenever it was taken.
+       * ─── WHY NOT market_day ────────────────────────────────────────────
+       * It has no row for today until daily.marketday runs at 13:40, so during
+       * a session it can NEVER say "today is a session". Every live capture
+       * would find yesterday, mark itself STALE, and be skipped by the very job
+       * that was going to create the row — leaving broker_seen_at NULL and the
+       * compute quietly falling back to our own breadth.
        *
-       * daily.marketday skips STALE rows, so the broker's breadth would never
-       * have reached market_day. It would have looked like the scraper was not
-       * posting, while it posted perfectly and was filed wrong.
+       * Tomorrow would look like the broker feed was never wired, and the day
+       * after would be spent debugging an endpoint that works.
        *
-       * Comparing ::date to ::date in SQL removes the class of error: no Date
-       * object reaches a string comparison, and no timezone is applied twice.
+       * awsat_market_quotes is written AS THE SESSION RUNS, so it can answer
+       * the question at 09:05. Same class of error as comparing String(Date):
+       * a derivation that consults something not yet populated.
+       *
+       * The comparison stays in SQL — ::date to ::date, with the Kuwait
+       * conversion done by Postgres, so no Date object reaches a string and no
+       * timezone is applied twice.
        */
       const { rows: sess } = await query(
-        `SELECT trading_date::text AS trading_date,
-                (trading_date = ($1::timestamptz AT TIME ZONE 'Asia/Kuwait')::date)
-                  AS is_session_day
-           FROM market_day
-          WHERE trading_date <= ($1::timestamptz AT TIME ZONE 'Asia/Kuwait')::date
-            AND COALESCE(total_volume, 0) > 0
-          ORDER BY trading_date DESC LIMIT 1`, [when.capturedAt]);
+        `WITH cap AS (
+           SELECT ($1::timestamptz AT TIME ZONE 'Asia/Kuwait')::date AS capture_day,
+                  extract(dow FROM ($1::timestamptz AT TIME ZONE 'Asia/Kuwait')) AS dow
+         )
+         SELECT cap.capture_day::text AS capture_day,
+                -- Friday (5) and Saturday (6) are never sessions on Boursa
+                -- Kuwait, whatever happens to be in the table.
+                (cap.dow NOT IN (5, 6)
+                 AND EXISTS (SELECT 1 FROM awsat_market_quotes q
+                              WHERE q.trading_date = cap.capture_day)) AS is_session_day,
+                -- The session these figures describe when today is not one:
+                -- the last day that actually traded.
+                (SELECT max(q2.trading_date)::text FROM awsat_market_quotes q2
+                  WHERE q2.trading_date <= cap.capture_day) AS last_traded
+           FROM cap`, [when.capturedAt]);
 
       const captured = new Date(when.capturedAt);
-      const tradingDate = sess.length ? sess[0].trading_date : clock.tradingDay();
       const isSessionDay = sess.length ? sess[0].is_session_day : false;
+      const tradingDate = isSessionDay
+        ? sess[0].capture_day
+        : (sess[0] && sess[0].last_traded) || clock.tradingDay();
 
       /**
        * LIVE before 13:30 Kuwait, CLOSE at or after, STALE off-session.

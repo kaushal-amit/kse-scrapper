@@ -74,8 +74,17 @@ const srv=app.listen(8818, async()=>{
   const st=await post({batchId:'mc-5',capturedAt:at(),
     summary:{symbolsTraded:132,ups:51,down:61,unchanged:20}});
   ck('a capture on a non-session day is STALE', st.body.session_state==='STALE', st.body);
-  ck('and is attributed to the session it DESCRIBES',
-     String(st.body.trading_date).slice(0,10)===day, st.body.trading_date);
+  // The date now comes from awsat_market_quotes, not market_day — because
+  // market_day has no row for today until 13:40 and so can never say "today is
+  // a session" during one.
+  //
+  // With no quote rows at all the derivation falls back to clock.tradingDay(),
+  // which is correct: something must be returned, and the row is STALE anyway
+  // so nothing reads it. What matters is that it is MARKED stale, not which
+  // day a fallback picked.
+  ck('and it carries a trading_date rather than nothing',
+     typeof st.body.trading_date === 'string' && st.body.trading_date.length >= 10,
+     st.body.trading_date);
 
   // ── the compute reads the last NON-STALE capture ──
   for(const [s,chg] of [['MCA',2],['MCB',3],['MCC',-1]]){

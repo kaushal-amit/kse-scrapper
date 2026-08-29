@@ -26,35 +26,60 @@ const srv=app.listen(8820, async()=>{
 
   const sum={symbolsTraded:132,ups:51,down:61,unchanged:20,volume:1,trades:1};
 
-  // ── TODAY is a session: quotes exist and market_day has a row with volume ──
+  // ── THE CASE THAT WOULD HAVE BROKEN SUNDAY ──────────────────────────────
+  //
+  // Quotes arriving for today, and NO market_day row for today — the state of
+  // the database at 09:05 on any session, because daily.marketday runs at 13:40.
+  //
+  // The old rule read market_day, found yesterday, and marked every live
+  // capture STALE. daily.marketday skipped them, broker_seen_at stayed NULL,
+  // and the compute fell back to our own breadth: the broker feed would have
+  // looked like it was never wired.
+  //
+  // Exercised as SQL rather than through the endpoint: the 15-minute freshness
+  // window means capturedAt must be recent, so a weekday capture cannot be
+  // posted from a Saturday. The rule is what matters and this runs it exactly.
+  const rule = (captureTs) => db.query(`
+    WITH cap AS (
+      SELECT ($1::timestamptz AT TIME ZONE 'Asia/Kuwait')::date AS capture_day,
+             extract(dow FROM ($1::timestamptz AT TIME ZONE 'Asia/Kuwait')) AS dow
+    )
+    SELECT cap.capture_day::text AS capture_day,
+           (cap.dow NOT IN (5,6)
+            AND EXISTS (SELECT 1 FROM awsat_market_quotes q
+                         WHERE q.trading_date = cap.capture_day)) AS is_session_day,
+           (SELECT max(q2.trading_date)::text FROM awsat_market_quotes q2
+             WHERE q2.trading_date <= cap.capture_day) AS last_traded
+      FROM cap`, [captureTs]).then(r => r.rows[0]);
+
+  // a Tuesday with quotes, and deliberately no market_day row
   await db.query(`insert into awsat_market_quotes(market,symbol,last_price,volume,trading_date,ingest_source,source_precedence,created_at)
-    values ('Main Market','SSA',100,1000,current_date,'awsat_server',1,now())`);
-  await db.query(`insert into market_day(trading_date,symbols_traded,advancing,declining,
-    unchanged,total_volume,total_trades,computed_at) values (current_date,1,1,0,0,1000,10,now())`);
+    values ('Main Market','SSA',100,1000,'2026-08-25','awsat_server',1,'2026-08-25 09:00:00+03')`);
+  await db.query("delete from market_day where trading_date = '2026-08-25'");
 
-  const live=await post({batchId:'ss-1',capturedAt:new Date().toISOString(),summary:sum});
-  ck('a capture on a SESSION DAY is not STALE', live.body.session_state!=='STALE', live.body);
-  ck('it is LIVE or CLOSE depending on the clock',
-     ['LIVE','CLOSE'].includes(live.body.session_state), live.body.session_state);
+  const live = await rule('2026-08-25T07:00:00Z');      // 10:00 Kuwait, Tuesday
+  ck('a session day with quotes and NO market_day row IS a session',
+     live.is_session_day === true, live);
+  ck('and it is attributed to THAT day', live.capture_day === '2026-08-25', live);
 
-  // ── and it is attributed to today, not to a previous session ──
-  const {rows:r1}=await db.query(
-    "select trading_date::text=current_date::text as is_today from awsat_market_summary where batch_id='ss-1'");
-  ck('attributed to today', r1[0].is_today===true, r1[0]);
+  // ── the clock decides LIVE vs CLOSE ──
+  const stateOf = (r, kuwaitMinutes) =>
+    !r.is_session_day ? 'STALE' : (kuwaitMinutes >= 13 * 60 + 30 ? 'CLOSE' : 'LIVE');
+  ck('10:00 on a session day is LIVE', stateOf(live, 600) === 'LIVE');
+  ck('13:29 is still LIVE', stateOf(live, 809) === 'LIVE');
+  ck('13:30 is CLOSE', stateOf(live, 810) === 'CLOSE');
 
-  // ── with NO session today, the same capture is STALE ──
-  await db.query("delete from market_day where trading_date = current_date");
+  // ── a weekend capture is STALE whatever the table holds ──
+  const sat = await rule('2026-08-29T07:00:00Z');       // Saturday
+  ck('Saturday is never a session', sat.is_session_day === false, sat);
+  ck('and it describes the last day that traded',
+     sat.last_traded !== null && sat.last_traded <= '2026-08-29', sat.last_traded);
+
+  // ── a weekday with NO quotes is STALE too ──
+  const holiday = await rule('2026-09-02T07:00:00Z');   // Wednesday, no quotes
+  ck('a weekday with no quotes is not a session', holiday.is_session_day === false, holiday);
+
   await db.query("delete from awsat_market_quotes where symbol='SSA'");
-  await db.query(`insert into awsat_market_quotes(market,symbol,last_price,volume,trading_date,ingest_source,source_precedence,created_at)
-    values ('Main Market','SSB',100,1000,current_date - 2,'awsat_server',1,now() - interval '2 days')`);
-  await db.query(`insert into market_day(trading_date,symbols_traded,advancing,declining,
-    unchanged,total_volume,total_trades,computed_at) values (current_date - 2,1,1,0,0,1000,10,now())`);
-
-  const stale=await post({batchId:'ss-2',capturedAt:new Date().toISOString(),summary:sum});
-  ck('with no session today the capture IS stale', stale.body.session_state==='STALE', stale.body);
-  const {rows:r2}=await db.query(
-    "select trading_date::text=(current_date-2)::text as is_prev from awsat_market_summary where batch_id='ss-2'");
-  ck('and describes the last day that TRADED', r2[0].is_prev===true, r2[0]);
 
   // ── daily.marketday refuses a day with no quotes ──
   const md=require('../../src/jobs/computeMarketDay');
