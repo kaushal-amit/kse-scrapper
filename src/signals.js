@@ -18,11 +18,36 @@
  * the phone. The trader decides.
  */
 
-const NO_PROTECTION_BID = Number(process.env.SIG_NO_PROTECTION_BID || 20_000);
-const BUYERS_RATIO = Number(process.env.SIG_BUYERS_RATIO || 1.6);
-const BIG_QTY = Number(process.env.SIG_BIG_QTY || 100_000);
-const BAIT_MAX_AGE_SECS = Number(process.env.SIG_BAIT_MAX_AGE_SECS || 300);
-const TINY_TRADE_SHARES = Number(process.env.SIG_TINY_TRADE_SHARES || 100);
+/**
+ * ─── THE THRESHOLDS COME FROM kb_threshold ─────────────────────────────────
+ * These were env vars read at module load, which meant changing one needed a
+ * restart and changing it everywhere needed a deploy. They now come from the
+ * table, loaded once at boot.
+ *
+ * Read through a getter rather than captured at module load: the module is
+ * required before load() runs, so a captured value would be whatever the
+ * fallback was and the table would never take effect.
+ *
+ * The VALUES are unchanged, so every one of the 32 checks behaves exactly as
+ * before. Only where the number lives has moved.
+ */
+const T = require('./kb/thresholds');
+
+const th = (key, envVar, fallback) => {
+  // Before load() — a unit test requiring this module directly, or a tool that
+  // runs pre-seed — fall back rather than throw.
+  if (!T.isLoaded()) {
+    const v = envVar ? process.env[envVar] : undefined;
+    return v === undefined || v === '' ? fallback : Number(v);
+  }
+  return T.get(key);
+};
+
+const NO_PROTECTION_BID = () => th('sig_no_protection_bid', 'SIG_NO_PROTECTION_BID', 20_000);
+const BUYERS_RATIO = () => th('sig_buyers_ratio', 'SIG_BUYERS_RATIO', 1.6);
+const BIG_QTY = () => th('sig_big_qty', 'SIG_BIG_QTY', 100_000);
+const BAIT_MAX_AGE_SECS = () => th('sig_bait_max_age_secs', 'SIG_BAIT_MAX_AGE_SECS', 300);
+const TINY_TRADE_SHARES = () => th('sig_tiny_trade_shares', 'SIG_TINY_TRADE_SHARES', 100);
 
 /** Volume traded between two snapshots. Volume is cumulative for the session. */
 /**
@@ -112,10 +137,10 @@ const n = (v) => (v === null || v === undefined || v === '' ? null : Number(v));
  */
 function noProtection(prev, now) {
   const bidQty = n(now.bid_qty);
-  if (bidQty === null || bidQty >= NO_PROTECTION_BID) return null;
+  if (bidQty === null || bidQty >= NO_PROTECTION_BID()) return null;
   return {
     signal: 'NO_PROTECTION',
-    detail: `bid ${bidQty.toLocaleString()} < ${NO_PROTECTION_BID.toLocaleString()}`,
+    detail: `bid ${bidQty.toLocaleString()} < ${NO_PROTECTION_BID().toLocaleString()}`,
     bid_qty: bidQty,
   };
 }
@@ -136,7 +161,7 @@ function buyersRatio(prev, now) {
   if (bq === null || oq === null || oq === 0) return null;
 
   const ratio = bq / oq;
-  if (ratio < BUYERS_RATIO) return null;
+  if (ratio < BUYERS_RATIO()) return null;
 
   const before = n(prev.last_price);
   const after = n(now.last_price);
@@ -200,8 +225,8 @@ function wallPulled(prev, now) {
 function baitBid(prev, now) {
   const bidQty = n(now.bid_qty);
   const age = n(now.bid_age_secs);
-  if (bidQty === null || bidQty <= BIG_QTY) return null;
-  if (age === null || age >= BAIT_MAX_AGE_SECS) return null;
+  if (bidQty === null || bidQty <= BIG_QTY()) return null;
+  if (age === null || age >= BAIT_MAX_AGE_SECS()) return null;
 
   return {
     signal: 'BAIT_BID',
@@ -221,7 +246,7 @@ function frozen(prev, now) {
   const bq = n(now.bid_qty);
   const oq = n(now.offer_qty);
   if (bq === null || oq === null) return null;
-  if (bq <= BIG_QTY || oq <= BIG_QTY) return null;
+  if (bq <= BIG_QTY() || oq <= BIG_QTY()) return null;
 
   const traded = tradedBetween(prev, now);
   if (traded === null || traded > 0) return null;
@@ -247,7 +272,7 @@ function bidEmpty(prev, now) {
 
   const traded = tradedBetween(prev, now);
   if (traded === null || traded === 0) return null;
-  if (traded > TINY_TRADE_SHARES) return null;
+  if (traded > TINY_TRADE_SHARES()) return null;
 
   return {
     signal: 'BID_EMPTY',
@@ -303,6 +328,8 @@ module.exports = {
   bidEmpty,
   tradedBetween,
   THRESHOLDS: {
+    // Exported as FUNCTIONS: the value is read when a check runs, not when
+    // this module is required — which happens before load().
     NO_PROTECTION_BID, BUYERS_RATIO, BIG_QTY, BAIT_MAX_AGE_SECS, TINY_TRADE_SHARES,
   },
 };

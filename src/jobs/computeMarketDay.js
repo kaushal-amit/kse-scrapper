@@ -24,11 +24,15 @@ const M = require('./marketDayMetrics');
 const COLUMNS = [
   'trading_date',
   'symbols_traded', 'advancing', 'declining', 'unchanged',
+  // What OUR rule produced, written every run whatever the source.
+  'computed_advancing', 'computed_declining', 'computed_symbols',
   'pct_advancing', 'pct_advancing_ratio', 'breadth_5d_avg', 'thin_symbols',
   'avg_pct_change', 'median_pct_change', 'pct_change_p10', 'pct_change_p90',
   'total_volume', 'total_trades', 'volume_vs_20d', 'symbols_over_3x_daily',
   'new_symbols', 'suspended_symbols', 'renamed_symbols', 'cb_events_total',
   'regime', 'computed_at',
+  // Broker-sourced, from the last non-STALE capture of the session.
+  'turnover_kd', 'index_close', 'index_ytd_pct', 'broker_seen_at',
 ];
 
 /**
@@ -139,6 +143,23 @@ async function compute(tradingDay, runId) {
     symbol_day: ['chg_fils', 'chg_1d', 'trades', 'total_volume', 'data_quality'],
   });
 
+  /**
+   * A SESSION MUST HAVE TRADED.
+   *
+   * Same shape as the guard below: writing a row for a day with no quotes
+   * creates a market_day entry for a non-session, and the market-summary
+   * endpoint then derives trading_date from it. Two rows for 28 and 29 August
+   * got in that way and had to be deleted.
+   */
+  const { rows: traded } = await query(
+    'SELECT count(*)::int AS n FROM awsat_market_quotes WHERE trading_date = $1', [day]);
+  if (!traded[0].n) {
+    throw new Error(
+      `awsat_market_quotes has no rows for ${day}, so it was not a session. `
+      + 'Writing a market_day row would create one for a day that never traded, '
+      + 'and the market-summary endpoint reads those back as sessions.');
+  }
+
   const rows = await loadDay(day);
   if (!rows.length) {
     throw new Error(
@@ -154,9 +175,64 @@ async function compute(tradingDay, runId) {
   const trailing = await trailingTrades(day);
   const prior = await priorSessions(day);
 
+  /**
+   * DID THE BROKER ALREADY SPEAK FOR THIS DAY?
+   *
+   * If so its breadth stands and the compute must not replace it. A backfill
+   * silently overwriting a day's authoritative count would look exactly like a
+   * working system — the same shape as the KPPC/PHC inversion, where the
+   * counts were right and the rows were wrong.
+   */
+  /**
+   * The broker's own figures, from the LAST NON-STALE CAPTURE of this session.
+   *
+   * Read here rather than written by the ingest endpoint: one writer per table.
+   * The endpoint owns awsat_market_summary; this job owns market_day.
+   *
+   * STALE excluded because a shut market's panel shows the PREVIOUS session —
+   * Friday's read of Thursday's close is real data about Thursday, but it is
+   * not a capture OF Friday and must not speak for it.
+   *
+   * A session whose capture stopped early has no CLOSE row, so this finds
+   * whatever LIVE captures exist; a session nobody captured finds nothing and
+   * the computed breadth stands, which broker_seen_at IS NULL already handles.
+   */
+  const { rows: caps } = await query(
+    `SELECT captured_at, session_state, symbols_traded, advancing, declining,
+            unchanged, total_volume, total_trades, turnover_kd,
+            index_close, index_ytd_pct
+       FROM awsat_market_summary
+      WHERE trading_date = $1 AND session_state <> 'STALE'
+      ORDER BY captured_at DESC LIMIT 1`, [day]);
+  const broker = caps[0] || null;
+
+  if (broker) {
+    const ourPct = b.pct_advancing;
+    const theirPct = broker.symbols_traded
+      ? Number(((100 * broker.advancing) / broker.symbols_traded).toFixed(4)) : null;
+    // Rule 3: name both numbers when they part company. If this fires often,
+    // our rule is wrong and the broker is probably right.
+    if (ourPct !== null && theirPct !== null && Math.abs(ourPct - theirPct) > 2) {
+      log.warn('market_day: our breadth disagrees with the broker by more than 2 points', {
+        day,
+        ours: `${b.advancing}/${b.declining}/${b.unchanged} of ${b.symbols_traded} = ${ourPct}%`,
+        broker: `${broker.advancing}/${broker.declining}/${broker.unchanged} of ${broker.symbols_traded} = ${theirPct}%`,
+        difference: Number((ourPct - theirPct).toFixed(2)),
+        capturedAt: broker.captured_at,
+        sessionState: broker.session_state,
+        note: 'the broker figure stands. Ours is a reconstruction; theirs is the count.',
+      });
+    }
+  }
+
   const row = {
     trading_date: day,
     ...b,
+    // Written every run, whatever the source, so the disagreement is queryable
+    // across every session rather than grep-able for a fortnight.
+    computed_advancing: b.advancing,
+    computed_declining: b.declining,
+    computed_symbols: b.symbols_traded,
     ...dist,
     ...act,
     breadth_5d_avg: M.breadth5dAvg(
@@ -177,6 +253,27 @@ async function compute(tradingDay, runId) {
   };
   // breadth() returns no_prev_close for reporting; market_day has no column.
   delete row.no_prev_close;
+
+  // The broker's six stand. pct_advancing and regime are RECOMPUTED from them,
+  // not from ours — the regime must follow the authoritative count.
+  if (broker) {
+    row.symbols_traded = broker.symbols_traded;
+    row.advancing = broker.advancing;
+    row.declining = broker.declining;
+    row.unchanged = broker.unchanged;
+    row.total_volume = broker.total_volume ?? row.total_volume;
+    row.total_trades = broker.total_trades ?? row.total_trades;
+    row.turnover_kd = broker.turnover_kd ?? null;
+    row.index_close = broker.index_close ?? null;
+    row.index_ytd_pct = broker.index_ytd_pct ?? null;
+    // Stamped by THIS job now, from the capture it read.
+    row.broker_seen_at = broker.captured_at;
+    row.pct_advancing = broker.symbols_traded
+      ? Number(((100 * broker.advancing) / broker.symbols_traded).toFixed(4)) : null;
+    row.pct_advancing_ratio = (broker.advancing + broker.declining)
+      ? Number(((100 * broker.advancing) / (broker.advancing + broker.declining)).toFixed(4)) : null;
+    row.regime = M.regimeOf(row.pct_advancing);
+  }
 
   const values = COLUMNS.map((c) => (row[c] === undefined ? null : row[c]));
   await query(

@@ -29,6 +29,7 @@ const { config } = require('../config');
 const repo = require('../db/repositories');
 const { query } = require('../db/pool');
 const clock = require('../market/clock');
+const marketMetrics = require('../jobs/marketDayMetrics');
 const symbolCheck = require('../reconcileSymbols');
 const validate = require('../validate');
 const parse = require('../scrapers/parse');
@@ -403,6 +404,146 @@ function createRouter() {
       // Where the rows this instance accepts actually land.
       db,
     });
+  });
+
+  /**
+   * POST /market-summary — the broker's own top-panel figures.
+   *
+   * ─── ONE ROW PER DAY, LAST CAPTURE WINS ────────────────────────────────
+   * The script posts every minute. Nothing reads a minute-by-minute breadth
+   * series, and 260 near-identical rows a day is storage without a consumer,
+   * so each capture overwrites the day's row.
+   *
+   * The broker's six shared figures REPLACE the computed ones and stamp
+   * broker_seen_at, which is what stops the next backfill putting a
+   * reconstruction back over the exchange's own count.
+   */
+  router.post('/market-summary', async (req, res) => {
+    const started = Date.now();
+    const body = req.body || {};
+    const summary = body.summary || {};
+
+    const when = checkCapturedAt(body.capturedAt);
+    if (!when.ok) return res.status(400).json({ ok: false, error: when.error });
+
+    const num = (v) => {
+      if (v === null || v === undefined || v === '') return null;
+      const n = parse.toNumber(v);
+      return n === null || !Number.isFinite(n) ? null : n;
+    };
+    const int = (v) => { const n = num(v); return n === null ? null : Math.round(n); };
+
+    const advancing = int(summary.ups);
+    const declining = int(summary.down);
+    const symbols = int(summary.symbolsTraded);
+
+    // An all-null summary is a selector failure, not data. PERMANENT so the
+    // client stops retrying and dumps the markup instead.
+    if (advancing === null && declining === null && symbols === null) {
+      return res.status(400).json({
+        ok: false,
+        error: 'every breadth figure was null — the panel selectors have moved',
+      });
+    }
+
+    try {
+      const replay = await replayIfSeen(body.batchId);
+      if (replay) {
+        log.info('ingest: duplicate market summary replayed', { batchId: body.batchId });
+        return res.json(replay);
+      }
+
+      /**
+       * WHICH SESSION DO THESE FIGURES DESCRIBE?
+       *
+       * From days that ACTUALLY TRADED. The earlier rule asked
+       * awsat_market_quotes for the newest trading_date at or before the
+       * capture — and gave two different answers ten minutes apart, because a
+       * quote row dated the 28th arrived in between. The same panel wrote to
+       * two different days' rows.
+       *
+       * A derivation that changes as unrelated data arrives is not a
+       * derivation. market_day only holds sessions that produced volume, so it
+       * cannot move under a capture.
+       */
+      /**
+       * The comparison is done in SQL, not in JavaScript.
+       *
+       * ─── WHY ────────────────────────────────────────────────────────────
+       * The driver returns trading_date as a Date object, and
+       * String(new Date(...)) gives "Fri Aug 28 2026 21:00:00 GMT+0000". Slicing
+       * ten characters off that yields "Fri Aug 2", which can never equal
+       * "2026-08-29" — so isSessionDay was ALWAYS false and every capture filed
+       * as STALE, whenever it was taken.
+       *
+       * daily.marketday skips STALE rows, so the broker's breadth would never
+       * have reached market_day. It would have looked like the scraper was not
+       * posting, while it posted perfectly and was filed wrong.
+       *
+       * Comparing ::date to ::date in SQL removes the class of error: no Date
+       * object reaches a string comparison, and no timezone is applied twice.
+       */
+      const { rows: sess } = await query(
+        `SELECT trading_date::text AS trading_date,
+                (trading_date = ($1::timestamptz AT TIME ZONE 'Asia/Kuwait')::date)
+                  AS is_session_day
+           FROM market_day
+          WHERE trading_date <= ($1::timestamptz AT TIME ZONE 'Asia/Kuwait')::date
+            AND COALESCE(total_volume, 0) > 0
+          ORDER BY trading_date DESC LIMIT 1`, [when.capturedAt]);
+
+      const captured = new Date(when.capturedAt);
+      const tradingDate = sess.length ? sess[0].trading_date : clock.tradingDay();
+      const isSessionDay = sess.length ? sess[0].is_session_day : false;
+
+      /**
+       * LIVE before 13:30 Kuwait, CLOSE at or after, STALE off-session.
+       *
+       * Deliberately NOT "the last capture of the day is the close": that would
+       * promote a session that stopped at 12:23 to a complete one. A truncated
+       * session gets no CLOSE row at all, which is the truth — nobody captured
+       * the close — and market_day falls back to computing.
+       */
+      const kuwaitMinutes = (() => {
+        const k = new Date(captured.getTime() + 3 * 3600_000);   // UTC+3, no DST
+        return k.getUTCHours() * 60 + k.getUTCMinutes();
+      })();
+      const sessionState = !isSessionDay ? 'STALE'
+        : (kuwaitMinutes >= 13 * 60 + 30 ? 'CLOSE' : 'LIVE');
+
+      const res2 = await query(`
+        INSERT INTO awsat_market_summary
+          (captured_at, trading_date, session_state, symbols_traded, advancing,
+           declining, unchanged, total_volume, total_trades, turnover_kd,
+           index_close, index_ytd_pct, fields_found, batch_id, source)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'awsat_client')
+        ON CONFLICT (captured_at) DO NOTHING
+        RETURNING captured_at`,
+      [when.capturedAt, tradingDate, sessionState, symbols, advancing, declining,
+        int(summary.unchanged), int(summary.volume), int(summary.trades),
+        num(summary.turnover), num(summary.indexClose), num(summary.ytdPct),
+        body.fieldsFound ?? null, body.batchId ?? null]);
+
+      const counts = { offered: 1, inserted: res2.rowCount, rejected: 0 };
+      await recordSubmission(body.batchId, 'market-summary', 'awsat_client', when.capturedAt, counts);
+      await logRun('ingest.marketsummary', tradingDate, counts, started);
+
+      if (sessionState === 'STALE') {
+        log.info('ingest: market summary stored as STALE', {
+          capturedOn: captured.toISOString().slice(0, 10), describes: tradingDate,
+          note: 'a shut market shows the LAST session — stored and marked, not discarded',
+        });
+      }
+
+      // NOTE: market_day is NOT written here. One writer per table —
+      // daily.marketday reads the last non-STALE capture of the session.
+      return res.json({
+        ok: true, ...counts, trading_date: tradingDate, session_state: sessionState,
+      });
+    } catch (err) {
+      log.error('ingest: market summary failed', { err: err.message });
+      return res.status(500).json({ ok: false, error: err.message });
+    }
   });
 
   /**

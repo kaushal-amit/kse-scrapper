@@ -140,6 +140,18 @@ async function main() {
   const health = await db.healthCheck();
   log.info('database reachable', { version: health.version });
 
+  /**
+   * THE THRESHOLDS, BEFORE ANYTHING READS THEM.
+   *
+   * Loaded once here rather than per query: the fast loop would otherwise ask
+   * for the same thirty numbers 1,440 times a session.
+   *
+   * A missing key FAILS THE BOOT even where a fallback exists. A gate running
+   * on a fallback nobody chose is a gate nobody decided — and it looks exactly
+   * like a gate that is working.
+   */
+  await require('./kb/thresholds').load({ strict: true });
+
   // Applying migrations at boot keeps environments consistent; it is a no-op
   // when everything is already applied.
   await migrate();

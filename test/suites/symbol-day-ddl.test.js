@@ -28,7 +28,12 @@ let p=0,n=0;const ck=(t,c,x)=>{n++;if(c)p++;else console.log('  FAIL:',t,JSON.st
   // +close_source (028). THIN says "something was wrong"; close_source says
   // exactly what — 14 of 29 captured days have a close that is the last
   // Trading print rather than the official close.
-  ck('94 columns after migration 028', sd.length===94, sd.length);
+  // +4 from 031: markup, resumed, lift, hit — the fields the front end reads
+  // that had no column. resumed stays NULL: unknown, not "never suspended".
+  ck('98 columns after migration 031', sd.length===98, sd.length);
+  for (const c of ['markup','resumed','lift','hit']) {
+    ck(c + ' present', !!name(c));
+  }
   ck('close_source present', !!name('close_source'));
   ck('prev_session_gap_days present — "5d" can span 11 calendar days',
      !!name('prev_session_gap_days'));
@@ -88,7 +93,15 @@ let p=0,n=0;const ck=(t,c,x)=>{n++;if(c)p++;else console.log('  FAIL:',t,JSON.st
   const md=await cols('market_day');
   ck('market_day exists', md.length>0, md.length);
   // 21 from the DDL + thin_symbols + pct_advancing_ratio (migration 023).
-  ck('23 columns after migration 023', md.length===23, md.length);
+  // +7 from 030: the broker's summary overwrites the computed breadth on the
+  // same row rather than living in a second table, and computed_* keep ours so
+  // the disagreement stays queryable.
+  ck('30 columns after migration 030', md.length===30, md.length);
+  ck('broker_seen_at present — what stops a backfill overwriting the exchange count',
+     md.some(c=>c.column_name==='broker_seen_at'));
+  ck('computed_* kept so "do we disagree often" is a query, not a grep',
+     ['computed_advancing','computed_declining','computed_symbols']
+       .every(c=>md.some(x=>x.column_name===c)));
   ck('thin_symbols present — THIN rows count toward breadth but are explainable',
      md.some(c=>c.column_name==='thin_symbols'));
   ck('pct_advancing_ratio stored alongside, for comparison only',

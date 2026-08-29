@@ -1,0 +1,245 @@
+<div class="layout-row">
+                                                                <div data-id="topPanel-volume" class="layout-col pad-m-r">
+                                                                    <div class="font-l bold prominent-fore-color pad-s-b">--</div>
+                                                                    <div class="font-m fade-fore-color toppanel-back">Volume</div>
+                                                                </div>
+
+                                                                <div data-id="topPanel-turnover" class="layout-col ms-top-bar-padding-x-large-left">
+                                                                    <div class="font-l bold prominent-fore-color pad-s-b">--</div>
+                                                                    <div class="font-m fade-fore-color toppanel-back">Turnover</div>
+                                                                </div>
+
+                                                            <div class="layout-col ms-top-bar-padding-x-large-left">
+                                                                <div class="font-l bold prominent-fore-color pad-s-b">--</div>
+                                                                <div class="font-m fade-fore-color toppanel-back">Trades</div>
+                                                            </div>
+
+                                                                <div data-id="topPanel-ytd" class="ms-top-bar-padding-x-large-left">
+                                                                    <div class="font-l bold up-fore-color pad-s-b ltr">
+                                                                        <span class="up-fore-color">--</span>
+                                                                    </div>
+                                                                    <div class="font-m fade-fore-color toppanel-back">YTD %</div>
+                                                                </div>
+                                                        </div>
+
+────────
+
+<div class="layout-row">
+                                                                <div data-id="topPanel-volume" class="layout-col pad-m-r">
+                                                                    <div class="font-l bold prominent-fore-color pad-s-b">--</div>
+                                                                    <div class="font-m fade-fore-color toppanel-back">Volume</div>
+                                                                </div>
+
+                                                                <div data-id="topPanel-turnover" class="layout-col ms-top-bar-padding-x-large-left">
+                                                                    <div class="font-l bold prominent-fore-color pad-s-b">--</div>
+                                                                    <div class="font-m fade-fore-color toppanel-back">Turnover</div>
+                                                                </div>
+
+                                                            <div class="layout-col ms-top-bar-padding-x-large-left">
+                                                                <div class="font-l bold prominent-fore-color pad-s-b">--</div>
+                                                                <div class="font-m fade-fore-color toppanel-back">Trades</div>
+                                                            </div>
+
+                                                                <div data-id="topPanel-ytd" class="ms-top-bar-padding-x-large-left">
+                                                                    <div class="font-l bold up-fore-color pad-s-b ltr">
+                                                                        <span class="up-fore-color">--</span>
+                                                                    </div>
+                                                                    <div class="font-m fade-fore-color toppanel-back">YTD %</div>
+                                                                </div>
+                                                        </div>
+
+────────
+
+<div class="layout-row">
+                                                                <div data-id="topPanel-volume" class="layout-col pad-m-r">
+                                                                    <div class="font-l bold prominent-fore-color pad-s-b">--</div>
+                                                                    <div class="font-m fade-fore-color toppanel-back">Volume</div>
+                                                                </div>
+
+                                                                <div data-id="topPanel-turnover" class="layout-col ms-top-bar-padding-x-large-left">
+                                                                    <div class="font-l bold prominent-fore-color pad-s-b">--</div>
+                                                                    <div class="font-m fade-fore-color toppanel-back">Turnover</div>
+                                                                </div>
+
+                                                            <div class="layout-col ms-top-bar-padding-x-large-left">
+                                                                <div class="font-l bold prominent-fore-color pad-s-b">--</div>
+                                                                <div class="font-m fade-fore-color toppanel-back">Trades</div>
+                                                            </div>
+
+                                                                <div data-id="topPanel-ytd" class="ms-top-bar-padding-x-large-left">
+                                                                    <div class="font-l bold up-fore-color pad-s-b ltr">
+                                                                        <span class="up-fore-color">--</span>
+                                                                    </div>
+                                                                    <div class="font-m fade-fore-color toppanel-back">YTD %</div>
+                                                                </div>
+                                                        </div>
+
+────────
+
+<div class="layout-row">
+                                                                <div data-id="topPanel-volume" class="layout-col pad-m-r">
+                                                                    <div class="font-l bold prominent-fore-color pad-s-b">--</div>
+                                                                    <div class="font-m fade-fore-color toppanel-back">Volume</div>
+                                                                </div>
+
+                                                                <div data-id="topPanel-turnover" class="layout-col ms-top-bar-padding-x-large-left">
+                                                                    <div class="font-l bold prominent-fore-color pad-s-b">--</div>
+                                                                    <div class="font-m fade-fore-color toppanel-back">Turnover</div>
+                                                                </div>
+
+                                                            <div class="layout-col ms-top-bar-padding-x-large-left">
+                                                                <div class="font-l bold prominent-fore-color pad-s-b">--</div>
+                                                                <div class="font-m fade-fore-color toppanel-back">Trades</div>
+                                                            </div>
+
+                                                                <div data-id="topPanel-ytd" class="ms-top-bar-padding-x-large-left">
+                                                                    <div class="font-l bold up-fore-color pad-s-b ltr">
+                                                                        <span class="up-fore-color">--</span>
+                                                                    </div>
+                                                                    <div class="font-m fade-fore-color toppanel-back">YTD %</div>
+                                                                </div>
+                                                        </div>
+
+────────
+
+<div class="layout-row">
+                                                                    <div data-id="topPanel-symbol" class="layout-col mgn-l-r">
+                                                                        <div class="font-l bold h-left prominent-fore-color pad-s-b">--</div>
+                                                                        <div class="font-m h-left fade-fore-color">Symbols Traded</div>
+                                                                    </div>
+
+                                                                    <div data-id="topPanel-chartIcon" class="layout-col">
+                                                                        <div class="pad-s-b ms-top-bar-padding-x-large-left mgn-m-l mgn-m-t">
+                                                                                <div class="progress-market ms-top-bar-progress-vertical ms-top-bar-vertical-top">
+                                                                                    <div role="progressbar" aria-valuenow="70" aria-valuemin="0" aria-valuemax="100" style="width:0%;" class="progress-bar up-back-color"></div>
+                                                                                </div>
+                                                                                <div class="progress-market ms-top-bar-progress-vertical ms-top-bar-vertical-top">
+                                                                                    <div role="progressbar" aria-valuenow="70" aria-valuemin="0" aria-valuemax="100" style="width:0%;" class="progress-bar down-back-color"></div>
+                                                                                </div>
+                                                                                <div class="progress-market ms-top-bar-progress-vertical ms-top-bar-vertical-top">
+                                                                                    <div role="progressbar" aria-valuenow="70" aria-valuemin="0" aria-valuemax="100" style="width:0%;" class="progress-bar highlight-back-color-2"></div>
+                                                                                </div>
+                                                                        </div>
+                                                                    </div>
+
+                                                            <div data-id="topPanel-ups" class="layout-col pad-m-l">
+                                                                <div class="font-l bold h-left up-fore-color pad-s-b">--</div>
+                                                                <div class="font-m h-left fade-fore-color">UPs</div>
+                                                            </div>
+                                                            <div data-id="topPanel-down" class="layout-col ms-top-bar-padding-x-large-left">
+                                                                <div class="font-l bold h-left down-fore-color pad-s-b">--</div>
+                                                                <div class="font-m h-left fade-fore-color">Down</div>
+                                                            </div>
+                                                            <div data-id="topPanel-unchanged" class="layout-col ms-top-bar-padding-x-large-left">
+                                                                <div class="font-l bold h-left highlight-fore-color pad-s-b">--</div>
+                                                                <div class="font-m h-left fade-fore-color">Unchanged</div>
+                                                            </div>
+                                                        </div>
+
+────────
+
+<div class="layout-row">
+                                                                    <div data-id="topPanel-symbol" class="layout-col mgn-l-r">
+                                                                        <div class="font-l bold h-left prominent-fore-color pad-s-b">--</div>
+                                                                        <div class="font-m h-left fade-fore-color">Symbols Traded</div>
+                                                                    </div>
+
+                                                                    <div data-id="topPanel-chartIcon" class="layout-col">
+                                                                        <div class="pad-s-b ms-top-bar-padding-x-large-left mgn-m-l mgn-m-t">
+                                                                                <div class="progress-market ms-top-bar-progress-vertical ms-top-bar-vertical-top">
+                                                                                    <div role="progressbar" aria-valuenow="70" aria-valuemin="0" aria-valuemax="100" style="width:0%;" class="progress-bar up-back-color"></div>
+                                                                                </div>
+                                                                                <div class="progress-market ms-top-bar-progress-vertical ms-top-bar-vertical-top">
+                                                                                    <div role="progressbar" aria-valuenow="70" aria-valuemin="0" aria-valuemax="100" style="width:0%;" class="progress-bar down-back-color"></div>
+                                                                                </div>
+                                                                                <div class="progress-market ms-top-bar-progress-vertical ms-top-bar-vertical-top">
+                                                                                    <div role="progressbar" aria-valuenow="70" aria-valuemin="0" aria-valuemax="100" style="width:0%;" class="progress-bar highlight-back-color-2"></div>
+                                                                                </div>
+                                                                        </div>
+                                                                    </div>
+
+                                                            <div data-id="topPanel-ups" class="layout-col pad-m-l">
+                                                                <div class="font-l bold h-left up-fore-color pad-s-b">--</div>
+                                                                <div class="font-m h-left fade-fore-color">UPs</div>
+                                                            </div>
+                                                            <div data-id="topPanel-down" class="layout-col ms-top-bar-padding-x-large-left">
+                                                                <div class="font-l bold h-left down-fore-color pad-s-b">--</div>
+                                                                <div class="font-m h-left fade-fore-color">Down</div>
+                                                            </div>
+                                                            <div data-id="topPanel-unchanged" class="layout-col ms-top-bar-padding-x-large-left">
+                                                                <div class="font-l bold h-left highlight-fore-color pad-s-b">--</div>
+                                                                <div class="font-m h-left fade-fore-color">Unchanged</div>
+                                                            </div>
+                                                        </div>
+
+────────
+
+<div class="layout-row">
+                                                                    <div data-id="topPanel-symbol" class="layout-col mgn-l-r">
+                                                                        <div class="font-l bold h-left prominent-fore-color pad-s-b">--</div>
+                                                                        <div class="font-m h-left fade-fore-color">Symbols Traded</div>
+                                                                    </div>
+
+                                                                    <div data-id="topPanel-chartIcon" class="layout-col">
+                                                                        <div class="pad-s-b ms-top-bar-padding-x-large-left mgn-m-l mgn-m-t">
+                                                                                <div class="progress-market ms-top-bar-progress-vertical ms-top-bar-vertical-top">
+                                                                                    <div role="progressbar" aria-valuenow="70" aria-valuemin="0" aria-valuemax="100" style="width:0%;" class="progress-bar up-back-color"></div>
+                                                                                </div>
+                                                                                <div class="progress-market ms-top-bar-progress-vertical ms-top-bar-vertical-top">
+                                                                                    <div role="progressbar" aria-valuenow="70" aria-valuemin="0" aria-valuemax="100" style="width:0%;" class="progress-bar down-back-color"></div>
+                                                                                </div>
+                                                                                <div class="progress-market ms-top-bar-progress-vertical ms-top-bar-vertical-top">
+                                                                                    <div role="progressbar" aria-valuenow="70" aria-valuemin="0" aria-valuemax="100" style="width:0%;" class="progress-bar highlight-back-color-2"></div>
+                                                                                </div>
+                                                                        </div>
+                                                                    </div>
+
+                                                            <div data-id="topPanel-ups" class="layout-col pad-m-l">
+                                                                <div class="font-l bold h-left up-fore-color pad-s-b">--</div>
+                                                                <div class="font-m h-left fade-fore-color">UPs</div>
+                                                            </div>
+                                                            <div data-id="topPanel-down" class="layout-col ms-top-bar-padding-x-large-left">
+                                                                <div class="font-l bold h-left down-fore-color pad-s-b">--</div>
+                                                                <div class="font-m h-left fade-fore-color">Down</div>
+                                                            </div>
+                                                            <div data-id="topPanel-unchanged" class="layout-col ms-top-bar-padding-x-large-left">
+                                                                <div class="font-l bold h-left highlight-fore-color pad-s-b">--</div>
+                                                                <div class="font-m h-left fade-fore-color">Unchanged</div>
+                                                            </div>
+                                                        </div>
+
+────────
+
+<div class="layout-row">
+                                                                    <div data-id="topPanel-symbol" class="layout-col mgn-l-r">
+                                                                        <div class="font-l bold h-left prominent-fore-color pad-s-b">--</div>
+                                                                        <div class="font-m h-left fade-fore-color">Symbols Traded</div>
+                                                                    </div>
+
+                                                                    <div data-id="topPanel-chartIcon" class="layout-col">
+                                                                        <div class="pad-s-b ms-top-bar-padding-x-large-left mgn-m-l mgn-m-t">
+                                                                                <div class="progress-market ms-top-bar-progress-vertical ms-top-bar-vertical-top">
+                                                                                    <div role="progressbar" aria-valuenow="70" aria-valuemin="0" aria-valuemax="100" style="width:0%;" class="progress-bar up-back-color"></div>
+                                                                                </div>
+                                                                                <div class="progress-market ms-top-bar-progress-vertical ms-top-bar-vertical-top">
+                                                                                    <div role="progressbar" aria-valuenow="70" aria-valuemin="0" aria-valuemax="100" style="width:0%;" class="progress-bar down-back-color"></div>
+                                                                                </div>
+                                                                                <div class="progress-market ms-top-bar-progress-vertical ms-top-bar-vertical-top">
+                                                                                    <div role="progressbar" aria-valuenow="70" aria-valuemin="0" aria-valuemax="100" style="width:0%;" class="progress-bar highlight-back-color-2"></div>
+                                                                                </div>
+                                                                        </div>
+                                                                    </div>
+
+                                                            <div data-id="topPanel-ups" class="layout-col pad-m-l">
+                                                                <div class="font-l bold h-left up-fore-color pad-s-b">--</div>
+                                                                <div class="font-m h-left fade-fore-color">UPs</div>
+                                                            </div>
+                                                            <div data-id="topPanel-down" class="layout-col ms-top-bar-padding-x-large-left">
+                                                                <div class="font-l bold h-left down-fore-color pad-s-b">--</div>
+                                                                <div class="font-m h-left fade-fore-color">Down</div>
+                                                            </div>
+                                                            <div data-id="topPanel-unchanged" class="layout-col ms-top-bar-padding-x-large-left">
+                                                                <div class="font-l bold h-left highlight-fore-color pad-s-b">--</div>
+                                                                <div class="font-m h-left fade-fore-color">Unchanged</div>
+                                                            </div>
+                                                        </div>
