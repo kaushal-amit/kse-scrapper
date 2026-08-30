@@ -59,9 +59,6 @@
    * awsat_stock_depth should hold LADDERS. If it is empty, that should be
    * visible rather than disguised.
    */
-  var POST_L1_AS_DEPTH = false;
-
-  var L1_EVERY_MS     = 60 * 1000;   // all symbols, level 1
   var LADDER_EVERY_MS = 3000;        // one symbol's full book, round-robin
   var MAX_LEVELS      = 20;   // the awsat_stock_depth CHECK ceiling
   var EQUITIES_ONLY   = true;
@@ -320,63 +317,15 @@
     });
   }
 
-  // ── TASK 1 — level 1 for EVERY symbol, from the socket ────────────────────
-  function l1Tick() {
-    flush();
-    if (!POST_L1_AS_DEPTH) {
-      stats.msg = 'level-1 is in awsat_market_quotes; depth holds ladders only';
-      return;
-    }
-    var capturedAt = new Date().toISOString();
-    var records = [];
-    var seen = {};
-    var skippedEmpty = 0;
-
-    board.forEach(function (q, sym) {
-      var m = master.get(String(sym).toUpperCase());
-      if (!m) return;
-      if (EQUITIES_ONLY && m.instr && m.instr !== '0') return;
-      if (KEEP_MARKETS.length && KEEP_MARKETS.indexOf(m.market) === -1) return;
-      var key = String(m.symbol || m.code).toUpperCase();
-      if (seen[key]) return;               // never the same stock twice
-      seen[key] = 1;
-
-      var bid = num(q.bbp), offer = num(q.bap);
-      var bidQty = num(q.bbq), offerQty = num(q.baq);
-
-      // ZERO IS NOT A PRICE. The socket reports 0 for a symbol with no live
-      // book — outside hours, suspended, or never subscribed. Posting those
-      // filled the depth table with 398 rows of level-1 zeros that look like
-      // data and bury whether the real ladder ever ran.
-      var hasBook = (bid > 0) || (offer > 0) || (bidQty > 0) || (offerQty > 0);
-      if (!hasBook) { skippedEmpty++; return; }
-      records.push({
-        symbol: m.symbol, code: m.code, level: 1,
-        bid: bid, bidQty: bidQty,
-        offer: offer, offerQty: offerQty,
-        capturedAt: capturedAt,
-      });
-    });
-
-    stats.l1Symbols = records.length;
-    stats.l1Empty = skippedEmpty;
-
-    if (!records.length) {
-      // Say WHICH it is. "nothing to send" covers both a dead tap and a closed
-      // market, and those need different responses.
-      stats.msg = skippedEmpty
-        ? ('no live books — ' + skippedEmpty + ' symbols all zero (market closed?)')
-        : ('no level-1 data yet (' + board.size + ' raw / ' + master.size + ' master)');
-      return;
-    }
-
-    post({ batchId: uuid(), token: TOKEN, capturedAt: capturedAt, levels: records, source: 'awsat_client' })
-      .then(function (j) {
-        stats.l1Posts++;
-        stats.msg = 'L1: ' + records.length + ' symbols → inserted ' + (j.inserted != null ? j.inserted : '?');
-      })
-      .catch(function (e) { stats.msg = 'L1 failed: ' + e.message + ' — queued'; });
-  }
+  // ── l1Tick REMOVED ────────────────────────────────────────────────────────
+  //
+  // It posted level 1 for every symbol on the board to /depth. That duplicates
+  // awsat_market_quotes, which already carries the touch, and it filled the
+  // depth table with 136 symbols at one level — crowding out the ladders the
+  // table exists for.
+  //
+  // older build with the flag on reintroduces it, and one did. Deleted rather
+  // than disabled.
 
   // ── TASK 2 — full ladder, one symbol per tick, strict rotation ────────────
   function symbolList() {
@@ -768,7 +717,120 @@
       });
   }
 
-  setTimeout(function () { l1Tick(); setInterval(l1Tick, L1_EVERY_MS); }, 8000);
+  /**
+   * The symbols to sweep, from /depth-symbols.
+   *
+   * ─── ALSO MISSING ─────────────────────────────────────────────────────────
+   * Like ladderSweep, this was called and never defined. Both had to exist for
+   * the ladder to run at all, and neither did.
+   *
+   * The endpoint serves depth_watchlist in SLOT ORDER, so pre-day slots 1-3 are
+   * swept before wake-ups and a short budget cuts the least important first.
+   *
+   * On failure the previous list is KEPT rather than cleared: a momentary
+   * network error should not stop the sweep, and an empty list is
+   * indistinguishable from "no slots assigned" to everything downstream.
+   */
+  function refreshSymbols() {
+    return fetch(SYMBOLS_URL, { cache: 'no-store' })
+      .then(function (r) {
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return r.json();
+      })
+      .then(function (j) {
+        var list = (j && j.symbols) || [];
+        if (!list.length) {
+          // A real state at 08:59, not an error: no pre-day picks and no
+          // wake-ups yet. The server logs a warning on a session day.
+          LADDER_SYMBOLS = [];
+          stats.listSource = 'depth_watchlist (empty)';
+          return;
+        }
+        if (list.length > LADDER_MAX_SAFE) {
+          stats.msg = 'ladder list is ' + list.length + ' symbols; ~'
+            + LADDER_MAX_SAFE + ' is the most that fits a 15s sweep';
+        }
+        LADDER_SYMBOLS = list.map(function (x) {
+          return typeof x === 'string' ? { symbol: x, code: null } : x;
+        });
+        stats.listSource = 'depth_watchlist · ' + (j.pre_day || 0) + ' pre-day, '
+          + (j.wakeup || 0) + ' wake-up';
+      })
+      .catch(function (e) {
+        // Keep whatever we had. Falling back to a hardcoded list would sweep
+        // symbols nobody chose and quietly fill the table with them.
+        if (!LADDER_SYMBOLS.length) {
+          LADDER_SYMBOLS = FALLBACK_SYMBOLS.map(function (x) {
+            return { symbol: x, code: null };
+          });
+          stats.listSource = 'FALLBACK — /depth-symbols unreachable (' + e.message + ')';
+        } else {
+          stats.listSource = 'kept previous list — ' + e.message;
+        }
+      });
+  }
+
+  /**
+   * ─── THE SWEEP ────────────────────────────────────────────────────────────
+   *
+   * This function did not exist. It was scheduled twice and never defined, so
+   * the script threw ReferenceError twelve seconds after load and the ladder
+   * never ran once — which is why three sessions produced level 1 only.
+   *
+   * One symbol at a time, in slot order, re-reading the list every sweep so a
+   * slot change takes effect without a reload. Sequential rather than parallel:
+   * the terminal shows ONE book, so two captures at once would read the same
+   * widget and file it under two symbols.
+   */
+  var sweeping = false;
+
+  function ladderSweep() {
+    if (sweeping) { stats.msg = 'previous sweep still running'; return; }
+    sweeping = true;
+    var started = Date.now();
+
+    // Re-read every sweep. The list is state, not configuration, and a
+    // wake-up can claim a slot mid-session.
+    refreshSymbols().then(function () {
+      var targets = LADDER_SYMBOLS.slice();
+      if (!targets.length) {
+        stats.msg = 'no symbols from /depth-symbols — nothing to sweep';
+        sweeping = false;
+        refresh();
+        return;
+      }
+
+      var i = 0;
+      var ok = 0;
+      var skipped = 0;
+
+      function next() {
+        // Stop at the budget rather than run into the next sweep: a sweep that
+        // overlaps its successor reads a book the other one just switched away
+        // from, and files it under the wrong symbol.
+        if (i >= targets.length || Date.now() - started > LADDER_BUDGET_MS) {
+          sweeping = false;
+          stats.sweeps = (stats.sweeps || 0) + 1;
+          stats.msg = 'swept ' + ok + '/' + targets.length
+            + (skipped ? ' · ' + skipped + ' skipped' : '')
+            + ' in ' + Math.round((Date.now() - started) / 100) / 10 + 's';
+          refresh();
+          return;
+        }
+        var target = targets[i++];
+        captureLadder(target, function (good) {
+          if (good) ok += 1; else skipped += 1;
+          next();
+        });
+      }
+      next();
+    }).catch(function (e) {
+      sweeping = false;
+      stats.msg = 'sweep failed: ' + e.message;
+      refresh();
+    });
+  }
+
   setTimeout(function () { ladderSweep(); setInterval(ladderSweep, 15 * 1000); }, 12000);
 
   // ── panel ─────────────────────────────────────────────────────────────────
@@ -779,7 +841,7 @@
     panel.style.cssText = 'position:fixed;z-index:2147483647;right:10px;top:10px;width:380px;background:#042f2e;color:#99f6e4;font:12px/1.45 monospace;border:1px solid #0891b2;border-radius:10px;padding:10px;';
     var h = document.createElement('div');
     h.style.cssText = 'font-weight:700;margin-bottom:6px;';
-    h.textContent = 'Depth — all symbols (L1) + rotating ladder';
+    h.textContent = 'Depth — ladder sweep';
     panel.appendChild(h);
     pre = document.createElement('div'); panel.appendChild(pre);
     var b = document.createElement('button');
@@ -798,7 +860,8 @@
     if (!pre) return;
     var list = symbolList().length;
     pre.innerHTML =
-      '<b>L1 (all symbols)</b> ' + stats.l1Symbols + ' with a book'
+      // The L1 sweep is gone; what matters now is where the list came from.
+      '<b>list</b> ' + (stats.listSource || 'not loaded yet')
         + (stats.l1Empty ? ', ' + stats.l1Empty + ' empty (skipped)' : '')
         + ' &nbsp; posts: ' + stats.l1Posts + '<br>' +
       'frames: ' + stats.frames + ' &nbsp; master: ' + master.size + (fullMasterFetched ? ' (full)' : ' (partial…)') + '<br><br>' +

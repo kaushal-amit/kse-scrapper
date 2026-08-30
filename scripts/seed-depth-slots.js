@@ -64,6 +64,47 @@ async function main() {
     }
   }
 
+  /**
+   * REFUSE THE WHOLE BATCH IF A SYMBOL ALREADY HOLDS A DIFFERENT SLOT.
+   *
+   * ─── WHY NOT JUST REASSIGN ─────────────────────────────────────────────
+   * The unique index enforces one slot per symbol, so reassigning CATTL from
+   * slot 3 to slot 1 fails — but it failed AFTER writing slot 1, leaving the
+   * day half-seeded with a raw Postgres error nobody can act on.
+   *
+   * Refusing up front is better than releasing the old slot silently: a
+   * pre-day pick that quietly moves is a pick nobody chose, and the point of
+   * slot order is that 1-3 are swept first.
+   */
+  const { rows: held } = await query(
+    `SELECT slot_no, symbol FROM depth_watchlist
+      WHERE trading_date = $1 AND symbol = ANY($2) AND released_at IS NULL`,
+    [DATE, SLOTS]);
+
+  const conflicts = held.filter((h) => SLOTS.indexOf(h.symbol.toUpperCase()) + 1 !== h.slot_no);
+  if (conflicts.length) {
+    console.error('\n  REFUSING — these symbols already hold a different slot today:\n');
+    for (const c of conflicts) {
+      console.error(`    ${c.symbol.padEnd(14)} holds slot ${c.slot_no}, `
+        + `you asked for slot ${SLOTS.indexOf(c.symbol.toUpperCase()) + 1}`);
+    }
+    console.error('\n  One symbol, one slot. Release it first, or seed it in the slot');
+    console.error('  it already holds:\n');
+    // The order they are ALREADY in. Building it by swapping pairs produced a
+    // list with a symbol twice — a suggestion that fails the moment it is run
+    // is worse than none.
+    const { rows: current } = await query(
+      `SELECT symbol FROM depth_watchlist
+        WHERE trading_date = $1 AND slot_type = 'PRE_DAY' AND released_at IS NULL
+        ORDER BY slot_no`, [DATE]);
+    if (current.length) {
+      console.error(`    --slots=${current.map((r) => r.symbol).join(',')}\n`);
+    }
+    console.error('  Or release: UPDATE depth_watchlist SET released_at = now()');
+    console.error(`               WHERE trading_date = '${DATE}' AND symbol = ANY(ARRAY[...]);\n`);
+    process.exit(1);
+  }
+
   if (!APPLY) {
     console.log('\n  Dry run — nothing written. Re-run with --apply.\n');
     return;

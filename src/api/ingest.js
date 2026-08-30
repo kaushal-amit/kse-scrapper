@@ -289,75 +289,87 @@ function createRouter() {
 
     const day = clock.tradingDay();
     try {
-      // THE STATE, from depth_watchlist. Slot order is priority order: the
-      // client sweeps in order and stops at its time budget, so pre-day slots
-      // 1-3 are swept before wake-ups.
-      /*
-       * The sweep list — TRADEABLE symbols only.
+      /**
+       * ─── IT EXPLAINS WHY THE LIST IS EMPTY ────────────────────────────────
        *
-       * ─── THREE FILTERS, TWO COLUMNS, DELIBERATELY DIFFERENT ────────────────────
+       * An empty list has four possible causes and they are indistinguishable
+       * from outside: no rows for this date, every row released, every symbol
+       * filtered as not tradeable, or the rows sitting in a different database
+       * from the one this process reads.
        *
-       *   symbol_day        is_primary      history keeps a delisted stock
-       *   market_day        is_tradeable    breadth excludes it
-       *   /depth-symbols    is_tradeable    never sweep it
-       *
-       * A symbol is primary but NOT tradeable for two distinct reasons: it sits on
-       * the Auction Market, or it is DELISTED. Both are correct. is_primary is never
-       * set false by either — BAREEQ keeps its 8 sessions in symbol_day and simply
-       * stops counting in breadth.
-       *
-       * This looks like an inconsistency and is not one. Do not "fix" it.
+       * Seven slots existed for exactly the date this asked for, and the
+       * endpoint still returned nothing — with no way to tell which of the four
+       * it was. So it now reports each count, and names the database it read.
        */
+      const { rows: diag } = await query(`
+        SELECT
+          (SELECT count(*)::int FROM depth_watchlist) AS rows_any_date,
+          (SELECT count(*)::int FROM depth_watchlist WHERE trading_date = $1) AS rows_today,
+          (SELECT count(*)::int FROM depth_watchlist
+            WHERE trading_date = $1 AND released_at IS NOT NULL) AS released,
+          (SELECT count(*)::int FROM depth_watchlist w
+            WHERE w.trading_date = $1 AND w.released_at IS NULL
+              AND EXISTS (SELECT 1 FROM instruments i
+                           WHERE i.symbol = w.symbol AND i.is_tradeable = false)) AS not_tradeable,
+          (SELECT max(trading_date)::text FROM depth_watchlist) AS newest_slot_date,
+          current_database() AS db`, [day]);
+      const d = diag[0];
+
       const { rows } = await query(`
-        SELECT w.slot_no, w.symbol, w.slot_type,
-               i.code, i.is_tradeable, i.broker_status, i.market
+        SELECT w.slot_no, w.symbol, w.slot_type, i.code
           FROM depth_watchlist w
           LEFT JOIN LATERAL (
-            SELECT code, is_tradeable, broker_status, market FROM instruments
-             WHERE symbol = w.symbol LIMIT 1
+            SELECT code FROM instruments
+             WHERE symbol = w.symbol AND code IS NOT NULL AND is_primary LIMIT 1
           ) i ON true
          WHERE w.trading_date = $1 AND w.symbol IS NOT NULL AND w.released_at IS NULL
-           -- NEVER OFFER A SLOT TO A SYMBOL THAT CANNOT BE TRADED.
-           --
-           -- Delisted, or on the auction market: sweeping its book costs one of
-           -- eight slots and returns something nobody can act on. Unknown
-           -- symbols are kept — a new listing has no registry row yet.
+           -- NEVER OFFER A SLOT TO A SYMBOL THAT CANNOT BE TRADED. Unknown
+           -- symbols are KEPT: a new listing has no registry row yet.
            AND NOT EXISTS (
              SELECT 1 FROM instruments i2
               WHERE i2.symbol = w.symbol AND i2.is_tradeable = false)
          ORDER BY w.slot_no`, [day]);
 
-      // A slot can be held by a symbol that has since become untradeable.
-      // Silently shrinking the list from 8 to 7 is exactly the class of thing
-      // that goes unnoticed for a month, so each drop is named with its reason.
-      const usable = [];
-      for (const r of rows) {
-        if (r.is_tradeable === false) {
-          const why = r.broker_status === 'DELISTED' ? 'DELISTED'
-            : r.market === 'Auction Market' ? 'Auction Market' : 'not primary';
-          logDroppedOnce(day, r.symbol, why);
-          continue;
-        }
-        usable.push(r);
+      const preDay = rows.filter((r) => r.slot_type === 'PRE_DAY').length;
+
+      if (!rows.length) {
+        // One line that says WHICH of the four it was.
+        const why = d.rows_today === 0
+          ? (d.rows_any_date === 0
+            ? `depth_watchlist is EMPTY in database "${d.db}" — the seeder wrote somewhere else`
+            : `no slots for ${day}; newest slots are dated ${d.newest_slot_date}`)
+          : d.released === d.rows_today ? 'every slot for today is released'
+            : d.not_tradeable ? `${d.not_tradeable} slot(s) hold symbols marked is_tradeable = false`
+              : 'rows exist and pass every filter — this should not happen';
+        log.warn('depth-symbols: serving an empty list', {
+          day, database: d.db, rowsToday: d.rows_today, rowsAnyDate: d.rows_any_date,
+          released: d.released, notTradeable: d.not_tradeable,
+          newestSlotDate: d.newest_slot_date, why,
+        });
+        return res.json({
+          symbols: [], source: 'depth_watchlist', trading_date: day,
+          pre_day: 0, wakeup: 0,
+          // Returned so one curl answers it, without server log access.
+          diagnostic: {
+            database: d.db, rows_today: d.rows_today, rows_any_date: d.rows_any_date,
+            released: d.released, not_tradeable: d.not_tradeable,
+            newest_slot_date: d.newest_slot_date, why,
+          },
+        });
       }
 
-      const preDay = usable.filter((r) => r.slot_type === 'PRE_DAY').length;
       if (!preDay && clock.isTradingDay(new Date())) {
-        // A warning, not a failure: no pre-day picks is a legitimate choice,
-        // and the day runs on wake-ups alone. Silent would be wrong.
         log.warn('depth-symbols: no PRE_DAY slots on a session day', {
-          day,
-          note: 'seed them with scripts/seed-depth-slots.js, or the day runs on wake-ups only',
+          day, note: 'seed with scripts/seed-depth-slots.js, or the day runs on wake-ups only',
         });
       }
 
       return res.json({
-        symbols: usable.map((r) => ({ symbol: r.symbol, code: r.code, slot: r.slot_no })),
+        symbols: rows.map((r) => ({ symbol: r.symbol, code: r.code, slot: r.slot_no })),
         source: 'depth_watchlist',
         trading_date: day,
         pre_day: preDay,
-        wakeup: usable.length - preDay,
-        dropped: rows.length - usable.length,
+        wakeup: rows.length - preDay,
       });
     } catch (err) {
       log.error('depth-symbols failed', { err: err.message });
