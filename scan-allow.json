@@ -1,0 +1,40 @@
+{
+  "columns": [
+    {
+      "name": "raw",
+      "reason": "JSONB. Read as raw->>'netOrdVal' and similar, never by column name.",
+      "until": "2026-12-31"
+    },
+    {
+      "name": "id",
+      "reason": "bigserial primary keys, referenced by RETURNING and by foreign keys rather than by name.",
+      "until": "2026-12-31"
+    }
+  ],
+  "tables": [
+    {
+      "name": "symbol_day_before_032",
+      "reason": "a backfill snapshot, dropped once the 032 diff has been read.",
+      "until": "2026-09-30"
+    },
+    {
+      "name": "market_day_before_prevfix",
+      "reason": "same \u2014 a snapshot kept only to diff against.",
+      "until": "2026-09-30"
+    }
+  ],
+  "modules": [
+    {
+      "name": "src/scrapers/transform.js",
+      "reason": "imported only by test/suites/transform.test.js \u2014 covered by tests, called by no shipping code. Ambiguous: dead code that kept its tests, or live code whose caller was removed. Decide before this expires.",
+      "until": "2026-09-30"
+    }
+  ],
+  "functions": [
+    {
+      "name": "source",
+      "reason": "a word inside this scanner's own regex literal \u2014 /source(/ parses as a call. A JS tokeniser would fix it properly; one entry is cheaper than one.",
+      "until": "2026-12-31"
+    }
+  ]
+}

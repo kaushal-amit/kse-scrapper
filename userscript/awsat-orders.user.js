@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         awsat / DirectFN — Order List → Server 1
 // @namespace    local.trading.tools
-// @version      2.0.0
+// @version      2.2.0
 // @description  Reads the Order List grid by cell-id and posts it to Server 1. No credentials leave the browser.
 // @match        *://*.awsatbroker.com/*
 // @match        *://awsatbroker.com/*
@@ -23,36 +23,68 @@
 (function () {
   'use strict';
 
-  var SERVER = 'http://localhost:8787';   // Server 1
+  /**
+   * The running build, shown on the panel.
+   *
+   * Two scripts both reported @version 2.0.0 — one with the money fields and
+   * the iframe walk, one without. Tampermonkey showed the same string for
+   * each, so a session went into diagnosing a bug that was already fixed.
+   * A build that cannot identify itself is a build nobody can debug.
+   */
+  var VERSION = '2.2.0';
+
+  var SERVER = 'https://scrapper.99labs.space';   // Server 1
   var TOKEN  = 'CHANGE-ME';               // must equal INGEST_TOKEN
   var EVERY_MS = 60 * 1000;
   var MAX_RETRY_QUEUE = 30;
 
+  /**
+   * cell-id -> field. Several ids map to `orderId` because the grid has not
+   * used one consistently: order_list_snapshots carries the id under
+   * clOrdId on some rows and nowhere at all on 12,482 of 13,465.
+   *
+   * Listing the alternatives is cheaper than guessing which is current, and
+   * UNMAPPED_SEEN below reports any id we still do not know.
+   */
   var CELL_MAP = {
     'symbolInfo.dispProp1': 'symbolRaw',
+    'symbolInfo.sDes': 'symbolRaw',
+    'symbolInfo.sDesc': 'symbolRaw',      // a third spelling, seen in the wild
     clOrdId:  'orderId',
+    orderId:  'orderId',
+    ordId:    'orderId',
+    orderID:  'orderId',
+    ordNo:    'orderId',
+    orderNo:  'orderId',
     ordSts:   'status',
+    status:   'status',
     ordSide:  'side',
+    side:     'side',
     ordQty:   'quantity',
+    qty:      'quantity',
     price:    'price',
     cumQty:   'filled',
+    filled:   'filled',
     pendQty:  'remaining',
+    remaining: 'remaining',
     adjustedCrdDte: 'stamp',
-    // THE MONEY COLUMNS. All three are in the grid already; the old extractor
-    // simply did not map them, so the P&L had to be rebuilt by hand.
-    avgPrice:   'avgPrice',
-    ordVal:     'ordVal',
-    netOrdVal:  'netOrdVal',     // <- this one IS the P&L
-    // Present in the grid, and columns exist for them since migration 020.
-    // The MIGRATION fills these from history; without capturing them here,
-    // today's rows would be poorer than the ones we imported — the newest data
-    // the thinnest, which is exactly backwards.
-    ordTyp:     'orderType',     // Limit or Market. SPREAD never crosses the
-                                 // spread, so a Market fill is outside the
-                                 // strategy, not a data point within it.
-    exg:        'exchange',
+    adjustedExpTime: 'expiry',
+    ordTyp:   'orderType',
+    exg:      'exchange',
+    code:     'code',
+
+    // ─── THE MONEY FIELDS ────────────────────────────────────────────────
+    // Present on every row of the grid, and absent from this map — so the
+    // script read them and threw them away. netOrdVal is the P&L: it is why
+    // net_value was NULL on 20 of 23 migrated orders and would have stayed
+    // NULL on every new one.
+    avgPrice:  'avgPrice',
+    ordVal:    'orderValue',
+    netOrdVal: 'netValue',
   };
 
+  /** Every cell-id seen that CELL_MAP does not know. Reported, then dumped. */
+  var unmappedSeen = {};
   var retryQueue = [];
   var stats = { posts: 0, lastCount: 0, queued: 0, msg: 'waiting for the order list…',
     scrollNote: '', expected: null, shortBy: 0 };
@@ -90,25 +122,85 @@
     return /^\d{4,}$/.test(t) ? t : null;
   }
 
-  function ordersWidget() {
-    var widgets = document.querySelectorAll('div[id^="orderList-"]');
-
-    for (var i = 0; i < widgets.length; i++) {
-      var w = widgets[i];
-      var active = w.querySelector('.wdgttl-tab-item.active span');
-      var label = active ? (active.textContent || '').replace(/\s+/g, ' ').trim() : null;
-      if (label && /^order list$/i.test(label)) return { widget: w, activeTab: label };
+  /**
+   * Every document on the page, the terminal's frames included.
+   *
+   * ─── WHY THIS EXISTS ──────────────────────────────────────────────────────
+   * document.querySelectorAll does not cross an iframe boundary. The widget
+   * renders inside a frame on the terminal page and directly in the document
+   * when popped out into its own tab — so a lookup that only searched the top
+   * document found it in one place and reported "waiting for the order list"
+   * in the other, with three orders on screen.
+   *
+   * The depth and market-summary scripts have always walked frames. This one
+   * never did.
+   */
+  function collectDocs(doc, acc) {
+    acc.push(doc);
+    var frames = doc.querySelectorAll('iframe, frame');
+    for (var i = 0; i < frames.length; i++) {
+      // Cross-origin frames throw on access. Skipping them is correct: the
+      // terminal's own frames are same-origin.
+      try { if (frames[i].contentDocument) collectDocs(frames[i].contentDocument, acc); } catch (e) {}
     }
+    return acc;
+  }
 
-    // No widget is on the Order List tab. Report which tab IS active, so the
-    // answer is "switch the tab", not "the scraper is broken".
-    for (var j = 0; j < widgets.length; j++) {
-      var a = widgets[j].querySelector('.wdgttl-tab-item.active span');
-      if (a) {
-        return { widget: null, activeTab: (a.textContent || '').replace(/\s+/g, ' ').trim() };
+  /**
+   * The Order List widget.
+   *
+   * ─── NO TAB CHECK ─────────────────────────────────────────────────────────
+   * An earlier version refused unless it could also prove the Order List tab
+   * was active, by reading `.wdgttl-tab-item.active span`. That markup differs
+   * between the embedded widget and the popped-out window, so the check failed
+   * on the terminal, the lookup returned null, and the panel read "waiting for
+   * the order list" with three orders on screen.
+   *
+   * The version that ran for months has no such check: take the widget and
+   * read it. If the grid holds no order rows the reader returns nothing, which
+   * is the same outcome without a guard that can be wrong.
+   *
+   * Two lookups, in order:
+   *   1. the widget by id
+   *   2. any clOrdId cell, climbing to its container — which finds the grid
+   *      even if the widget id is renamed
+   *
+   * Both run across every reachable frame, because the widget renders inside
+   * one on the terminal page and directly in the document when popped out.
+   */
+  function ordersWidget() {
+    var docs = collectDocs(document, []);
+
+    for (var d = 0; d < docs.length; d++) {
+      var w = docs[d].querySelector('div[id^="orderList-"]');
+      if (w) {
+        var active = w.querySelector('.wdgttl-tab-item.active span');
+        // Reported, never enforced: useful in the panel, and not a reason to
+        // refuse to read a grid that is right there.
+        return { widget: w, activeTab: active ? clean(active.textContent) : null, problem: null };
       }
     }
-    return { widget: null, activeTab: null };
+
+    for (var d2 = 0; d2 < docs.length; d2++) {
+      var c = docs[d2].querySelector('[cell-id="clOrdId"]');
+      if (c) {
+        var host = c.closest('.widget_new') || c.closest('.ember-table-tables-container');
+        if (host) {
+          return {
+            widget: host, activeTab: null, problem: null,
+            note: 'found by a clOrdId cell — the widget id prefix has changed',
+          };
+        }
+      }
+    }
+
+    return {
+      widget: null,
+      activeTab: null,
+      problem: 'no Order List grid in ' + docs.length + ' document(s)'
+        + (docs.length === 1 ? ' — no frames reachable from this page' : '')
+        + '. Is the Order List panel open?',
+    };
   }
 
   /**
@@ -135,10 +227,15 @@
   }
 
   /** Parse whatever rows are rendered right now. */
-  function readRenderedRows(body) {
+  function readRenderedRows(body, noId, seen) {
+    noId = noId || [];
     var buckets = new Map();
     body.querySelectorAll('.ember-table-table-row').forEach(function (row) {
       if (String(row.className).indexOf('header-row') >= 0) return;
+      // Count what is IN THE DOM, separately from what parses. "0 rows" means
+      // two completely different faults otherwise: an empty grid and a grid
+      // that was read and understood by none of it.
+      if (seen) seen.rows = (seen.rows || 0) + 1;
       var m = (row.getAttribute('style') || '').match(/top:\s*(-?[\d.]+)px/);
       var key = m ? 'T' + Math.round(parseFloat(m[1]))
                   : 'R' + Math.round(row.getBoundingClientRect().top);
@@ -160,10 +257,27 @@
           if (!value) return;
           if (id === 'ordSts' && title && title !== text) rec.statusReason = title;
           var field = CELL_MAP[id];
-          if (field && rec[field] == null) { rec[field] = value; hits++; }
+          if (field) {
+            if (rec[field] == null) { rec[field] = value; hits++; }
+          } else {
+            // An id we do not know. Recorded rather than ignored: the order id
+            // arriving under an unrecognised cell-id is exactly what makes a
+            // full grid read as empty.
+            unmappedSeen[id] = value;
+          }
         });
       });
-      if (hits && rec.orderId) out.push(rec);
+      /**
+       * ─── A ROW WITHOUT AN ID IS COUNTED, NOT DROPPED ────────────────────
+       *
+       * `hits && rec.orderId` threw away any row whose other eight cells
+       * mapped perfectly if that ONE cell-id was named something else — and
+       * nothing counted it, so the panel read "active and empty" while the
+       * grid was full.
+       */
+      if (!hits) return;
+      if (rec.orderId) out.push(rec);
+      else noId.push(rec);
     });
     return out;
   }
@@ -190,6 +304,43 @@
   }
 
   /**
+   * How many rows the grid SAYS it holds, independent of what we read.
+   *
+   * ─── IT WAS CALLED AND NEVER WRITTEN ──────────────────────────────────────
+   * The scan called this and it did not exist, so tick() threw ReferenceError
+   * on every cycle. Nothing caught it, so stats.msg never left its INITIAL
+   * value and the panel read "waiting for the order list…" while the grid was
+   * full — the same shape as ladderSweep in the depth script.
+   *
+   * A missing function is not a missing feature: it stops everything after it.
+   *
+   * The count comes from the virtualised list's own height. Ember sizes the
+   * container to rowHeight x rows, so total height over row height IS the row
+   * count, whether or not those rows are currently rendered. Null when neither
+   * can be measured — an honest unknown rather than a fabricated number.
+   */
+  function expectedRowCount(body) {
+    var list = body.querySelector('.lazy-list-container') || body;
+    var row = body.querySelector('.ember-table-table-row');
+    var rowH = row ? row.getBoundingClientRect().height : 0;
+    if (!rowH) {
+      var m = (row && (row.getAttribute('style') || '').match(/height:\s*([\d.]+)px/));
+      rowH = m ? parseFloat(m[1]) : 0;
+    }
+    if (!rowH) return null;
+
+    var total = list.scrollHeight || 0;
+    if (!total) {
+      var lm = (list.getAttribute('style') || '').match(/height:\s*([\d.]+)px/);
+      total = lm ? parseFloat(lm[1]) : 0;
+    }
+    if (!total) return null;
+
+    var n = Math.round(total / rowH);
+    return n > 0 && n < 5000 ? n : null;
+  }
+
+  /**
    * Read every row, scrolling through the virtualised grid.
    *
    * ─── WHY IT STEPS BY ROWS, NOT BY SCREENFULS ───────────────────────────
@@ -208,7 +359,9 @@
   function readOrders(done) {
     var found = ordersWidget();
     if (!found.widget) {
-      return done(null, found.activeTab
+      return done(null, found.problem
+        ? found.problem
+        : found.activeTab
         ? 'the "' + found.activeTab + '" tab is active — switch to Order List'
         : 'Order List widget not on screen');
     }
@@ -218,9 +371,11 @@
             || found.widget;
 
     var byId = new Map();
+    var noIdRows = [];
+    var seen = { rows: 0 };
     function collect() {
       var before = byId.size;
-      readRenderedRows(body).forEach(function (r) {
+      readRenderedRows(body, noIdRows, seen).forEach(function (r) {
         if (!byId.has(r.orderId)) byId.set(r.orderId, r);
       });
       return byId.size - before;      // how many NEW ones this window gave
@@ -230,7 +385,10 @@
 
     var targets = scrollTargets(body);
     if (!targets.length) {
-      stats.scrollNote = 'grid does not scroll — ' + byId.size + ' row(s) visible';
+      stats.scrollNote = 'grid does not scroll — ' + byId.size + ' order(s) from '
+        + seen.rows + ' DOM row(s)'
+        + (noIdRows.length ? ' · ' + noIdRows.length + ' READ BUT HAD NO ORDER ID' : '');
+      reportUnmapped(noIdRows, seen);
       return done([...byId.values()], null);
     }
 
@@ -295,6 +453,57 @@
     }, 250);
   }
 
+  /**
+   * Rows were read and had no id: say which cell-ids the grid actually used.
+   *
+   * Dumped ONCE to /ingest/debug, because the markup that explains it exists
+   * only in that moment — the same rule as the market-summary selectors. Being
+   * told "0 orders" a week later is undiagnosable; being told the grid used
+   * `ordNo` is a one-line fix.
+   */
+  /**
+   * Dumped once per PAGE LOAD, not once ever.
+   *
+   * A tab that was not logged in when the script started will find the grid
+   * later, and the markup it finds then is what matters. A flag that latches
+   * forever would suppress the one dump that could explain a real failure.
+   */
+  var dumped = false;
+  var dumpedAt = 0;
+  function reportUnmapped(noIdRows, seen) {
+    // Re-arm after ten minutes, so a late login gets its own dump.
+    if (dumped && Date.now() - dumpedAt > 600000) dumped = false;
+    var ids = Object.keys(unmappedSeen);
+
+    // Rows existed in the DOM and none became an order. That is a PARSE
+    // failure, and it is invisible if it reports the same "0" as an empty grid.
+    if (seen && seen.rows && !noIdRows.length) {
+      stats.msg = seen.rows + ' DOM row(s) present but none parsed'
+        + (ids.length ? ' · unmapped cell-ids: ' + ids.slice(0, 12).join(', ') : '');
+    }
+    if (!noIdRows.length) return;
+
+    stats.msg = noIdRows.length + ' row(s) read with NO order id. '
+      + (ids.length ? 'Unmapped cell-ids: ' + ids.slice(0, 12).join(', ')
+        : 'and no unmapped cell-ids — the id column may be absent from the grid');
+
+    if (dumped) return;
+    dumped = true;
+    dumpedAt = Date.now();
+    fetch(SERVER + '/ingest/debug', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + TOKEN },
+      body: JSON.stringify({ items: [{
+        source: 'order-list-cell-ids',
+        d: JSON.stringify({
+          unmappedCellIds: unmappedSeen,
+          sampleRowsWithoutId: noIdRows.slice(0, 3),
+          knownIds: Object.keys(CELL_MAP),
+        }, null, 2),
+      }] }),
+    }).catch(function () {});
+  }
+
   function toPayload(rec) {
     var sym = (rec.symbolRaw || '').split(/\s*-\s*/)[0].trim().toUpperCase() || null;
     var q = num(rec.quantity), f = num(rec.filled);
@@ -307,9 +516,13 @@
       quantity: q,
       filled: f,
       remaining: num(rec.remaining),
+      // rec keys come from CELL_MAP's VALUES, not its keys: ordVal maps to
+      // orderValue and netOrdVal to netValue. Reading rec.ordVal here sent
+      // undefined — the field was captured and then lost one line before the
+      // POST, which is the same failure as never capturing it.
       avgPrice: num(rec.avgPrice),
-      ordVal: num(rec.ordVal),
-      netOrdVal: num(rec.netOrdVal),
+      ordVal: num(rec.orderValue),
+      netOrdVal: num(rec.netValue),
       statusReason: rec.statusReason || null,
       orderType: rec.orderType || null,
       exchange: rec.exchange || null,
@@ -359,9 +572,16 @@
       if (problem) { stats.msg = problem; return; }
 
       if (!rows.length) {
-        // A trader with no live orders is a normal state, not a failure.
         stats.lastCount = 0;
-        stats.msg = 'Order List tab is active and empty';
+        // Only claim "empty" when nothing was read at all. A grid full of rows
+        // that were discarded for want of an id is not an empty grid, and
+        // saying so sent us looking at the wrong thing for a session.
+        // Only claim "empty" when the DOM held no rows either. A grid full of
+        // rows that produced nothing is not an empty grid, and saying so sent
+        // us looking at the wrong thing for a session.
+        if (!/NO ORDER ID|none parsed/.test(stats.scrollNote + ' ' + stats.msg)) {
+          stats.msg = 'Order List tab is active and empty';
+        }
         return;
       }
 
@@ -402,7 +622,7 @@
       + 'border-radius:10px;padding:10px;';
     var h = document.createElement('div');
     h.style.cssText = 'font-weight:700;margin-bottom:6px;';
-    h.textContent = 'Order List → Server 1';
+    h.textContent = 'Order List → Server 1  v' + VERSION;
     panel.appendChild(h);
     pre = document.createElement('div'); panel.appendChild(pre);
 

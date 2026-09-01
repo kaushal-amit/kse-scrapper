@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         awsat / DirectFN — Depth for ALL symbols
 // @namespace    local.trading.tools
-// @version      5.0.0
+// @version      2.2.0
 // @description  Level-1 depth for every symbol from the price socket each cycle (no switching, meets the 1-1.5 min ceiling), plus a round-robin full-ladder sweep of the open symbol. Posts to Server 1.
 // @match        *://*.awsatbroker.com/*
 // @match        *://awsatbroker.com/*
@@ -46,6 +46,10 @@
   'use strict';
 
   // ── CONFIG ────────────────────────────────────────────────────────────────
+  // The running build, shown on the panel: two scripts both reporting
+  // 2.0.0 cost a session diagnosing a bug that was already fixed.
+  var VERSION = '2.2.0';
+
   var SERVER          = 'https://socket.99labs.space';
   var TOKEN           = 'trading';
   /**
@@ -275,6 +279,9 @@
     return x.replace(/&?MOD=[^&]*/i, '');
   }
   setInterval(function () {
+    // Never gives up: a tab sits through a login, a timeout and a re-login,
+    // and anything that can only happen at startup will eventually happen
+    // before the thing it depends on exists.
     if (fullMasterFetched || !sampleUrl) return;
     try {
       nativeFetch(masterUrl(sampleUrl), { credentials: 'include' })
@@ -841,7 +848,7 @@
     panel.style.cssText = 'position:fixed;z-index:2147483647;right:10px;top:10px;width:380px;background:#042f2e;color:#99f6e4;font:12px/1.45 monospace;border:1px solid #0891b2;border-radius:10px;padding:10px;';
     var h = document.createElement('div');
     h.style.cssText = 'font-weight:700;margin-bottom:6px;';
-    h.textContent = 'Depth — ladder sweep';
+    h.textContent = 'Depth — ladder sweep  v' + VERSION + '';
     panel.appendChild(h);
     pre = document.createElement('div'); panel.appendChild(pre);
     var b = document.createElement('button');

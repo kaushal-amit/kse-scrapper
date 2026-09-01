@@ -46,6 +46,7 @@ const COLUMNS = [
   'avg_uptick_shares', 'avg_downtick_shares', 'uptick_ratio',
   'n_upticks', 'n_downticks', 'turnover_kd',
   'first_half_shares_per_min', 'second_half_shares_per_min',
+  'avg_spread_fils', 'avg_spread_pct', 'days_active', 'down_days', 'peak_hour',
   'family', 'tick_band_crossed', 'computed_at',
 ];
 
@@ -199,6 +200,57 @@ async function previousCloses(day) {
   return out;
 }
 
+/**
+ * days_active and down_days — both lookbacks, both per symbol, one query.
+ *
+ * days_active counts sessions the symbol TRADED in the last 20 with data. A
+ * stock active 3 of 20 is a different proposition from one active 20, and no
+ * other column says so in a number.
+ *
+ * down_days is a run length, which chg_1d cannot give: it describes one day.
+ */
+async function activityBlock(day) {
+  const { rows } = await query(`
+    WITH sessions AS (
+      SELECT DISTINCT trading_date FROM symbol_day
+       WHERE trading_date <= $1 ORDER BY trading_date DESC LIMIT 20
+    ),
+    active AS (
+      SELECT sd.symbol, count(*)::int AS days_active
+        FROM symbol_day sd JOIN sessions s USING (trading_date)
+       WHERE COALESCE(sd.total_volume, 0) > 0
+       GROUP BY sd.symbol
+    ),
+    runs AS (
+      -- Consecutive down sessions, this one included. A gap in the sequence
+      -- ends the run: two down days either side of an untraded day is not a
+      -- run of three.
+      SELECT symbol, trading_date, chg_fils,
+             row_number() OVER (PARTITION BY symbol ORDER BY trading_date DESC) AS back
+        FROM symbol_day WHERE trading_date <= $1
+    ),
+    streak AS (
+      SELECT symbol,
+             (SELECT count(*)::int FROM runs r2
+               WHERE r2.symbol = r.symbol
+                 AND r2.back <= COALESCE((SELECT min(back) FROM runs r3
+                       WHERE r3.symbol = r.symbol AND COALESCE(r3.chg_fils, 0) >= 0), 999) - 1
+             ) AS down_days
+        FROM runs r WHERE r.back = 1
+    )
+    SELECT COALESCE(a.symbol, st.symbol) AS symbol,
+           a.days_active, st.down_days
+      FROM active a FULL OUTER JOIN streak st ON a.symbol = st.symbol`, [day]);
+  const out = new Map();
+  for (const r of rows) {
+    out.set(r.symbol, {
+      days_active: r.days_active === null ? null : Number(r.days_active),
+      down_days: r.down_days === null ? null : Number(r.down_days),
+    });
+  }
+  return out;
+}
+
 /** The close five SESSIONS back, for every symbol, in one query. */
 async function closesFiveSessionsBack(day) {
   /**
@@ -258,6 +310,8 @@ function buildRow(symbol, day, rows, marketMedian) {
     close_source: M.closeSource(rows),
     range_source: M.rangeSource(rows),
     ...M.flowBlock(rows),
+    ...M.spreadBlock(rows, close),
+    peak_hour: M.peakHour(rows),
     day_range: (price.high_px !== null && price.low_px !== null)
       ? price.high_px - price.low_px : null,
     total_volume: volume.total_volume,
@@ -344,6 +398,7 @@ async function compute(tradingDay, runId) {
   // Two queries for the whole day, not two per symbol.
   const prevCloses = await previousCloses(day);
   const back5 = await closesFiveSessionsBack(day);
+  const activity = await activityBlock(day);
 
   const built = [];
   let crossed = 0;
@@ -357,6 +412,10 @@ async function compute(tradingDay, runId) {
       ? row.close_px - prev.prev_close : null;
     row.chg_1d = (row.chg_fils !== null && prev.prev_close)
       ? Number(((100 * row.chg_fils) / prev.prev_close).toFixed(4)) : null;
+
+    const act = activity.get(symbol);
+    row.days_active = act ? act.days_active : null;
+    row.down_days = act ? act.down_days : null;
 
     const px5 = back5.get(symbol);
     row.chg_5d = (row.close_px !== null && px5)

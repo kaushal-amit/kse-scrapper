@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AWSAT / DirectFN — Market Summary Capture
 // @namespace    local.trading.tools
-// @version      1.3.0
+// @version      1.4.0
 // @description  Reads the top-panel market summary (Index, Volume, Turnover, Trades, YTD %, Symbols Traded, UPs, Down, Unchanged) once a minute and submits it to Server 1.
 // @match        *://*.awsatbroker.com/*
 // @match        *://awsatbroker.com/*
@@ -25,6 +25,10 @@
   'use strict';
 
   // ── CONFIG ────────────────────────────────────────────────────────────────
+  // The running build, shown on the panel: two scripts both reporting
+  // 2.0.0 cost a session diagnosing a bug that was already fixed.
+  var VERSION = '1.4.0';
+
   var SERVER          = 'https://scrapper.99labs.space';
   var TOKEN           = 'CHANGE-ME';               // must equal INGEST_TOKEN
   var POST_EVERY_MS   = 60 * 1000;
@@ -231,7 +235,7 @@
       + 'border-radius:10px;padding:10px;';
     var h = document.createElement('div');
     h.style.cssText = 'font-weight:600;margin-bottom:6px;';
-    h.textContent = 'Market Summary Capture';
+    h.textContent = 'Market Summary Capture  v' + VERSION + '';
     panel.appendChild(h);
     pre = document.createElement('div');
     panel.appendChild(pre);

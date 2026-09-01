@@ -3,8 +3,12 @@ process.env.AWSAT_MODE='client';
 const db=require('../../src/db/pool');
 let p=0,n=0;const ck=(t,c,x)=>{n++;if(c)p++;else console.log('  FAIL:',t,JSON.stringify(x))};
 (async()=>{
+  // SCOPED TO public. A database that also carries the backend's spread.* views
+  // has a second symbol_day, and an unscoped count returns both — 167 columns
+  // where there are 112.
   const cols=async(t)=>(await db.query(
-    "select column_name, data_type from information_schema.columns where table_name=$1",[t])).rows;
+    "select column_name, data_type from information_schema.columns "
+    + "where table_schema='public' and table_name=$1",[t])).rows;
 
   // ── the retired table is gone ──
   const {rows:old}=await db.query(
@@ -31,7 +35,13 @@ let p=0,n=0;const ck=(t,c,x)=>{n++;if(c)p++;else console.log('  FAIL:',t,JSON.st
   // +4 from 031: markup, resumed, lift, hit — the fields the front end reads
   // that had no column. resumed stays NULL: unknown, not "never suspended".
   // +9 from 032: range_source and the eight flow columns.
-  ck('107 columns after migration 032', sd.length===107, sd.length);
+  // +5 from 035: the columns the backend computed and we did not. avg_spread_pct
+  // is the one that matters — the raw fils figure ranks a 0.1-tick stock as
+  // tighter than a 1-fil stock when it is wider in ticks.
+  ck('112 columns after migration 035', sd.length===112, sd.length);
+  for (const c of ['avg_spread_fils','avg_spread_pct','days_active','down_days','peak_hour']) {
+    ck(c + ' present', !!name(c));
+  }
   ck('range_source present — an unmarked short range is a wrong gate',
      !!name('range_source'));
   for (const c of ['avg_uptick_shares','avg_downtick_shares','uptick_ratio',

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AWSAT / DirectFN — Server 1 Capture
 // @namespace    local.trading.tools
-// @version      2.0.0
+// @version      2.2.0
 // @description  Reads the price socket in the page's own context and submits quotes, depth and orders to Server 1. No second login, no refresh, no scrolling. Credentials never leave the browser.
 // @match        *://*.awsatbroker.com/*
 // @match        *://awsatbroker.com/*
@@ -28,7 +28,11 @@
   'use strict';
 
   // ── CONFIG ────────────────────────────────────────────────────────────────
-  var SERVER      = 'http://localhost:8787';        // Server 1 base URL
+  // The running build, shown on the panel: two scripts both reporting
+  // 2.0.0 cost a session diagnosing a bug that was already fixed.
+  var VERSION = '2.2.0';
+
+  var SERVER      = 'https://scrapper.99labs.space'; // Server 1 base URL
   var TOKEN       = 'CHANGE-ME';                    // must equal INGEST_TOKEN
   var POST_EVERY_MS = 60 * 1000;
   var MAX_RETRY_QUEUE = 30;                         // ~30 minutes of backlog
@@ -45,7 +49,8 @@
   var unmatched = new Set();
   var retryQueue = [];
   var stats = { frames: 0, lastPost: '—', lastResult: '—', masterTries: 0, queued: 0, sent: 0,
-    unmatched: 0, masterRefetches: 0, lastRefetch: '—' };
+    unmatched: 0, masterRefetches: 0, lastRefetch: '—',
+    masterState: 'starting' };
 
   /**
    * ─── THE MASTER GOES STALE AND NOTHING NOTICED ───────────────────────────
@@ -265,11 +270,81 @@
     } catch (e) { if (done) done(false); }
   }
 
+  /**
+   * ─── IT MUST NEVER GIVE UP ────────────────────────────────────────────────
+   *
+   * This loop used to stop after eight attempts — sixteen seconds. If the
+   * terminal was not logged in by then, sampleUrl had never been observed, the
+   * master was never fetched, and every quote was dropped as unmatched. Logging
+   * in afterwards changed nothing, because nothing re-armed the loop.
+   *
+   * Depth and orders need the master too, so all three went quiet together and
+   * looked like three separate faults.
+   *
+   * A userscript sits in a tab for hours across a login, a session timeout and
+   * a re-login. Anything that can only happen at startup will eventually happen
+   * before the thing it depends on exists.
+   *
+   * So: keep trying, and back off rather than hammer. Every 2 seconds for the
+   * first minute, then every 15 — a fetch that costs nothing while waiting, and
+   * does not become a request loop over an eight-hour session.
+   */
+  var masterWaitStarted = Date.now();
+
   setInterval(function () {
-    if (fullMasterFetched || !sampleUrl || stats.masterTries >= 8) return;
+    if (fullMasterFetched) return;
+
+    if (!sampleUrl) {
+      // Not logged in, or no quote request seen yet. Say which, because "no
+      // data" and "not logged in" need different actions from whoever is
+      // watching the panel.
+      stats.masterState = 'waiting for the terminal — no quote request seen yet '
+        + '(' + Math.round((Date.now() - masterWaitStarted) / 1000) + 's)';
+      return;
+    }
+
+    // Slow down after the first minute, but never stop.
+    var waited = Date.now() - masterWaitStarted;
+    if (waited > 60000 && stats.masterTries % 8 !== 0) { stats.masterTries++; return; }
+
     stats.masterTries++;
-    fetchMaster();
+    stats.masterState = 'fetching the symbol master (attempt ' + stats.masterTries + ')';
+    fetchMaster(function (ok) {
+      if (ok && master.size) {
+        stats.masterState = 'master loaded: ' + master.size + ' symbols';
+      } else {
+        stats.masterState = 'master fetch failed — retrying'
+          + (waited > 60000 ? ' every 16s' : ' every 2s');
+      }
+    });
   }, 2000);
+
+  /**
+   * A LOGIN AFTER THE FACT RE-ARMS EVERYTHING.
+   *
+   * sampleUrl is captured from an observed request, so it appears the moment
+   * the terminal starts talking — which is the moment a late login completes.
+   * Watching for it is how the script notices, without polling the DOM for a
+   * login form whose markup we would have to guess at.
+   */
+  var sawSampleUrl = false;
+  setInterval(function () {
+    if (sampleUrl && !sawSampleUrl) {
+      sawSampleUrl = true;
+      // Reset the backoff: this is a fresh start, not a continuation of a
+      // failed one.
+      masterWaitStarted = Date.now();
+      stats.masterTries = 0;
+      fullMasterFetched = false;
+      try { console.log('[capture] terminal is talking — fetching the master'); } catch (e) {}
+    } else if (!sampleUrl && sawSampleUrl) {
+      // It stopped talking: a session timeout, or the tab was left overnight.
+      // Re-arm so the next login is picked up.
+      sawSampleUrl = false;
+      fullMasterFetched = false;
+      stats.masterState = 'the terminal stopped responding — waiting for a new session';
+    }
+  }, 3000);
 
   // ── build + submit ────────────────────────────────────────────────────────
   function score(r) {
@@ -382,7 +457,7 @@
     panel.style.cssText = 'position:fixed;z-index:2147483647;right:10px;bottom:10px;width:340px;background:#0f172a;color:#e2e8f0;font:12px/1.45 monospace;border:1px solid #334155;border-radius:10px;padding:10px;';
     var h = document.createElement('div');
     h.style.cssText = 'font-weight:600;margin-bottom:6px;';
-    h.textContent = 'Server 1 Capture';
+    h.textContent = 'Server 1 Capture  v' + VERSION + '';
     panel.appendChild(h);
     pre = document.createElement('div'); panel.appendChild(pre);
     var bar = document.createElement('div');

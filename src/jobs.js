@@ -47,6 +47,20 @@ function awsatServerAllowed(name) {
     + (mode === 'client' ? '; the Tampermonkey scripts collect instead' : '');
 }
 
+/**
+ * A stable 32-bit key from the job name.
+ *
+ * pg_advisory_lock takes an integer, not a string, and the key must be the
+ * same in every process — so it is derived from the name rather than assigned.
+ */
+function hashJobName(name) {
+  let h = 0;
+  for (let i = 0; i < name.length; i += 1) {
+    h = ((h << 5) - h + name.charCodeAt(i)) | 0;
+  }
+  return h;
+}
+
 async function runJob(name, fn, args) {
   const blocked = awsatServerAllowed(name);
   if (blocked) {
@@ -58,6 +72,63 @@ async function runJob(name, fn, args) {
     log.warn('skipped — previous run still in progress', { job: name });
     return { status: 'SKIPPED' };
   }
+
+  /**
+   * ─── ONE PROCESS PER JOB, ACROSS EVERY PROCESS ─────────────────────────────
+   *
+   * `running` is a Set in memory — it stops one process overlapping ITSELF and
+   * knows nothing about another. Two schedulers were pointed at the same
+   * database: the deployed server and a local one. At 13:30 both would call
+   * daily.symbolday, compute the same rows, and if they ever disagreed there
+   * would be no way to tell which won.
+   *
+   * A config flag on one of them would fix it and be reversed by accident in a
+   * month. An advisory lock survives a third process, needs no coordination,
+   * and the skip is VISIBLE in scrape_runs rather than silent.
+   *
+   * pg_try_advisory_lock returns false rather than waiting: a job that queues
+   * behind another for twenty minutes is worse than one that skips and says so.
+   * The lock is released when the connection closes, so a crashed process does
+   * not hold it forever.
+   */
+  const lockKey = hashJobName(name);
+  // A DEDICATED connection: an advisory lock is held by the session that took
+  // it, so a pooled query would release it the moment the client went back.
+  const { pool } = require('./db/pool');
+  const lockClient = await pool.connect().catch(() => null);
+  let holdsLock = false;
+  if (lockClient) {
+    try {
+      const { rows } = await lockClient.query('SELECT pg_try_advisory_lock($1) AS got', [lockKey]);
+      holdsLock = rows[0].got === true;
+    } catch { holdsLock = false; }
+    if (!holdsLock) {
+      lockClient.release();
+      log.warn('skipped — another process holds this job', {
+        job: name,
+        note: 'a second scheduler is pointed at this database; only one computes',
+      });
+      // Recorded, so the skip is visible in scrape_runs rather than only in a
+      // log line nobody reads.
+      try {
+        const id = await repo.startRun(name, clock.tradingDay());
+        // finishRun expects an ERROR OBJECT, not a string: it reads .message
+        // and .stack. A string leaves error_message NULL and the row reads as
+        // an ordinary skip with no reason.
+        await repo.finishRun(id, {
+          status: 'SKIPPED',
+          startedAt: Date.now(),
+          error: new Error('another process holds the advisory lock for this job'),
+        });
+      } catch (e) {
+        // The skip is still correct if it cannot be recorded, but swallowing
+        // the reason is how a diagnostic disappears.
+        log.warn('could not record the lock skip', { job: name, err: e.message });
+      }
+      return { status: 'SKIPPED', reason: 'held by another process' };
+    }
+  }
+
   running.add(name);
 
   const startedAt = Date.now();
@@ -112,6 +183,12 @@ async function runJob(name, fn, args) {
     return { status: 'FAILED', error: err };
   } finally {
     running.delete(name);
+    if (lockClient) {
+      if (holdsLock) {
+        await lockClient.query('SELECT pg_advisory_unlock($1)', [lockKey]).catch(() => {});
+      }
+      lockClient.release();
+    }
   }
 }
 
@@ -497,4 +574,11 @@ async function run(name, args) {
   return runJob(name, fn, args);
 }
 
-module.exports = { run, JOBS, jobNames: Object.keys(JOBS) };
+module.exports = {
+  run,
+  JOBS,
+  jobNames: Object.keys(JOBS),
+  // Exported for the lock test: two callers racing one job name.
+  _runJob: runJob,
+  _hashJobName: hashJobName,
+};

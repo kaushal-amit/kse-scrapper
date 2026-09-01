@@ -393,6 +393,52 @@ function rangeSource(rows) {
 }
 
 /**
+ * The touch spread, in fils and as a percentage.
+ *
+ * Both, because the raw figure ranks tick bands backwards: EKTTITAB at 0.15
+ * fils looks tightest on the board and is 1.5 ticks, wider than GFH at 1.00
+ * fils. The percentage is comparable across every symbol and is what
+ * rangeOverCost divides by.
+ *
+ * Volume-gated like every other measure: a spread quoted while nothing trades
+ * is a quote, not a cost anyone paid.
+ */
+function spreadBlock(rows, closePx) {
+  const steps = volumeSteps(rows);
+  const spreads = [];
+  for (const { now } of steps) {
+    const bid = n(now.bid);
+    const offer = n(now.offer);
+    if (bid === null || offer === null || bid <= 0 || offer <= 0) continue;
+    const sp = offer - bid;
+    if (sp < 0) continue;          // crossed book: a bad read, not a spread
+    spreads.push(sp);
+  }
+  if (!spreads.length) return { avg_spread_fils: null, avg_spread_pct: null };
+  const avg = spreads.reduce((t, v) => t + v, 0) / spreads.length;
+  return {
+    avg_spread_fils: Number(avg.toFixed(4)),
+    avg_spread_pct: (closePx && closePx > 0)
+      ? Number(((100 * avg) / closePx).toFixed(4)) : null,
+  };
+}
+
+/** The Kuwait hour carrying the most trades. */
+function peakHour(rows) {
+  const byHour = new Map();
+  for (const { now, traded } of volumeSteps(rows)) {
+    const k = new Date(new Date(now.created_at).getTime() + 3 * 3600_000);
+    const h = k.getUTCHours();
+    byHour.set(h, (byHour.get(h) || 0) + traded);
+  }
+  if (!byHour.size) return null;
+  let best = null;
+  let most = -1;
+  for (const [h, v] of byHour) if (v > most) { most = v; best = h; }
+  return best;
+}
+
+/**
  * buy_sell_ratio, and the reason it is often NULL.
  *
  * A stock that sits at the offer classifies EVERY print as buying. GFH sits
@@ -467,6 +513,8 @@ module.exports = {
   ordered,
   volumeSteps,
   flowBlock,
+  spreadBlock,
+  peakHour,
   rangeSource,
   closeRow,
   RANGE_SESSIONS,

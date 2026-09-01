@@ -31,7 +31,11 @@ const names=(r)=>r.map(x=>x.signal).sort();
 COLS=(await db.query(
   "select column_name from information_schema.columns where table_name='symbol_minute' order by ordinal_position"
 )).rows.map(r=>r.column_name);
-ck('the fixture is built from '+COLS.length+' real columns', COLS.length===18, COLS.length);
+// 18 at 015, +source at 036. Asserting the COUNT means every column added
+// fails this line — which is the point: the fixture is built from the real
+// shape, so a new column must be considered rather than silently absent.
+ck('the fixture is built from '+COLS.length+' real columns', COLS.length===19, COLS.length);
+ck('source distinguishes a LIVE row from a BACKFILL one', COLS.includes('source'));
 ck('and symbol_minute has NO `volume` column — the bug', !COLS.includes('volume'));
 ck('it has volume_delta instead', COLS.includes('volume_delta'));
 
