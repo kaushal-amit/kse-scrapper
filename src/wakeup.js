@@ -255,6 +255,9 @@ async function scan(day = clock.tradingDay(), atHour = null) {
   // ACTIVITY (a), but MOVEMENT and the absolute-volume floor now decide.
   const paced = await computePace(day, atHour);
   const paceBy = new Map(paced.map((p) => [p.symbol, p.pace]));
+  // SPR-31 · the divisor behind pace, so a "13.9x" in the feed is checkable
+  // (473 trades / 34 baseline). A tiny baseline is what made 92x on 92 trades.
+  const baselineBy = new Map(paced.map((p) => [p.symbol, p.median_trades]));
   const moves = await computeMovement(day, atHour);
   const budgetKd = await currentBudgetKd();
   const firing = moves
@@ -323,7 +326,7 @@ async function scan(day = clock.tradingDay(), atHour = null) {
          VALUES (now(), $1, $2, 'WAKEUP_BLOCKED', NULL, $3, $4)
          ON CONFLICT DO NOTHING`,
         [day, cand.symbol, cand.pace,
-          `woke ${cand.pace}x on ${cand.trades} trades — no free slot`
+          `woke ${cand.pace}x on ${cand.trades} trades (÷${baselineBy.get(cand.symbol) ?? '?'} baseline) — no free slot`
           + (weakest ? `. ${weakest.symbol} is the deadest at ${weakest.pace ?? '?'}x. Swap?` : '')],
       ).catch(() => {});
 
@@ -331,9 +334,15 @@ async function scan(day = clock.tradingDay(), atHour = null) {
       continue;
     }
 
+    // SPR-31 · show the divisor so the multiple can be checked, without losing
+    // the "on N trades" phrasing the rest of the system reads.
+    const base = baselineBy.get(cand.symbol);
+    const paceStr = cand.pace != null
+      ? `pace ${cand.pace}x on ${cand.trades} trades (÷${base ?? '?'} baseline)`
+      : `${cand.trades} trades (no pace baseline)`;
     const message = replaced
-      ? `pace ${cand.pace}x on ${cand.trades} trades — replaced ${replaced}`
-      : `pace ${cand.pace}x on ${cand.trades} trades`;
+      ? `${paceStr} — replaced ${replaced}`
+      : paceStr;
 
     // STATE first. If claiming the slot fails, no history is written for a
     // promotion that did not happen.

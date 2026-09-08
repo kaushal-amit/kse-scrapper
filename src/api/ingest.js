@@ -500,6 +500,16 @@ function createRouter() {
     try {
       const { rows: known } = await query(
         'SELECT is_tradeable, broker_status FROM instruments WHERE symbol = $1', [symbol]);
+      // SPR-03 · a symbol not in the instruments list is refused, not assigned.
+      // The duplicate check already guarded one bad input; an unknown symbol (a
+      // typo like ZZZZ) fell straight through and evicted the live slot silently.
+      if (!known.length) {
+        return res.status(400).json({
+          ok: false,
+          error: `${symbol} is not a listed symbol`,
+          detail: 'not in the instruments list — check the spelling before displacing a live slot.',
+        });
+      }
       if (known.length && known[0].is_tradeable === false) {
         return res.status(400).json({
           ok: false,
