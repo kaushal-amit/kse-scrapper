@@ -24,6 +24,10 @@ const arg = (n) => {
 const DATE = arg('date');
 const SLOTS = (arg('slots') || '').split(',').map((s) => s.trim().toUpperCase()).filter(Boolean);
 const APPLY = process.argv.includes('--apply');
+// Q-10 · displacing a slot that already holds a live symbol needs an explicit
+// --force and a --reason, so a mid-session re-seed is never silent.
+const FORCE = process.argv.includes('--force');
+const REASON = arg('reason');
 const MAX_PRE_DAY = 3;
 
 async function main() {
@@ -105,27 +109,77 @@ async function main() {
     process.exit(1);
   }
 
+  /**
+   * Q-10 · A SLOT THAT ALREADY HOLDS A DIFFERENT LIVE SYMBOL IS BEING DISPLACED.
+   *
+   * The seed is the night-before tool. Re-run mid-session — as it was at
+   * 11:40:50 on the day this was filed — its ON CONFLICT DO UPDATE silently
+   * overwrote whatever slot 1-3 held, stamping assigned_by='SEED' with no record
+   * of what it replaced or why. That is the re-seed nobody could explain.
+   *
+   * So: a target slot holding a DIFFERENT active symbol is a displacement.
+   * Refuse it unless --force, and when forced REQUIRE a --reason and RECORD the
+   * displaced symbol + reason in the audit columns (migration 037). A first-ever
+   * seed on an empty day displaces nothing and is unaffected.
+   */
+  const { rows: activeRows } = await query(
+    `SELECT slot_no, symbol FROM depth_watchlist
+      WHERE trading_date = $1 AND released_at IS NULL`, [DATE]);
+  const activeBySlot = new Map(activeRows.map((r) => [r.slot_no, r.symbol.toUpperCase()]));
+  const displacements = [];
+  for (let i = 0; i < SLOTS.length; i += 1) {
+    const held = activeBySlot.get(i + 1);
+    if (held && held !== SLOTS[i]) displacements.push({ slot: i + 1, from: held, to: SLOTS[i] });
+  }
+
+  if (displacements.length && !FORCE) {
+    console.error('\n  REFUSING — these slots already hold a different live symbol:\n');
+    for (const d of displacements) console.error(`    slot ${d.slot}   ${d.from.padEnd(14)} → ${d.to}`);
+    console.error('\n  This looks like a mid-session re-seed. The night-before seed is not meant');
+    console.error('  to overwrite live slots — that is the silent re-seed Q-10 is about.');
+    console.error('  If you really mean to displace them, say so and say why:\n');
+    console.error(`    node scripts/seed-depth-slots.js --date=${DATE} --slots=${SLOTS.join(',')} --apply --force --reason="..."\n`);
+    process.exit(1);
+  }
+  if (displacements.length && FORCE && !REASON) {
+    console.error('\n  --force needs --reason="why these live slots are being displaced".');
+    console.error('  A forced re-seed with no reason is exactly the silent overwrite Q-10 flagged.\n');
+    process.exit(1);
+  }
+
   if (!APPLY) {
     console.log('\n  Dry run — nothing written. Re-run with --apply.\n');
+    if (displacements.length) console.log(`  (would displace: ${displacements.map((d) => `slot ${d.slot} ${d.from}→${d.to}`).join(', ')})\n`);
     return;
   }
   if (unknown.length) {
     console.log(`\n  ${unknown.length} unknown symbol(s) — seeding anyway, but check the spelling.`);
   }
 
+  const displacedBySlot = new Map(displacements.map((d) => [d.slot, d.from]));
   let written = 0;
   for (let i = 0; i < SLOTS.length; i += 1) {
+    const displaced = displacedBySlot.get(i + 1) || null;
     const res = await query(
       `INSERT INTO depth_watchlist
-         (trading_date, slot_no, symbol, slot_type, assigned_by)
-       VALUES ($1, $2, $3, 'PRE_DAY', 'SEED')
+         (trading_date, slot_no, symbol, slot_type, assigned_by,
+          replaced_symbol, replaced_at, replaced_by, replaced_reason)
+       VALUES ($1, $2, $3, 'PRE_DAY', 'SEED',
+               $4, CASE WHEN $4::text IS NULL THEN NULL ELSE now() END,
+               CASE WHEN $4::text IS NULL THEN NULL ELSE 'SEED' END, $5)
        ON CONFLICT (trading_date, slot_no) DO UPDATE SET
          symbol = EXCLUDED.symbol,
          assigned_at = now(),
          released_at = NULL,
-         assigned_by = 'SEED'
-       RETURNING slot_no`, [DATE, i + 1, SLOTS[i]]);
+         assigned_by = 'SEED',
+         replaced_symbol = EXCLUDED.replaced_symbol,
+         replaced_at = EXCLUDED.replaced_at,
+         replaced_by = EXCLUDED.replaced_by,
+         replaced_reason = EXCLUDED.replaced_reason
+       RETURNING slot_no`,
+      [DATE, i + 1, SLOTS[i], displaced, displaced ? (REASON || 'seed re-run') : null]);
     written += res.rowCount;
+    if (displaced) console.log(`    slot ${i + 1}   displaced ${displaced} → ${SLOTS[i]}  (recorded: ${REASON})`);
   }
 
   console.log(`\n  ${written} pre-day slot(s) assigned for ${DATE}.`);
