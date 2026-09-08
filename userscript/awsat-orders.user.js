@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         awsat / DirectFN — Order List → Server 1
 // @namespace    local.trading.tools
-// @version      2.3.0
+// @version      2.6.0
 // @description  Reads the Order List grid by cell-id and posts it to Server 1. No credentials leave the browser.
 // @match        *://*.awsatbroker.com/*
 // @match        *://awsatbroker.com/*
@@ -31,10 +31,10 @@
    * each, so a session went into diagnosing a bug that was already fixed.
    * A build that cannot identify itself is a build nobody can debug.
    */
-  var VERSION = '2.3.0';
+  var VERSION = '2.6.0';
 
   var SERVER = 'https://scrapper.99labs.space';   // Server 1
-  var TOKEN  = 'CHANGE-ME';               // must equal INGEST_TOKEN
+  var TOKEN  = 'trading';               // must equal INGEST_TOKEN
   var EVERY_MS = 60 * 1000;
   var MAX_RETRY_QUEUE = 30;
 
@@ -82,6 +82,34 @@
     ordVal:    'orderValue',
     netOrdVal: 'netValue',
   };
+
+  /**
+   * ─── C1 · THE ORDER LIST GRID HAS NO ORDER-ID COLUMN ANY MORE ──────────────
+   *
+   * The grid this script was built against carried `clOrdId` on every row. On
+   * 2 September the broker's Order List view dropped that column: the live DOM
+   * now shows only symbol / status / side / quantity / price / filled / pending
+   * / avg / order value / net value / order type / order date / expiry — and NO
+   * id cell. readRenderedRows kept a row only `if (rec.orderId)`, so with the id
+   * gone EVERY row fell to the no-id bucket and nothing was ever posted. That is
+   * the six-session silence, and it looks identical in the DB to an empty grid.
+   *
+   * A real id is always preferred (if the grid ever restores clOrdId, it wins).
+   * When there is none, synthesise a STABLE, UNIQUE id from the order's own
+   * immutable fields — symbol, side, order price, order quantity, and the
+   * placement timestamp (adjustedCrdDte, to the second). Stable across cycles
+   * (those fields never change once the order exists) so the server de-dupes it
+   * correctly; unique enough that two distinct orders never collide. Marked
+   * `synthetic` in the payload so downstream knows the id was derived, not read.
+   */
+  function syntheticId(rec) {
+    var sym = (rec.symbolRaw || '').split(/\s*-\s*/)[0].trim().toUpperCase();
+    // The timestamp is what makes it unique; without symbol AND stamp there is
+    // no honest stable key, so return nothing rather than a colliding guess.
+    if (!sym || !rec.stamp) return null;
+    var parts = [sym, rec.side || '', rec.price || '', rec.quantity || '', rec.stamp];
+    return 'syn:' + parts.join('|').replace(/\s+/g, '');
+  }
 
   /** Every cell-id seen that CELL_MAP does not know. Reported, then dumped. */
   var unmappedSeen = {};
@@ -276,6 +304,13 @@
        * grid was full.
        */
       if (!hits) return;
+      // C1 · no id column in the current grid → derive a stable one so the row
+      // is captured instead of silently dropped. A real id, when present, is
+      // never overwritten.
+      if (!rec.orderId) {
+        var syn = syntheticId(rec);
+        if (syn) { rec.orderId = syn; rec.orderIdSynthetic = true; }
+      }
       if (rec.orderId) out.push(rec);
       else noId.push(rec);
     });
@@ -526,6 +561,9 @@
       statusReason: rec.statusReason || null,
       orderType: rec.orderType || null,
       exchange: rec.exchange || null,
+      // C1 · true when the grid had no id column and this id was derived from
+      // symbol/side/price/qty/timestamp rather than read from a clOrdId cell.
+      synthetic: !!rec.orderIdSynthetic,
       // The account, read from the widget's own dropdown rather than a cell.
       portfolio: portfolioOf(ordersWidget().widget) || null,
       // The whole record, so a field nobody mapped yet is still captured.
@@ -581,11 +619,93 @@
     }).catch(function () {});
   }
 
+  /**
+   * ─── C1b · MOUNT THE GRID THE BROKER BUILDS ONLY ON A TAB INTERACTION ──────
+   *
+   * On a fresh login the Order List grid is not in the DOM at all — the broker
+   * renders it the first time its tab is interacted with, and until then the
+   * reader honestly finds nothing ("no Order List grid … Is the panel open?").
+   * Once mounted it PERSISTS for the whole session, readable even while another
+   * tab is showing — which is why touching the tabs once made capture start and
+   * stay working.
+   *
+   * So do that touch ourselves, once, when the grid is missing: click the Order
+   * List tab (harmless if it is already the active one). It never places or
+   * cancels an order — a widget tab only switches which panel is shown — and it
+   * stops as soon as the grid mounts, so it is not a per-cycle disturbance. If
+   * clicking the tab directly does not mount it, a sibling bounce (the exact
+   * away-and-back that works by hand) is the escalation, still one-time.
+   */
+  var mountTries = 0;
+  /**
+   * A tab is an Ember `data-ember-action` element; a plain .click() on the
+   * ALREADY-ACTIVE tab is ignored, which is why activating Order List did
+   * nothing. What works by hand is switching AWAY and BACK. Reproduce that with
+   * a full, bubbling mouse sequence (mousedown→mouseup→click) so whichever event
+   * the broker's handler listens on fires — .click() alone was not enough.
+   */
+  function fireClick(el) {
+    if (!el) return;
+    var view = el.ownerDocument && el.ownerDocument.defaultView;
+    ['mousedown', 'mouseup', 'click'].forEach(function (type) {
+      try { el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: view, composed: true })); }
+      catch (e) { try { el.click(); } catch (e2) {} }
+    });
+  }
+  function tabEl(name) {
+    var docs = collectDocs(document, []);
+    for (var d = 0; d < docs.length; d++) {
+      var items = docs[d].querySelectorAll('.wdgttl-tab-item');
+      for (var i = 0; i < items.length; i++) {
+        var span = items[i].querySelector('span');
+        if (span && clean(span.textContent).toLowerCase() === name.toLowerCase()) {
+          return items[i].querySelector('a') || items[i];
+        }
+      }
+    }
+    return null;
+  }
+  function clickTab(name) { var el = tabEl(name); if (el) { fireClick(el); return true; } return false; }
+
+  /**
+   * Mount the grid by doing exactly what the operator does: switch to a SIBLING
+   * tab, then back to Order List. Clicking Order List while it is already active
+   * is a no-op — the away-and-back is the trigger. One-time (capped), and only
+   * while the grid is absent, so it is a cold-start nudge, never a per-cycle
+   * disturbance. It only switches a view panel; it never places or cancels an
+   * order, and it returns the view to Order List.
+   */
+  function mountOrderList() {
+    if (mountTries >= 5) return false;   // give up rather than bounce forever
+    mountTries++;
+    var siblings = ['Portfolio', 'Account Summary', 'Order Search'];
+    var away = null;
+    for (var i = 0; i < siblings.length && !away; i++) if (tabEl(siblings[i])) away = siblings[i];
+    if (!away) { clickTab('Order List'); return true; }   // no sibling found — try Order List anyway
+    clickTab(away);
+    setTimeout(function () { clickTab('Order List'); }, 500);  // …and straight back
+    return true;
+  }
+  // Prime it once at startup (before the first tick), so capture begins on its
+  // own after login instead of waiting for a manual tab switch.
+  setTimeout(function () { if (!ordersWidget().widget) mountOrderList(); }, 4500);
+
   function tick() {
     flush();
 
     readOrders(function (rows, problem) {
-      if (problem) { stats.msg = problem; heartbeat(0, problem); return; }
+      if (problem) {
+        stats.msg = problem;
+        heartbeat(0, problem);
+        // C1b · the grid is not in the DOM yet (fresh login, no tab touched).
+        // Mount it ourselves and re-read shortly after, instead of waiting for
+        // the operator to switch tabs.
+        if (/no Order List grid/.test(problem) && mountOrderList()) {
+          stats.msg = problem + ' — mounting the Order List tab…';
+          setTimeout(tick, 1500);
+        }
+        return;
+      }
 
       if (!rows.length) {
         stats.lastCount = 0;
