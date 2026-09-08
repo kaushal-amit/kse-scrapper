@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         awsat / DirectFN — Depth for ALL symbols
 // @namespace    local.trading.tools
-// @version      2.2.0
+// @version      2.3.0
 // @description  Level-1 depth for every symbol from the price socket each cycle (no switching, meets the 1-1.5 min ceiling), plus a round-robin full-ladder sweep of the open symbol. Posts to Server 1.
 // @match        *://*.awsatbroker.com/*
 // @match        *://awsatbroker.com/*
@@ -48,7 +48,7 @@
   // ── CONFIG ────────────────────────────────────────────────────────────────
   // The running build, shown on the panel: two scripts both reporting
   // 2.0.0 cost a session diagnosing a bug that was already fixed.
-  var VERSION = '2.2.0';
+  var VERSION = '2.3.0';
 
   var SERVER          = 'https://socket.99labs.space';
   var TOKEN           = 'trading';
@@ -107,9 +107,39 @@
    * Eight symbols at ~0.92s each is ~7.4s of work, which leaves headroom in a
    * 15s window for a slow ladder repaint.
    */
-  var LADDER_BUDGET_MS = 13000;   // leave ~2s of the 15s clear
+  // 25-second sweep, 23s of budget. Five symbols at the measured 4.34s average
+  // is 21.7s of work, so a normal sweep finishes inside it and a stalled one is
+  // cut rather than allowed to run into the next.
+  var LADDER_BUDGET_MS = 23000;
   // Eight slots at ~0.92s is ~7.4s. Above ~13 the sweep cannot finish in 15s.
-  var LADDER_MAX_SAFE = 13;
+  /**
+   * ─── THREE, AND IT WAS MEASURED ───────────────────────────────────────────
+   *
+   * This was 13, from an estimate that a symbol switch takes about 0.9
+   * seconds. Measured against 3,984 real switches on 1 September:
+   *
+   *     average  4.34s
+   *     p90     22.84s
+   *
+   * Nearly five times the estimate, and one switch in ten stalls badly. Eight
+   * symbols is a 35-second sweep, not 15.
+   *
+   * SET TO FIVE, and the window widened to match.
+   *
+   * Three was too few to trade from. But the average and the p90 are far
+   * apart — 4.34s against 22.84s — which means most switches are quick and a
+   * handful stall. An average dragged by outliers is the wrong number to size
+   * a budget with, and the median was never measured.
+   *
+   * So: five symbols, and the sweep is given 25 seconds rather than 15. At a
+   * 4.34s average that is 21.7s of work in a 25s window; when a switch stalls
+   * the budget cuts the sweep short and the next one starts clean, rather than
+   * every sweep overrunning into its successor.
+   *
+   * Slot order is priority order, so the five kept are the pre-day picks and
+   * the earliest wake-ups.
+   */
+  var LADDER_MAX_SAFE = 5;
   var POLL_MS         = 120;      // how often to re-check the widget
   var LADDER_WAIT_MS  = 2500;     // give up on a symbol after this
   var POPUP_TIMEOUT   = 3500;     // wait for the search results to appear
@@ -753,9 +783,19 @@
           stats.listSource = 'depth_watchlist (empty)';
           return;
         }
+        /**
+         * TRUNCATED, not merely warned about.
+         *
+         * This used to warn and sweep all of them anyway — so eight slots
+         * produced a 35-second cycle while the message said 15. Slot order is
+         * priority order, so the first three are the pre-day picks and the
+         * wake-ups fall off the end.
+         */
         if (list.length > LADDER_MAX_SAFE) {
-          stats.msg = 'ladder list is ' + list.length + ' symbols; ~'
-            + LADDER_MAX_SAFE + ' is the most that fits a 15s sweep';
+          stats.msg = list.length + ' slots, sweeping the first '
+            + LADDER_MAX_SAFE + ' — a switch measured 4.34s average, so more '
+            + 'than that does not fit a 25s sweep';
+          list = list.slice(0, LADDER_MAX_SAFE);
         }
         LADDER_SYMBOLS = list.map(function (x) {
           return typeof x === 'string' ? { symbol: x, code: null } : x;
@@ -791,6 +831,17 @@
    */
   var sweeping = false;
 
+  // Per-sweep check-in (see /ingest/heartbeat) — every sweep, whatever it read,
+  // so a depth script that stops sweeping (or sweeps and captures nothing, as on
+  // 8 Sep) is visible instead of silently absent. rowsSeen = symbols captured.
+  function heartbeat(rowsSeen, problem) {
+    fetch(SERVER + '/ingest/heartbeat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + TOKEN },
+      body: JSON.stringify({ script: 'depth', version: VERSION, rowsSeen: rowsSeen, problem: problem || null }),
+    }).catch(function () {});
+  }
+
   function ladderSweep() {
     if (sweeping) { stats.msg = 'previous sweep still running'; return; }
     sweeping = true;
@@ -802,6 +853,7 @@
       var targets = LADDER_SYMBOLS.slice();
       if (!targets.length) {
         stats.msg = 'no symbols from /depth-symbols — nothing to sweep';
+        heartbeat(0, 'no symbols from /depth-symbols');
         sweeping = false;
         refresh();
         return;
@@ -821,6 +873,7 @@
           stats.msg = 'swept ' + ok + '/' + targets.length
             + (skipped ? ' · ' + skipped + ' skipped' : '')
             + ' in ' + Math.round((Date.now() - started) / 100) / 10 + 's';
+          heartbeat(ok, ok === 0 ? ('0 captured of ' + targets.length + ' — ' + stats.msg) : null);
           refresh();
           return;
         }
@@ -834,11 +887,12 @@
     }).catch(function (e) {
       sweeping = false;
       stats.msg = 'sweep failed: ' + e.message;
+      heartbeat(0, 'sweep failed: ' + e.message);
       refresh();
     });
   }
 
-  setTimeout(function () { ladderSweep(); setInterval(ladderSweep, 15 * 1000); }, 12000);
+  setTimeout(function () { ladderSweep(); setInterval(ladderSweep, 25 * 1000); }, 12000);
 
   // ── panel ─────────────────────────────────────────────────────────────────
   var panel, pre;

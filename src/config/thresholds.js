@@ -56,6 +56,26 @@ const THRESHOLDS = {
   /** Below this trade count the pace ratio is noise. CR-46 */
   wakeup_trades_min: num('WAKEUP_TRADES_MIN', 20),
 
+  // ── B2 · the movement test (Item 4) ──────────────────────────────────────
+  // ACTIVITY is one of three; MOVEMENT and an absolute-volume floor are both
+  // required. The wake-up finds stocks to WATCH, so the movement bar matters
+  // more than raw pace. Every number here, never a literal in wakeup.js.
+  /** ACTIVITY (a): pace ≥ this × the session baseline. */
+  wakeup_pace_mult: num('WAKEUP_PACE_MULT', 2),
+  /** ACTIVITY (b): today's volume ≥ this × the symbol's own average. */
+  wakeup_vol_mult: num('WAKEUP_VOL_MULT', 3),
+  /** ACTIVITY (c): moved at least this many fils from the open. */
+  wakeup_move_open_fils: num('WAKEUP_MOVE_OPEN_FILS', 15),
+  /** MOVEMENT: the day's high−low range must be at least this many fils. */
+  wakeup_range_min_fils: num('WAKEUP_RANGE_MIN_FILS', 8),
+  /** MOVEMENT: an up-move of at least this many fils must have happened. */
+  wakeup_upmove_fils: num('WAKEUP_UPMOVE_FILS', 3),
+  /** The screen's absolute-volume floor is this × shares-at-budget (300 × shares). */
+  wakeup_abs_vol_floor_shares: num('WAKEUP_ABS_VOL_FLOOR_SHARES', 300),
+  /** A fraction of the screen floor for the WATCH threshold — the dry-run lowers
+   *  it toward 1/3 if the full floor fires under one symbol a session. */
+  wakeup_abs_vol_floor_frac: num('WAKEUP_ABS_VOL_FLOOR_FRAC', 1),
+
   /**
    * A close from before this hour is not a close. CR-64
    *

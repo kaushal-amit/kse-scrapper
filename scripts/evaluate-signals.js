@@ -43,7 +43,16 @@ async function evaluate(day, { apply = false, source = null } = {}) {
     }
     out.evaluated += 1;
 
-    const hits = signals.evaluate(row, prev) || [];
+    /**
+     * evaluate(prev, now) — IN THAT ORDER.
+     *
+     * This called evaluate(row, prev), so every check compared the NEWER row as
+     * "previous" and the older as "current". Signals that depend on direction —
+     * a wall added versus pulled, a bid thinning versus thickening — were
+     * computed backwards, and every count from the 1 September backfill was
+     * wrong. src/jobs.js had it right, so the live path was never affected.
+     */
+    const hits = signals.evaluate(prev, row) || [];
     for (const h of hits) {
       const name = h.signal || h.name || String(h);
       out.fired[name] = (out.fired[name] || 0) + 1;

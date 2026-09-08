@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         awsat / DirectFN — Order List → Server 1
 // @namespace    local.trading.tools
-// @version      2.2.0
+// @version      2.3.0
 // @description  Reads the Order List grid by cell-id and posts it to Server 1. No credentials leave the browser.
 // @match        *://*.awsatbroker.com/*
 // @match        *://awsatbroker.com/*
@@ -31,7 +31,7 @@
    * each, so a session went into diagnosing a bug that was already fixed.
    * A build that cannot identify itself is a build nobody can debug.
    */
-  var VERSION = '2.2.0';
+  var VERSION = '2.3.0';
 
   var SERVER = 'https://scrapper.99labs.space';   // Server 1
   var TOKEN  = 'CHANGE-ME';               // must equal INGEST_TOKEN
@@ -565,23 +565,37 @@
     });
   }
 
+  /**
+   * Per-cycle check-in — sent EVERY tick, data or not. A userscript that only
+   * posts when it has rows is invisible when it stops (orders went dark for six
+   * sessions unnoticed). This makes silence detectable: the server's
+   * client_heartbeat row stops advancing, and `problem` carries this panel's
+   * own message so the cause is known without reading the terminal. Fire-and-
+   * forget; a heartbeat must never disturb the capture path.
+   */
+  function heartbeat(rowsSeen, problem) {
+    fetch(SERVER + '/ingest/heartbeat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + TOKEN },
+      body: JSON.stringify({ script: 'orders', version: VERSION, rowsSeen: rowsSeen, problem: problem || null }),
+    }).catch(function () {});
+  }
+
   function tick() {
     flush();
 
     readOrders(function (rows, problem) {
-      if (problem) { stats.msg = problem; return; }
+      if (problem) { stats.msg = problem; heartbeat(0, problem); return; }
 
       if (!rows.length) {
         stats.lastCount = 0;
         // Only claim "empty" when nothing was read at all. A grid full of rows
         // that were discarded for want of an id is not an empty grid, and
         // saying so sent us looking at the wrong thing for a session.
-        // Only claim "empty" when the DOM held no rows either. A grid full of
-        // rows that produced nothing is not an empty grid, and saying so sent
-        // us looking at the wrong thing for a session.
         if (!/NO ORDER ID|none parsed/.test(stats.scrollNote + ' ' + stats.msg)) {
           stats.msg = 'Order List tab is active and empty';
         }
+        heartbeat(0, stats.msg);          // check in with the finalised reason
         return;
       }
 
@@ -593,6 +607,7 @@
         orders: rows.map(toPayload),
       };
 
+      heartbeat(rows.length, null);       // alive, with rows — data POST follows
       submit(batch).then(function (j) {
         stats.posts++; stats.lastCount = rows.length;
         stats.msg = 'sent ' + rows.length + ' → inserted ' + (j.inserted != null ? j.inserted : '?')

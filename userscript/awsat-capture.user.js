@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AWSAT / DirectFN — Server 1 Capture
 // @namespace    local.trading.tools
-// @version      2.2.0
+// @version      2.3.0
 // @description  Reads the price socket in the page's own context and submits quotes, depth and orders to Server 1. No second login, no refresh, no scrolling. Credentials never leave the browser.
 // @match        *://*.awsatbroker.com/*
 // @match        *://awsatbroker.com/*
@@ -30,7 +30,7 @@
   // ── CONFIG ────────────────────────────────────────────────────────────────
   // The running build, shown on the panel: two scripts both reporting
   // 2.0.0 cost a session diagnosing a bug that was already fixed.
-  var VERSION = '2.2.0';
+  var VERSION = '2.3.0';
 
   var SERVER      = 'https://scrapper.99labs.space'; // Server 1 base URL
   var TOKEN       = 'CHANGE-ME';                    // must equal INGEST_TOKEN
@@ -432,13 +432,26 @@
     });
   }
 
+  // Per-cycle check-in (see /ingest/heartbeat) — every cycle, records or not,
+  // so a quotes script that stops (or sees an empty board) is visible instead of
+  // silently absent. rowsSeen = symbols built this cycle.
+  function heartbeat(rowsSeen, problem) {
+    nativeFetch(SERVER + '/ingest/heartbeat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + TOKEN },
+      body: JSON.stringify({ script: 'quotes', version: VERSION, rowsSeen: rowsSeen, problem: problem || null }),
+    }).catch(function () {});
+  }
+
   function cycle() {
     flushQueue();                               // backlog first
     var records = buildRecords();
     if (!records.length) {
       stats.lastResult = 'nothing to send (' + board.size + ' raw / ' + master.size + ' master)';
+      heartbeat(0, 'nothing to send (' + board.size + ' raw / ' + master.size + ' master)');
       refresh(); return;
     }
+    heartbeat(records.length, null);            // alive, with N symbols
     post('quotes', { capturedAt: new Date().toISOString(), source: 'awsat_client', records: records });
   }
   setInterval(cycle, POST_EVERY_MS);

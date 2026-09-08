@@ -105,6 +105,72 @@ async function recordSubmission(batchId, kind, source, capturedAt, counts) {
   ).catch((err) => log.error('could not record client submission', { batchId, err: err.message }));
 }
 
+/**
+ * A userscript's per-cycle check-in. Upserted, so one row per (script, source)
+ * always shows the last time it ran and what it saw — 0 rows and a `problem`
+ * are check-ins too, which is the whole point: silence, not a value, is the
+ * failure. `problem` carries the panel's own message so the cause is legible
+ * remotely.
+ */
+async function recordHeartbeat({ script, source = 'awsat_client', version = null, rowsSeen = null, problem = null }) {
+  if (!script) return;
+  await query(
+    `INSERT INTO client_heartbeat (script, source, version, rows_seen, problem, last_seen_at)
+       VALUES ($1, $2, $3, $4, $5, now())
+     ON CONFLICT (script, source) DO UPDATE SET
+       version = EXCLUDED.version, rows_seen = EXCLUDED.rows_seen,
+       problem = EXCLUDED.problem, last_seen_at = now()`,
+    [script, source, version, rowsSeen, problem],
+  ).catch((err) => log.error('could not record heartbeat', { script, err: err.message }));
+}
+
+// The scripts that SHOULD be checking in. "Absent" (never ran) looks identical
+// to "fine" without this list — which is the whole trap: a script dead from boot
+// leaves no row, so silence alone cannot see it. Overridable per deployment.
+const EXPECTED_SCRIPTS = (process.env.EXPECTED_SCRIPTS || 'orders,depth,quotes,market-summary')
+  .split(',').map((s) => s.trim()).filter(Boolean);
+
+/**
+ * The scripts that have checked in but have gone quiet longer than `maxAgeSec`
+ * — H-9: a feed that was posting and stops must be detectable. A script that
+ * has NEVER checked in is not "silent", it is absent — see scriptRoster.
+ */
+async function staleScripts(maxAgeSec = 300) {
+  const { rows } = await query(
+    `SELECT script, source, version, rows_seen, problem, last_seen_at,
+            EXTRACT(epoch FROM now() - last_seen_at)::int AS silent_sec
+       FROM client_heartbeat
+      WHERE last_seen_at < now() - ($1 || ' seconds')::interval
+      ORDER BY last_seen_at ASC`,
+    [String(maxAgeSec)],
+  );
+  return rows;
+}
+
+/**
+ * The full roster: every EXPECTED script with a status — `ok`, `silent`
+ * (checked in, then stopped for > maxAgeSec) or `absent` (never checked in
+ * today). Absent is the one plain silence can't see: a script dead from boot
+ * leaves no row, and "no row" reads as "fine" unless something expects it.
+ */
+async function scriptRoster(maxAgeSec = 300) {
+  const { rows } = await query(
+    `SELECT script, version, rows_seen, problem, last_seen_at,
+            EXTRACT(epoch FROM now() - last_seen_at)::int AS silent_sec
+       FROM client_heartbeat`);
+  const byScript = new Map(rows.map((r) => [r.script, r]));
+  return EXPECTED_SCRIPTS.map((script) => {
+    const r = byScript.get(script);
+    if (!r) return { script, status: 'absent', lastSeenAt: null, silentSec: null };
+    return {
+      script,
+      status: r.silent_sec > maxAgeSec ? 'silent' : 'ok',
+      version: r.version, rowsSeen: r.rows_seen, problem: r.problem,
+      lastSeenAt: r.last_seen_at, silentSec: r.silent_sec,
+    };
+  });
+}
+
 /** Map the userscript's camelCase record onto awsat_market_quotes columns. */
 function toQuoteRow(r, meta) {
   const symbol = parse.toSymbol(r.symbol || r.code);
@@ -152,6 +218,17 @@ function toQuoteRow(r, meta) {
 function createRouter() {
   const router = express.Router();
   const TOKEN = process.env.INGEST_TOKEN || '';
+  /*
+   * G-5 · the ONE slot count, published so the backend does not guess. FIVE is
+   * the SPREAD depth sweep — 3 pre-day + 2 swappable (FLOW step 2), bounded by
+   * the 25 s vs 30 s capture cycle, which is why POST /slots/:n has always
+   * validated 1..5. The 7 September "twelve" was the raw scraper's total capture
+   * list, not the SPREAD sweep; the halt module operates on the five this
+   * endpoint validates. An operator who widens the sweep sets SLOT_COUNT, and the
+   * GET, both POSTs, and the backend's stale check all follow the published
+   * number — never a literal.
+   */
+  const SLOT_COUNT = Math.max(1, Number(process.env.SLOT_COUNT || 5));
 
   /**
    * CORS. Without it nothing from the terminal ever arrives.
@@ -370,11 +447,227 @@ function createRouter() {
         trading_date: day,
         pre_day: preDay,
         wakeup: rows.length - preDay,
+        slotCount: SLOT_COUNT, // G-5 · the address space POST /slots/:n validates against
       });
     } catch (err) {
       log.error('depth-symbols failed', { err: err.message });
       return res.status(500).json({ ok: false, error: err.message, symbols: [] });
     }
+  });
+
+  /**
+   * POST /slots/:n — swap the symbol in a depth slot.
+   *
+   * ─── WHY THIS EXISTS ──────────────────────────────────────────────────────
+   * EMIRATES was not in the sweep on 2 September. It became the only stock
+   * worth trading and the book was invisible for an hour until someone ran a
+   * command. SHUAIBA the day before. Twice in two days.
+   *
+   * ─── AND WHY IT LIVES IN THE SCRAPER ──────────────────────────────────────
+   * depth_watchlist is capture configuration, not a UI concern that happens to
+   * sit here — which symbols get swept is the scraper's business, and the
+   * backend is forbidden from writing public.* by a lint rule worth keeping.
+   *
+   * NO RESTART: /depth-symbols reads the table live and the userscript
+   * re-reads it every sweep, so a change lands within 25 seconds.
+   */
+  router.post('/slots/:n', async (req, res) => {
+    const slot = Number(req.params.n);
+    const symbol = String(req.body?.symbol || '').trim().toUpperCase();
+    const reason = String(req.body?.reason || '').slice(0, 200) || null;
+    // B4 · the backend names what it is replacing (spread:slotRequest carries
+    // replaced_symbol). Honoured when given; otherwise the slot's current holder.
+    const replacedSymbolIn = String(req.body?.replaced_symbol || '').trim().toUpperCase() || null;
+    const day = clock.tradingDay();
+
+    /**
+     * FIVE SLOTS, NEVER SIX.
+     *
+     * A symbol switch measured 4.34s across 3,984 real switches. Six symbols
+     * makes the cycle 30 seconds instead of 25 for EVERY symbol — degrading
+     * five books to gain one.
+     */
+    if (!Number.isInteger(slot) || slot < 1 || slot > SLOT_COUNT) {
+      return res.status(400).json({
+        ok: false,
+        error: `slot must be 1-${SLOT_COUNT}, got ${req.params.n}`,
+        detail: 'Five slots, never six: a sixth makes the sweep 30s instead of '
+          + '25s across every symbol, which degrades five books to gain one.',
+      });
+    }
+    if (!symbol) return res.status(400).json({ ok: false, error: 'symbol is required' });
+
+    try {
+      const { rows: known } = await query(
+        'SELECT is_tradeable, broker_status FROM instruments WHERE symbol = $1', [symbol]);
+      if (known.length && known[0].is_tradeable === false) {
+        return res.status(400).json({
+          ok: false,
+          error: `${symbol} is not tradeable`,
+          detail: `broker_status ${known[0].broker_status || 'unknown'} — a slot on it `
+            + 'would sweep a book nobody can act on.',
+        });
+      }
+
+      const { rows: current } = await query(
+        `SELECT slot_no, symbol FROM depth_watchlist
+          WHERE trading_date = $1 AND released_at IS NULL`, [day]);
+      const here = current.find((r) => r.slot_no === slot);
+      const elsewhere = current.find((r) => r.symbol === symbol && r.slot_no !== slot);
+
+      if (elsewhere) {
+        return res.status(409).json({
+          ok: false,
+          error: `${symbol} already holds slot ${elsewhere.slot_no}`,
+          detail: 'One symbol, one slot. Release that one first, or swap a different slot.',
+        });
+      }
+      if (here && here.symbol === symbol) {
+        return res.json({ ok: true, unchanged: true, slot, symbol,
+          note: 'that slot already holds this symbol' });
+      }
+
+      /**
+       * A SLOT HOLDING A POSITION OR A QUEUED ORDER CANNOT BE DISPLACED.
+       *
+       * Losing the book on a symbol you are IN is the one case where a swap
+       * costs more than it gains — you would be blind on the position while
+       * watching something you are not in.
+       */
+      if (here) {
+        const { rows: busy } = await query(`
+          SELECT
+            (SELECT count(*)::int FROM position
+              WHERE symbol = $1 AND is_open) AS open_positions,
+            (SELECT count(*)::int FROM awsat_order_list
+              WHERE symbol = $1 AND trading_date = $2
+                AND order_status IN ('Queued', 'Pending', 'Partially Filled')) AS queued`,
+        [here.symbol, day]);
+
+        // B3 · the BACKEND'S record is authoritative for what is held. Read
+        // spread.order_leg (a filled/carried/POSTED leg) and spread.claim —
+        // reads of spread.* are allowed. Guarded, so a scraper-only DB (no
+        // backend schema) simply falls back to the public.* check above.
+        let backendHeld = 0;
+        if (await query(`SELECT to_regclass('spread.order_leg') AS t`).then((r) => !!r.rows[0].t).catch(() => false)) {
+          const { rows: bk } = await query(`
+            SELECT (SELECT count(*)::int FROM spread.order_leg
+                      WHERE symbol = $1 AND status IN ('FILLED','CARRIED','POSTED')) AS legs,
+                   (SELECT count(*)::int FROM spread.claim WHERE symbol = $1) AS claims`,
+          [here.symbol]).catch(() => ({ rows: [{ legs: 0, claims: 0 }] }));
+          backendHeld = Number(bk[0].legs || 0) + Number(bk[0].claims || 0);
+        }
+
+        if (busy[0].open_positions > 0 || busy[0].queued > 0 || backendHeld > 0) {
+          return res.status(409).json({
+            ok: false,
+            error: `slot ${slot} holds ${here.symbol}, which cannot be displaced`,
+            detail: busy[0].open_positions > 0 || backendHeld > 0
+              ? `${here.symbol} has an open position or order the backend is tracking — `
+                + 'losing its book would leave you blind on a symbol you are in.'
+              : `${here.symbol} has ${busy[0].queued} queued order(s).`,
+            holding: here.symbol,
+          });
+        }
+
+        await query(
+          `UPDATE depth_watchlist SET released_at = now()
+            WHERE trading_date = $1 AND slot_no = $2 AND released_at IS NULL`, [day, slot]);
+      }
+
+      await query(`
+        INSERT INTO depth_watchlist
+          (trading_date, slot_no, symbol, slot_type, assigned_by,
+           replaced_symbol, replaced_at, replaced_by, replaced_reason)
+        VALUES ($1, $2, $3, $4, 'UI', $5, CASE WHEN $5::text IS NULL THEN NULL ELSE now() END,
+                CASE WHEN $5::text IS NULL THEN NULL ELSE 'UI' END, $6)
+        ON CONFLICT (trading_date, slot_no) DO UPDATE SET
+          symbol = EXCLUDED.symbol, assigned_at = now(), released_at = NULL,
+          replaced_symbol = EXCLUDED.replaced_symbol,
+          replaced_at = EXCLUDED.replaced_at,
+          replaced_by = EXCLUDED.replaced_by,
+          replaced_reason = EXCLUDED.replaced_reason`,
+      [day, slot, symbol, slot <= 3 ? 'PRE_DAY' : 'WAKEUP',
+        replacedSymbolIn || (here ? here.symbol : null), reason]);
+
+      const replaced = replacedSymbolIn || (here ? here.symbol : null);
+      log.info('depth slot swapped', {
+        slot, symbol, replaced, reason,
+        note: 'live within 25s — the sweep re-reads the list every cycle',
+      });
+
+      // B4 · return the RESULTING slot row, so the backend's spread:slotRequest
+      // handler can confirm the applied state rather than assume it.
+      const { rows: [row] } = await query(
+        `SELECT trading_date, slot_no, symbol, slot_type, assigned_at,
+                replaced_symbol, replaced_at, replaced_by, replaced_reason
+           FROM depth_watchlist WHERE trading_date = $1 AND slot_no = $2 AND released_at IS NULL`,
+        [day, slot]);
+      return res.json({
+        ok: true, slot, symbol, replaced,
+        row: row || null,
+        effective_in: 'up to 25 seconds — the sweep re-reads the list each cycle',
+      });
+    } catch (err) {
+      log.error('slot swap failed', { slot, symbol, err: err.message });
+      return res.status(500).json({ ok: false, error: err.message });
+    }
+  });
+
+  /**
+   * B4 · POST /depth-symbols — set the whole sweep list at once, in ONE
+   * transaction. This closes the "assumed shape" the backend was written to.
+   *
+   * REQUEST:  { date?: 'YYYY-MM-DD', slots: [{ slot: 1..5, symbol: 'ABC' }, …] }
+   *           date defaults to today; slots 1-3 are PRE_DAY, 4-5 WAKEUP.
+   * RESPONSE: { ok, date, slots: [<the resulting depth_watchlist rows>] }
+   *           a bad slot number or a duplicate symbol is a 400, applied atomically
+   *           (all or nothing) — a partial list would leave the sweep inconsistent.
+   */
+  router.post('/depth-symbols', async (req, res) => {
+    const day = String(req.body?.date || clock.tradingDay()).slice(0, 10);
+    const slots = Array.isArray(req.body?.slots) ? req.body.slots : null;
+    if (!slots || !slots.length) return res.status(400).json({ ok: false, error: 'slots array is required' });
+    const seen = new Set();
+    for (const s of slots) {
+      const nn = Number(s.slot);
+      const sym = String(s.symbol || '').trim().toUpperCase();
+      if (!Number.isInteger(nn) || nn < 1 || nn > SLOT_COUNT) return res.status(400).json({ ok: false, error: `slot must be 1-${SLOT_COUNT}, got ${s.slot}` });
+      if (!sym) return res.status(400).json({ ok: false, error: `slot ${nn} has no symbol` });
+      if (seen.has(sym)) return res.status(400).json({ ok: false, error: `${sym} appears twice — one symbol, one slot` });
+      seen.add(sym);
+    }
+    const { pool } = require('../db/pool');
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      // Set the WHOLE list: release the day's active slots first so a symbol
+      // moving slots does not collide with its old row (one symbol, one slot).
+      await client.query(
+        `UPDATE depth_watchlist SET released_at = now()
+          WHERE trading_date = $1 AND released_at IS NULL`, [day]);
+      for (const s of slots) {
+        const nn = Number(s.slot);
+        const sym = String(s.symbol).trim().toUpperCase();
+        await client.query(
+          `INSERT INTO depth_watchlist (trading_date, slot_no, symbol, slot_type, assigned_by)
+           VALUES ($1,$2,$3,$4,'INGEST_BULK')
+           ON CONFLICT (trading_date, slot_no) DO UPDATE SET
+             symbol = EXCLUDED.symbol, assigned_at = now(), released_at = NULL`,
+          [day, nn, sym, nn <= 3 ? 'PRE_DAY' : 'WAKEUP']);
+      }
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => {});
+      log.error('bulk depth-symbols failed', { err: err.message });
+      return res.status(500).json({ ok: false, error: err.message });
+    } finally {
+      client.release();
+    }
+    const { rows } = await query(
+      `SELECT trading_date, slot_no, symbol, slot_type FROM depth_watchlist
+        WHERE trading_date = $1 AND released_at IS NULL ORDER BY slot_no`, [day]);
+    return res.json({ ok: true, date: day, slots: rows });
   });
 
   /** Liveness for the userscript's panel. */
@@ -406,6 +699,13 @@ function createRouter() {
       db = { reachable: false, error: err.message };
     }
 
+    // H-9 · the full roster — every expected script, including ones that never
+    // started (`absent`), not only ones that stopped (`silent`). `problem`, when
+    // present, is the panel's own message, so a break's cause is legible here.
+    let scripts = [];
+    try { scripts = await scriptRoster(300); } catch { /* table may predate 038 */ }
+    const scriptsDown = scripts.filter((s) => s.status !== 'ok');
+
     return res.json({
       ok: true,
       at: new Date().toISOString(),
@@ -413,6 +713,10 @@ function createRouter() {
       awsatMode: config.awsat.mode,
       acceptingClientData: config.awsat.mode === 'client',
       pid: process.pid,
+      // Every expected script and its status; scriptsDown is the not-ok subset
+      // (absent | silent). Empty scriptsDown is healthy.
+      scripts,
+      scriptsDown,
       // Where the rows this instance accepts actually land.
       db,
     });
@@ -676,6 +980,26 @@ function createRouter() {
       log.error('could not store the debug dump', { err: err.message });
       return res.status(500).json({ ok: false, error: err.message });
     }
+  });
+
+  /**
+   * POST /ingest/heartbeat
+   * { script, version?, rowsSeen?, problem?, source? }
+   *
+   * Every userscript cycle, data or not. It is what makes a stopped script
+   * visible: the row's last_seen_at stops advancing, and `problem` says why.
+   */
+  router.post('/heartbeat', async (req, res) => {
+    const b = req.body || {};
+    if (!b.script) return res.status(400).json({ ok: false, error: 'script is required' });
+    await recordHeartbeat({
+      script: String(b.script).slice(0, 40),
+      source: b.source === 'awsat_server' ? 'awsat_server' : 'awsat_client',
+      version: b.version != null ? String(b.version).slice(0, 20) : null,
+      rowsSeen: Number.isFinite(Number(b.rowsSeen)) ? Number(b.rowsSeen) : null,
+      problem: b.problem != null ? String(b.problem).slice(0, 300) : null,
+    });
+    return res.json({ ok: true });
   });
 
   /**
@@ -1017,4 +1341,5 @@ function createRouter() {
   return router;
 }
 
-module.exports = { createRouter, toQuoteRow, checkCapturedAt, tokenMatches, PRECEDENCE };
+module.exports = { createRouter, toQuoteRow, checkCapturedAt, tokenMatches, PRECEDENCE,
+  recordHeartbeat, staleScripts, scriptRoster, EXPECTED_SCRIPTS };

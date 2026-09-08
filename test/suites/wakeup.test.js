@@ -1,6 +1,10 @@
-// pace = trades_today / median_trades_by_this_hour_last_10d
-// FIRE if pace >= 3.0 AND trades >= 20
+// B2 · pace is now one ACTIVITY input; MOVEMENT (range≥8, a 3-fil up-move) and
+// an absolute-volume floor decide. This suite tests the SLOT machinery, which
+// B2 did not change: the volume floor is switched off here and the firing
+// symbols get price captures (mv()) so they clear MOVEMENT. computePace reads
+// `trades`; the movement query reads `last_price` — the two fixtures coexist.
 process.env.AWSAT_MODE='client';
+process.env.WAKEUP_ABS_VOL_FLOOR_FRAC='0';
 const wake=require('../../src/wakeup');
 const db=require('../../src/db/pool');
 let p=0,n=0;const ck=(t,c,x)=>{n++;if(c)p++;else console.log('  FAIL:',t,JSON.stringify(x))};
@@ -21,6 +25,15 @@ let p=0,n=0;const ck=(t,c,x)=>{n++;if(c)p++;else console.log('  FAIL:',t,JSON.st
      values ('Main Market',$1,$2,$3,'Trading','awsat_server',1,$4)`,
     [sym,trades,d,new Date(d+'T'+String(hourUTC).padStart(2,'0')+':30:00Z')]);
 
+  // B2 · give a firing symbol the MOVEMENT it now needs: range 10 fils with
+  // 3-fil up-moves. The last capture carries the trade count so the message
+  // still reads "Nx on N trades". Floor is off (frac=0), so any volume clears it.
+  const mv=(sym,tradesOnLast)=>Promise.all([100,103,106,110].map((px,i)=>db.query(
+    `insert into awsat_market_quotes(market,symbol,last_price,high_price,low_price,volume,trades,
+       trading_date,session,ingest_source,source_precedence,created_at)
+     values ('Main Market',$1,$2,$2,$2,1,$3,$4,'Trading','awsat_server',1,$5)`,
+    [sym,px,i===3?tradesOnLast:0,day,new Date(day+'T06:0'+i+':00Z')])));
+
   for(let i=1;i<=10;i++){
     const d='1994-06-'+String(i+9).padStart(2,'0');
     await q('WKFAST',d,10,6);     // 10 trades by 09:30 Kuwait (06:30Z)
@@ -34,6 +47,7 @@ let p=0,n=0;const ck=(t,c,x)=>{n++;if(c)p++;else console.log('  FAIL:',t,JSON.st
   await q('WKTINY',day,12,6);     // 12/2    = 6x but 12 trades -> no (< 20)
   await q('WKNONE',day,500,6);    // baseline 0 -> pace unknowable
   await q('WKNEW',day,999,6);     // no history at all
+  await mv('WKFAST',120);         // only WKFAST also has the MOVEMENT to fire
 
   const paced=await wake.computePace(day,9);
   const by=(s)=>paced.find(x=>x.symbol===s);
@@ -66,28 +80,54 @@ let p=0,n=0;const ck=(t,c,x)=>{n++;if(c)p++;else console.log('  FAIL:',t,JSON.st
   for(const [sym,tr] of [['WKB',60],['WKC',70],['WKD',80],['WKE',90]]){
     for(let i=1;i<=10;i++) await q(sym,'1994-06-'+String(i+9).padStart(2,'0'),10,6);
     await q(sym,day,tr,6);
+    await mv(sym,tr);
   }
   await wake.scan(day,9);
   const holders=await wake.currentHolders(day);
   ck('all five wake-up slots held', holders.length===5, holders.map(h=>h.slot));
 
-  // a faster newcomer replaces the LOWEST pace
+  // A faster newcomer is BLOCKED when every slot is held — even at 30x.
+  // It used to evict the lowest pace, which could overwrite a symbol chosen
+  // ninety seconds earlier.
   for(let i=1;i<=10;i++) await q('WKMEGA','1994-06-'+String(i+9).padStart(2,'0'),10,6);
   await q('WKMEGA',day,300,6);        // 30x
+  await mv('WKMEGA',300);
   const swap=await wake.scan(day,9);
-  ck('the newcomer is promoted', swap.promoted===1, swap.rows);
+  ck('a full board promotes nobody', swap.promoted===0, swap.rows);
+  ck('and counts the block separately', swap.blocked>=1, swap);
   ck('and RECORDS what it replaced', swap.rows[0].replaced!==null, swap.rows[0]);
-  ck('it evicted the lowest pace (WKB at 6x)', swap.rows[0].replaced==='WKB', swap.rows[0].replaced);
-  const {rows:swapRow}=await db.query(
-    "select replaced,message from signal_log where symbol='WKMEGA' and trading_date=$1",[day]);
-  ck('the swap is in signal_log.replaced', swapRow[0].replaced==='WKB', swapRow[0]);
-  ck('and named in the message', /replaced WKB/.test(swapRow[0].message), swapRow[0].message);
+  /**
+ * ─── A WAKE-UP NO LONGER EVICTS ──────────────────────────────────────────
+ *
+ * It used to replace the lowest-pace holder. So a symbol chosen deliberately
+ * at 09:50 could be overwritten by a scan at 09:52 — which looks like a bug
+ * and is very hard to trace, because nothing in the book data says the slot
+ * changed hands.
+ *
+ * It now claims only FREE slots, and a blocked wake-up is logged AND surfaced
+ * in the feed, so it becomes a prompt rather than a silence.
+ */
+ck('it does NOT evict the lowest pace, even at 30x',
+     swap.rows.every(r=>r.slot===null||r.blocked!==true||r.slot===null), swap.rows);
+  ck('the wake-up is reported BLOCKED',
+     swap.rows.some(r=>r.symbol==='WKMEGA' && r.blocked===true), swap.rows);
 
-  // a slower newcomer must NOT churn a slot
+  // The refusal reaches the FEED, not just a log line. A blocked wake-up that
+  // nobody sees is a decision the trader never got to make.
+  const {rows:blocked}=await db.query(
+    "select signal,message from signal_log where symbol='WKMEGA' and trading_date=$1",[day]);
+  ck('it lands in signal_log as WAKEUP_BLOCKED',
+     blocked.length===1 && blocked[0].signal==='WAKEUP_BLOCKED', blocked);
+  ck('and names the deadest holder, so it reads as a prompt',
+     /WKB is the deadest/.test(blocked[0].message||''), blocked[0].message);
+  ck('with the pace that justified it', /30x/.test(blocked[0].message||''), blocked[0].message);
+
+  // a slower newcomer is blocked too, and says so
   for(let i=1;i<=10;i++) await q('WKMEH','1994-06-'+String(i+9).padStart(2,'0'),10,6);
   await q('WKMEH',day,35,6);          // 3.5x, below every holder
+  await mv('WKMEH',35);
   const noSwap=await wake.scan(day,9);
-  ck('a slower symbol does not evict anyone', noSwap.promoted===0, noSwap.rows);
+  ck('a slower symbol claims nothing either', noSwap.promoted===0, noSwap.rows);
 
   // ── the 8 the fast loop watches ──
   // A pre-day slot is a depth_watchlist row, not a signal_log row.

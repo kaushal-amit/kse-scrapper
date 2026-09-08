@@ -138,6 +138,17 @@ no timezone dependency to go stale. Comparing `new Date().getHours()` against 9
 would be correct only if the server itself were in Kuwait, and silently wrong by
 hours otherwise.
 
+### Halts reach `signal_log` at 17:45, not intraday (G-8)
+
+Halt-resume firings are detected live by the **backend** (`spread:halt` is the
+alert path, in real time). They land in `public.signal_log` only when
+`signals.score` runs at **17:45**: its first step mirrors that day's
+`spread.halt_event` RESUME rows into `signal_log` as `signal = 'HALT_RESUME'`,
+then scores them. So **anything reading `signal_log` intraday does not see
+today's halts** — they appear after 17:45, and `daily.analysis` (next morning)
+sees them. Nothing in the trading path depends on the mirror being real-time; the
+operator's alert is `spread:halt`, which fires the moment the symbol resumes.
+
 ---
 
 ## Project structure

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AWSAT / DirectFN — Market Summary Capture
 // @namespace    local.trading.tools
-// @version      1.4.0
+// @version      1.5.0
 // @description  Reads the top-panel market summary (Index, Volume, Turnover, Trades, YTD %, Symbols Traded, UPs, Down, Unchanged) once a minute and submits it to Server 1.
 // @match        *://*.awsatbroker.com/*
 // @match        *://awsatbroker.com/*
@@ -27,7 +27,7 @@
   // ── CONFIG ────────────────────────────────────────────────────────────────
   // The running build, shown on the panel: two scripts both reporting
   // 2.0.0 cost a session diagnosing a bug that was already fixed.
-  var VERSION = '1.4.0';
+  var VERSION = '1.5.0';
 
   var SERVER          = 'https://scrapper.99labs.space';
   var TOKEN           = 'CHANGE-ME';               // must equal INGEST_TOKEN
@@ -198,15 +198,27 @@
     });
   }
 
+  // Per-cycle check-in (see /ingest/heartbeat) — every cycle, captured or not,
+  // so a stopped or blind market-summary script is visible, not silently absent.
+  function heartbeat(rowsSeen, problem) {
+    fetch(SERVER + '/ingest/heartbeat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + TOKEN },
+      body: JSON.stringify({ script: 'market-summary', version: VERSION, rowsSeen: rowsSeen, problem: problem || null }),
+    }).catch(function () {});
+  }
+
   function cycle() {
     flushQueue();
     var r = scrape();
-    if (!r.labelsMatched.length) { stats.lastResult = 'panel not found'; refresh(); return; }
+    if (!r.labelsMatched.length) { stats.lastResult = 'panel not found'; heartbeat(0, 'panel not found'); refresh(); return; }
     if (!r.values) {
       dumpDebug(r.labelsMatched);
       stats.lastResult = 'labels found, NO values — HTML dumped to /ingest/debug';
+      heartbeat(0, 'labels found, no values');
       refresh(); return;
     }
+    heartbeat(r.values, null);          // alive, with N fields captured
     if (SKIP_UNCHANGED) {
       var key = JSON.stringify(r.data);
       if (key === lastKey) {

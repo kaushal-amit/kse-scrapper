@@ -31,6 +31,112 @@ const PACE_MIN = T.get('wakeup_pace_min');
 const TRADES_MIN = T.get('wakeup_trades_min');
 const BASELINE_DAYS = Number(process.env.WAKEUP_BASELINE_DAYS || 10);
 const WAKEUP_SLOTS = [4, 5, 6, 7, 8];
+const LOT = 100;
+
+/**
+ * B2 · the current session budget, from the backend's spread.gate_config — the
+ * absolute-volume floor is 300 × shares AT THAT BUDGET, and the budget is read,
+ * not restated. spread.* is the backend's; the scraper only READS it (allowed).
+ * Falls back to WAKEUP_BUDGET_KD, then 2000, when the store is unreachable.
+ */
+async function currentBudgetKd() {
+  try {
+    const { rows } = await query(
+      `SELECT config FROM spread.gate_config ORDER BY version DESC LIMIT 1`);
+    const v = rows[0] && rows[0].config ? rows[0].config['session-budget'] : null;
+    const n = Number(typeof v === 'object' && v ? v.numericValue : v);
+    if (Number.isFinite(n) && n > 0) return n;
+  } catch { /* spread schema may be absent in a scraper-only DB */ }
+  return Number(process.env.WAKEUP_BUDGET_KD || 2000);
+}
+
+/**
+ * B2 · per-symbol MOVEMENT and ACTIVITY inputs for the movement test: today's
+ * range, the move from the open, the count of ≥N-fil up-moves, today's volume
+ * and the symbol's own average, and whether it halted today. From the board-wide
+ * quotes grid, up to `atHour`.
+ */
+async function computeMovement(day = clock.tradingDay(), atHour = null) {
+  const hour = atHour === null ? new Date().getUTCHours() + 3 : atHour;
+  const upmove = T.get('wakeup_upmove_fils');
+  const { rows } = await query(`
+    WITH q AS (
+      SELECT symbol, created_at, session, trades, volume,
+             last_price::numeric AS last_price,
+             high_price::numeric AS high_price, low_price::numeric AS low_price,
+             lag(last_price::numeric) OVER (PARTITION BY symbol ORDER BY created_at) AS prev_px
+        FROM awsat_market_quotes
+       WHERE trading_date = $1 AND last_price IS NOT NULL AND last_price > 0
+         AND EXTRACT(hour FROM created_at AT TIME ZONE 'Asia/Kuwait') <= $2
+    ),
+    agg AS (
+      SELECT symbol,
+             max(trades)  AS trades_today,
+             max(volume)  AS volume_today,
+             (array_agg(last_price ORDER BY created_at))[1]      AS open_px,
+             (array_agg(last_price ORDER BY created_at DESC))[1] AS last_px,
+             max(GREATEST(COALESCE(high_price, last_price), last_price)) AS high_px,
+             min(LEAST(COALESCE(low_price, last_price), last_price))     AS low_px,
+             count(*) FILTER (WHERE prev_px IS NOT NULL AND (last_price - prev_px) >= $3) AS up_moves,
+             bool_or(session ~* 'auction|halt|circuit|suspend|\\ycb\\y') AS halted_today
+        FROM q GROUP BY symbol
+    ),
+    vavg AS (
+      -- the symbol's own average daily volume over the prior sessions
+      SELECT symbol, avg(vol) AS vol_avg FROM (
+        SELECT symbol, trading_date, max(volume) AS vol
+          FROM awsat_market_quotes
+         WHERE trading_date < $1 AND trading_date >= $1 - ($4 || ' days')::interval
+           AND volume IS NOT NULL
+         GROUP BY symbol, trading_date
+      ) d GROUP BY symbol
+    )
+    SELECT a.*, v.vol_avg
+      FROM agg a LEFT JOIN vavg v USING (symbol)`, [day, hour, upmove, BASELINE_DAYS * 3]);
+
+  return rows.map((r) => {
+    const open = r.open_px == null ? null : Number(r.open_px);
+    const last = r.last_px == null ? null : Number(r.last_px);
+    const high = r.high_px == null ? null : Number(r.high_px);
+    const low = r.low_px == null ? null : Number(r.low_px);
+    return {
+      symbol: r.symbol,
+      tradesToday: Number(r.trades_today || 0),
+      volumeToday: Number(r.volume_today || 0),
+      volAvg: r.vol_avg == null ? null : Number(r.vol_avg),
+      open, last, price: last,
+      rangeFils: high != null && low != null ? high - low : null,
+      moveFromOpen: last != null && open != null ? last - open : null,
+      upMoves: Number(r.up_moves || 0),
+      haltedToday: r.halted_today === true,
+    };
+  });
+}
+
+/**
+ * B2 · the movement test. ACTIVITY (any of three) AND MOVEMENT (both) AND an
+ * absolute-volume floor. Returns { fires, reasons, floor } per the config.
+ */
+function movementVerdict(m, pace, budgetKd) {
+  const paceMult = T.get('wakeup_pace_mult');
+  const volMult = T.get('wakeup_vol_mult');
+  const moveOpen = T.get('wakeup_move_open_fils');
+  const rangeMin = T.get('wakeup_range_min_fils');
+  const floorShares = T.get('wakeup_abs_vol_floor_shares');
+  const floorFrac = T.get('wakeup_abs_vol_floor_frac');
+
+  const activity =
+    (pace != null && pace >= paceMult) ||
+    (m.volAvg != null && m.volAvg > 0 && m.volumeToday >= volMult * m.volAvg) ||
+    (m.moveFromOpen != null && Math.abs(m.moveFromOpen) >= moveOpen);
+  const movement =
+    (m.rangeFils != null && m.rangeFils >= rangeMin) &&
+    (m.upMoves >= 1);
+  const sharesAtBudget = m.price > 0 ? Math.floor((budgetKd * 1000) / m.price / LOT) * LOT : 0;
+  const floor = Math.round(floorShares * sharesAtBudget * floorFrac);
+  const absVol = m.volumeToday >= floor;
+  return { fires: activity && movement && absVol, activity, movement, absVol, floor };
+}
 
 /**
  * Pace for every symbol that has traded today.
@@ -145,10 +251,26 @@ async function scan(day = clock.tradingDay(), atHour = null) {
     awsat_market_quotes: ['symbol', 'trades', 'trading_date', 'created_at'],
   }, { quiet: true });
 
+  // B2 · the movement test replaces the pace-only trigger. Pace still feeds
+  // ACTIVITY (a), but MOVEMENT and the absolute-volume floor now decide.
   const paced = await computePace(day, atHour);
-  const firing = paced
-    .filter((p) => p.pace !== null && p.pace >= PACE_MIN && p.trades >= TRADES_MIN)
-    .sort((a, b) => b.pace - a.pace);      // fastest first
+  const paceBy = new Map(paced.map((p) => [p.symbol, p.pace]));
+  const moves = await computeMovement(day, atHour);
+  const budgetKd = await currentBudgetKd();
+  const firing = moves
+    .map((m) => ({ ...m, pace: paceBy.get(m.symbol) ?? null, v: movementVerdict(m, paceBy.get(m.symbol) ?? null, budgetKd) }))
+    .filter((m) => m.v.fires)
+    // Priority: (1) halted today, (2) largest range in fils, (3) most 3-fil
+    // up-moves, (4) volume ratio — last.
+    .sort((a, b) => {
+      if (a.haltedToday !== b.haltedToday) return a.haltedToday ? -1 : 1;
+      if ((b.rangeFils ?? 0) !== (a.rangeFils ?? 0)) return (b.rangeFils ?? 0) - (a.rangeFils ?? 0);
+      if (b.upMoves !== a.upMoves) return b.upMoves - a.upMoves;
+      const ar = a.volAvg ? a.volumeToday / a.volAvg : 0;
+      const br = b.volAvg ? b.volumeToday / b.volAvg : 0;
+      return br - ar;
+    })
+    .map((m) => ({ ...m, trades: m.tradesToday })); // keep the field the rest reads
 
   if (!firing.length) {
     log.info('wake-up scan: nothing firing', { day, examined: paced.length });
@@ -169,13 +291,44 @@ async function scan(day = clock.tradingDay(), atHour = null) {
     let replaced = null;
 
     if (slot === undefined) {
-      // Full. The lowest pace goes — but only if this one beats it. A swap
-      // that does not improve the set costs the evicted symbol's session.
+      /**
+       * ─── A WAKE-UP NEVER DISPLACES AN OCCUPIED SLOT ───────────────────────
+       *
+       * This used to evict the lowest-pace holder. So a symbol chosen
+       * deliberately at 09:50 could be overwritten by a scan at 09:52 — which
+       * looks like a bug and is very hard to trace, because nothing in the
+       * book data says the slot changed hands.
+       *
+       * The refusal is LOGGED and SURFACED, not swallowed. If ABAR wakes at
+       * 3.4x and cannot get a slot, that is a decision for the trader — and
+       * they only get to make it if they are told.
+       */
       const weakest = [...held.values()]
         .sort((a, b) => Number(a.pace ?? 0) - Number(b.pace ?? 0))[0];
-      if (Number(cand.pace) <= Number(weakest.pace ?? 0)) continue;
-      slot = weakest.slot;
-      replaced = weakest.symbol;
+
+      log.warn('wake-up could not claim a slot — all five are held', {
+        symbol: cand.symbol,
+        pace: cand.pace,
+        trades: cand.trades,
+        weakestHeld: weakest ? weakest.symbol : null,
+        weakestPace: weakest ? weakest.pace : null,
+        note: 'swap it by hand if it is worth a slot: POST /ingest/slots/:n',
+      });
+
+      // Into the feed, so a blocked wake-up becomes a prompt rather than a log
+      // line nobody reads.
+      await query(
+        `INSERT INTO signal_log
+           (fired_at, trading_date, symbol, signal, slot, pace, message)
+         VALUES (now(), $1, $2, 'WAKEUP_BLOCKED', NULL, $3, $4)
+         ON CONFLICT DO NOTHING`,
+        [day, cand.symbol, cand.pace,
+          `woke ${cand.pace}x on ${cand.trades} trades — no free slot`
+          + (weakest ? `. ${weakest.symbol} is the deadest at ${weakest.pace ?? '?'}x. Swap?` : '')],
+      ).catch(() => {});
+
+      out.push({ symbol: cand.symbol, pace: cand.pace, slot: null, blocked: true });
+      continue;
     }
 
     const message = replaced
@@ -217,10 +370,20 @@ async function scan(day = clock.tradingDay(), atHour = null) {
   }
 
   log.info('wake-up scan complete', {
-    day, examined: paced.length, firing: firing.length, promoted: out.length,
+    // A BLOCKED wake-up is not a promotion. Counting it as one would report
+    // five promotions on a day when nothing changed slots.
+    day, examined: paced.length, firing: firing.length,
+    promoted: out.filter((r) => !r.blocked).length,
+    blocked: out.filter((r) => r.blocked).length,
     promotions: out.map((o) => `${o.symbol} slot ${o.slot} @ ${o.pace}x`),
   });
-  return { examined: paced.length, fired: firing.length, promoted: out.length, rows: out };
+  return {
+    examined: paced.length,
+    fired: firing.length,
+    promoted: out.filter((r) => !r.blocked).length,
+    blocked: out.filter((r) => r.blocked).length,
+    rows: out,
+  };
 }
 
 /**
@@ -239,7 +402,33 @@ async function slottedSymbols(day = clock.tradingDay()) {
   return rows;
 }
 
+/**
+ * B2 · the HARD-RULE dry-run — before the new trigger ships, run it against the
+ * last N sessions and report how many symbols would fire per session, and which.
+ * If it is under one per session the absolute-volume floor is too high (the
+ * wake-up finds stocks to WATCH, not to fill at full size): lower
+ * wakeup_abs_vol_floor_frac toward 1/3 and run again. No writes — a report only.
+ */
+async function dryRun({ sessions = 5, atHour = 13 } = {}) {
+  const { rows: days } = await query(
+    `SELECT DISTINCT trading_date FROM awsat_market_quotes ORDER BY trading_date DESC LIMIT $1`, [sessions]);
+  const budgetKd = await currentBudgetKd();
+  const out = [];
+  for (const d of days.reverse()) {
+    const moves = await computeMovement(d.trading_date, atHour);
+    const paced = await computePace(d.trading_date, atHour);
+    const paceBy = new Map(paced.map((p) => [p.symbol, p.pace]));
+    const fired = moves.filter((m) => movementVerdict(m, paceBy.get(m.symbol) ?? null, budgetKd).fires);
+    out.push({ day: clock.toDay ? clock.toDay(d.trading_date) : String(d.trading_date).slice(0, 10),
+      examined: moves.length, fired: fired.length, symbols: fired.map((f) => f.symbol) });
+  }
+  const avg = out.length ? out.reduce((s, r) => s + r.fired, 0) / out.length : 0;
+  return { budgetKd, floorFrac: T.get('wakeup_abs_vol_floor_frac'), perSession: out, avgPerSession: Number(avg.toFixed(2)),
+    tooHigh: avg < 1 };
+}
+
 module.exports = {
-  scan, computePace, currentHolders, holderPaces, slottedSymbols,
+  scan, computePace, computeMovement, movementVerdict, dryRun, currentBudgetKd,
+  currentHolders, holderPaces, slottedSymbols,
   PACE_MIN, TRADES_MIN, WAKEUP_SLOTS,
 };

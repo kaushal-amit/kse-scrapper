@@ -514,8 +514,12 @@ async function wakeupScan(runId) {
 
 /** Nightly scoring of today's signals (Step 3, item 6). */
 async function scoreSignals(runId, args) {
-  return require('./jobs/scoreSignals')
-    .score((args && args.date) || clock.tradingDay(), runId);
+  const day = (args && args.date) || clock.tradingDay();
+  // B4 · the halt mirror is the FIRST step: every halt-resume of the day lands
+  // in signal_log (once) before scoring, and the count-equality check fails the
+  // job loudly rather than scoring a half-mirrored day.
+  await require('./jobs/mirrorHalts').mirror(day);
+  return require('./jobs/scoreSignals').score(day, runId);
 }
 
 async function dailyAnalysis(runId, args) {

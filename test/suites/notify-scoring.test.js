@@ -79,10 +79,47 @@ const srv=app.listen(8811,async()=>{
      (await got('SCB','NO_PROTECTION')).was_right===true);
   ck('a warning that preceded a rise is wrong',
      (await got('SCA','NO_PROTECTION')).was_right===false);
-  ck('FROZEN claims no direction -> NULL, not false',
-     (await got('SCA','FROZEN')).was_right===null);
-  ck('but it IS marked scored, so it is not retried nightly',
+  // B1 · FROZEN is now scored 'still' — right when the price STAYED within the
+  // band (the freeze held), wrong when it broke. SCA moved 176->180: broke.
+  ck('FROZEN that BROKE (176->180) is wrong, not NULL',
+     (await got('SCA','FROZEN')).was_right===false, await got('SCA','FROZEN'));
+  ck('and it IS marked scored, so it is not retried nightly',
      (await got('SCA','FROZEN')).scored_at!==null);
+
+  // A FROZEN that actually stayed frozen is RIGHT.
+  await db.query(`insert into symbol_minute(symbol,trading_date,ts,last_price)
+    values ('SCC',$1,$2,176),('SCC',$1,$3,176),('SCC',$1,$4,176)`,[day,at(0),at(5),at(15)]);
+  await fire('SCC','FROZEN');
+  await scorer.score(day,null);
+  ck('FROZEN that HELD (176->176) is right', (await got('SCC','FROZEN')).was_right===true);
+
+  // B1 · the forward-price fallback. SCD has NO symbol_minute (not a depth slot)
+  // but IS in the board-wide awsat_market_quotes — the price must still fill.
+  await db.query(`insert into awsat_market_quotes(market,symbol,session,last_price,trading_date,ingest_source,source_precedence,created_at)
+    values ('KSE','SCD','Trading',176,$1,'awsat_server',1,$2),('KSE','SCD','Trading',181,$1,'awsat_server',1,$3)`,[day,at(0),at(5)]);
+  await fire('SCD','WAKEUP');
+  await scorer.score(day,null);
+  const scd=await got('SCD','WAKEUP');
+  ck('WAKEUP with no symbol_minute fills px_5min from awsat_market_quotes', Number(scd.px_5min)===181, scd.px_5min);
+  ck('  and grades it (176->181, a rise) right', scd.was_right===true, scd);
+
+  // B1 · pct_right at 5/15/60 separately.
+  const report=await scorer.scoringReport(day);
+  const buyers=report.find((x)=>x.signal==='BUYERS_8_5');
+  ck('scoringReport gives per-horizon fired/scored/%right', !!buyers && buyers.fired===2 && buyers.pctRight5!=null, buyers);
+
+  // B1 · backfill scores a day the nightly run missed.
+  const missed='1993-06-07';
+  await db.query('delete from signal_log where trading_date=$1',[missed]);
+  await db.query(`insert into symbol_minute(symbol,trading_date,ts,last_price)
+    values ('SCE',$1,$2,100),('SCE',$1,$3,104)`,[missed,new Date('1993-06-07T09:00:00Z'),new Date('1993-06-07T09:05:00Z')]);
+  await db.query(`insert into signal_log(symbol,trading_date,fired_at,signal,price)
+    values ('SCE',$1,$2,'BUYERS_8_5',100)`,[missed,new Date('1993-06-07T09:00:00Z')]);
+  const bf=await scorer.scoreBackfill(null);
+  ck('backfill scores the missed day too', bf.graded>=1 && (await db.query('select was_right from signal_log where trading_date=$1',[missed])).rows[0].was_right===true, bf);
+  await db.query('delete from signal_log where trading_date=$1',[missed]);
+  await db.query('delete from symbol_minute where trading_date=$1',[missed]);
+  await db.query('delete from awsat_market_quotes where trading_date=$1',[day]);
 
   const r2=await scorer.score(day,null);
   ck('a second run finds nothing unscored', r2.extracted===0, r2);

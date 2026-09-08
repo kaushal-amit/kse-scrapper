@@ -1,6 +1,7 @@
-// The scraper owns nine thresholds in a file. It must not read kb_threshold —
+// The scraper owns its thresholds in a file. It must not read kb_threshold —
 // a capture service that refuses to boot without a backend table is backwards
-// coupling.
+// coupling. B2 added seven wake-up movement-test thresholds (Item 4), all in
+// the same file with the same provenance.
 const fs=require('fs'); const path=require('path');
 const T=require('../../src/config/thresholds');
 const S=require('../../src/signals');
@@ -9,9 +10,14 @@ let p=0,n=0;const ck=(t,c,x)=>{n++;if(c)p++;else console.log('  FAIL:',t,JSON.st
 const NINE=['sig_no_protection_bid','sig_buyers_ratio','sig_big_qty',
   'sig_bait_max_age_secs','sig_tiny_trade_shares','sig_wall_qty',
   'wakeup_pace_min','wakeup_trades_min','close_capture_min_hhmm'];
+// B2 · the movement-test thresholds, in the same file.
+const MOVEMENT=['wakeup_pace_mult','wakeup_vol_mult','wakeup_move_open_fils',
+  'wakeup_range_min_fils','wakeup_upmove_fils','wakeup_abs_vol_floor_shares','wakeup_abs_vol_floor_frac'];
 
-ck('exactly nine thresholds', Object.keys(T.all()).length===9, Object.keys(T.all()).length);
+ck('the original nine thresholds plus the seven B2 movement ones',
+   Object.keys(T.all()).length===NINE.length+MOVEMENT.length, Object.keys(T.all()).length);
 for(const k of NINE) ck(k+' present', T.get(k)!==undefined);
+for(const k of MOVEMENT) ck(k+' present', T.get(k)!==undefined);
 
 // ── the VALUES did not move when they left the table ──
 ck('sig_no_protection_bid still 20000', T.get('sig_no_protection_bid')===20000);

@@ -23,20 +23,48 @@ const { query } = require('../db/pool');
 const clock = require('../market/clock');
 const log = require('../logger');
 
-/** +1 expects a rise, -1 expects a fall, 0 has no directional claim. */
-const DIRECTION = {
-  BUYERS_8_5: 1,
-  WALL_PULLED: 1,
-  WAKEUP: 1,
-  PREDAY: 0,
-  NO_PROTECTION: -1,
-  BID_EMPTY: -1,
-  BAIT_BID: -1,
-  WALL_PLACED: -1,
-  FROZEN: 0,
+/*
+ * ─── THE SCORING RULE, in one place (B1) ─────────────────────────────────────
+ * `was_right` is graded at +5 MINUTES on the signal's OWN claim, by at least
+ * MIN_MOVE_FILS. The claim differs by signal, and grading them all as "expects
+ * a rise" would mark a correct warning as a failure:
+ *
+ *   'up'    the signal expects a RISE   — right when px rose  ≥ MIN_MOVE
+ *   'down'  the signal is a WARNING     — right when px FELL  ≥ MIN_MOVE
+ *   'still' the signal says NOTHING WILL — right when px stayed within MIN_MOVE
+ *           MOVE (FROZEN: both sides walled, zero volume). It IS gradable — the
+ *           freeze either held or it broke — it is just not directional.
+ *   'none'  no forward claim (PREDAY, a pre-session marker) → left NULL.
+ *
+ * px_5min / px_15min / px_60min are all filled (a signal can be right at five
+ * minutes and wrong at sixty); was_right is the 5-minute grade, and pct_right at
+ * all three horizons is reported by scoringReport() from the px columns.
+ * HALT_RESUME is scored 'up' — a down-halt resume is a bounce play (B4).
+ */
+const MODE = {
+  BUYERS_8_5: 'up',
+  WALL_PULLED: 'up',
+  WAKEUP: 'up',
+  HALT_RESUME: 'up',
+  PREDAY: 'none',
+  NO_PROTECTION: 'down',
+  BID_EMPTY: 'down',
+  BAIT_BID: 'down',
+  WALL_PLACED: 'down',
+  FROZEN: 'still',
 };
 
 const MIN_MOVE_FILS = Number(process.env.SCORE_MIN_MOVE_FILS || 1);
+
+/** Grade one horizon's price against the signal's claim. null = not gradable. */
+function grade(base, px, mode) {
+  if (base == null || px == null || !mode || mode === 'none') return null;
+  const move = Number(px) - Number(base);
+  if (mode === 'up') return move >= MIN_MOVE_FILS;
+  if (mode === 'down') return -move >= MIN_MOVE_FILS;
+  if (mode === 'still') return Math.abs(move) < MIN_MOVE_FILS;
+  return null;
+}
 
 /**
  * The price a given number of minutes after a moment.
@@ -46,13 +74,26 @@ const MIN_MOVE_FILS = Number(process.env.SCORE_MIN_MOVE_FILS || 1);
  * because it happens to be closer.
  */
 async function priceAfter(symbol, from, minutes) {
+  // symbol_minute FIRST — it is the finest grid, but it exists only for the 8–17
+  // depth-slot symbols (signals.fast writes it). A WAKEUP fires on any of ~137
+  // symbols, so for all but the slotted few symbol_minute has no row and the
+  // forward price was never filled (1 of 15 WAKEUP rows). Fall back to the
+  // board-wide awsat_market_quotes (~60 s, every symbol) so every signal gets a
+  // forward price.
   const { rows } = await query(
     `SELECT last_price FROM symbol_minute
       WHERE symbol = $1 AND ts >= $2::timestamptz + ($3 || ' minutes')::interval
         AND last_price IS NOT NULL
       ORDER BY ts ASC LIMIT 1`, [symbol, from, minutes],
   );
-  return rows.length ? Number(rows[0].last_price) : null;
+  if (rows.length) return Number(rows[0].last_price);
+  const { rows: q } = await query(
+    `SELECT last_price FROM awsat_market_quotes
+      WHERE symbol = $1 AND created_at >= $2::timestamptz + ($3 || ' minutes')::interval
+        AND last_price IS NOT NULL AND last_price > 0
+      ORDER BY created_at ASC LIMIT 1`, [symbol, from, minutes],
+  );
+  return q.length ? Number(q[0].last_price) : null;
 }
 
 async function score(tradingDay, runId) {
@@ -81,12 +122,9 @@ async function score(tradingDay, runId) {
     const px60 = await priceAfter(s.symbol, s.fired_at, 60);
     const base = s.price === null ? null : Number(s.price);
 
-    let wasRight = null;
-    const dir = DIRECTION[s.signal];
-    if (base !== null && px5 !== null && dir) {
-      const move = (px5 - base) * dir;
-      wasRight = move >= MIN_MOVE_FILS;
-    }
+    // was_right is the 5-minute grade on the signal's own claim (see MODE).
+    const mode = MODE[s.signal];
+    const wasRight = grade(base, px5, mode);
 
     // scored_at is stamped even when was_right stays NULL: the signal HAS been
     // looked at, and leaving it unscored would make the job retry it nightly
@@ -115,4 +153,54 @@ async function score(tradingDay, runId) {
   return { extracted: pending.length, inserted: scored, rejected: unscorable };
 }
 
-module.exports = { score, priceAfter, DIRECTION, MIN_MOVE_FILS };
+/**
+ * B1 · score EVERY day that still has unscored rows, oldest first — not only
+ * today. The nightly job scored `trading_date = today`, so any day the 17:45 run
+ * was missed (a restart, a deploy, the process down) left its rows unscored for
+ * ever: 4,507 accumulated. This backfills them. Idempotent — a scored row is
+ * never revisited (scored_at IS NOT NULL).
+ */
+async function scoreBackfill(runId) {
+  const { rows: days } = await query(
+    `SELECT DISTINCT trading_date FROM signal_log
+      WHERE scored_at IS NULL ORDER BY trading_date`);
+  let total = 0, graded = 0;
+  for (const d of days) {
+    const r = await score(d.trading_date, runId);
+    total += r.extracted; graded += r.inserted;
+  }
+  log.info('scoring: backfill complete', { days: days.length, total, graded });
+  return { days: days.length, total, graded };
+}
+
+/**
+ * B1 · pct_right at 5, 15 and 60 minutes SEPARATELY, per signal — the table the
+ * delivery note carries. Computed from the px columns and each signal's MODE, so
+ * it re-grades at every horizon rather than only the stored 5-minute was_right.
+ * fired = rows that fired; scored = rows with a forward price at that horizon.
+ */
+async function scoringReport(day) {
+  const d = day || clock.tradingDay();
+  const { rows } = await query(
+    `SELECT signal, price, px_5min, px_15min, px_60min FROM signal_log
+      WHERE trading_date = $1`, [d]);
+  const acc = {};
+  for (const r of rows) {
+    const mode = MODE[r.signal] || 'none';
+    const a = acc[r.signal] || (acc[r.signal] = { fired: 0, h: { 5: { n: 0, right: 0 }, 15: { n: 0, right: 0 }, 60: { n: 0, right: 0 } } });
+    a.fired += 1;
+    for (const [h, px] of [[5, r.px_5min], [15, r.px_15min], [60, r.px_60min]]) {
+      const g = grade(r.price, px, mode);
+      if (g !== null) { a.h[h].n += 1; if (g) a.h[h].right += 1; }
+    }
+  }
+  const pct = (o) => (o.n ? Math.round((100 * o.right) / o.n) : null);
+  return Object.entries(acc).map(([signal, a]) => ({
+    signal, mode: MODE[signal] || 'none', fired: a.fired,
+    scored5: a.h[5].n, pctRight5: pct(a.h[5]),
+    scored15: a.h[15].n, pctRight15: pct(a.h[15]),
+    scored60: a.h[60].n, pctRight60: pct(a.h[60]),
+  })).sort((x, y) => x.signal.localeCompare(y.signal));
+}
+
+module.exports = { score, scoreBackfill, scoringReport, priceAfter, grade, MODE, MIN_MOVE_FILS };
