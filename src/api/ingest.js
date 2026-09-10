@@ -95,6 +95,29 @@ async function replayIfSeen(batchId) {
 }
 
 async function recordSubmission(batchId, kind, source, capturedAt, counts) {
+  // A1 · The heartbeat is a BYPRODUCT of every accepted submission, not a
+  // separate call only orders made. Before this, depth/quotes/market-summary
+  // posted rows into client_submissions but never touched client_heartbeat, so
+  // feedHealth.roster() — which reads ONLY client_heartbeat — reported them
+  // "absent" while they were in fact flowing every 28s. A live feed now writes
+  // its own liveness row on each post; silence is the only thing that reads as
+  // absent. Fired unconditionally on `kind` (independent of batchId, which only
+  // the submission log needs), and awaited before the submission so a heartbeat
+  // still lands even if the submission upsert is a duplicate no-op.
+  //
+  // A submission attests liveness (last_seen_at) and rows_seen ONLY. It does
+  // NOT touch version/problem — those are the userscript panel's own self-report
+  // (orders posts them via /ingest/heartbeat), and a submission overwriting them
+  // with nulls would erase a real "problem" message. So this upsert leaves both
+  // columns as they were on conflict, and inserts them null only on the first
+  // ever row for a feed that has no explicit heartbeat channel.
+  await query(
+    `INSERT INTO client_heartbeat (script, source, version, rows_seen, problem, last_seen_at)
+       VALUES ($1, $2, NULL, $3, NULL, now())
+     ON CONFLICT (script, source) DO UPDATE SET
+       rows_seen = EXCLUDED.rows_seen, last_seen_at = now()`,
+    [kind, source, counts.inserted],
+  ).catch((err) => log.error('could not record feed heartbeat from submission', { kind, err: err.message }));
   if (!batchId) return;
   await query(
     `INSERT INTO client_submissions

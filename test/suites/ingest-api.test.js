@@ -20,6 +20,7 @@ const srv=app.listen(8797,async()=>{
 
   await db.query("delete from awsat_market_quotes where ingest_source='awsat_client'");
   await db.query("delete from client_submissions");
+  await db.query("delete from client_heartbeat where script in ('quotes','depth','orders','market-summary')");
 
   // auth
   ck('no token -> 401', (await post('quotes',{records:[]},'')).status===401);
@@ -63,12 +64,40 @@ const srv=app.listen(8797,async()=>{
             {symbol:'ABAR',side:'Sell',price:177,quantity:500,filled:0}]});
   ck('orders: valid kept, id-less rejected', o.body.inserted===1 && o.body.rejected===1, o.body);
 
+  // A1 · every accepted submission writes a per-feed heartbeat, so feedHealth's
+  // roster (which reads ONLY client_heartbeat) sees depth/quotes as LIVE, not
+  // "absent". Before the fix only /ingest/heartbeat (orders-only) wrote a row,
+  // so the other three feeds flowed every 28s yet read as absent.
+  const {rows:hb}=await db.query(
+    "select script, rows_seen from client_heartbeat where script in ('quotes','depth','orders') order by script");
+  ck('every feed wrote a heartbeat from its submission', hb.length===3, hb.map(r=>r.script));
+  ck('  quotes heartbeat present', hb.some(r=>r.script==='quotes'), hb);
+  ck('  depth heartbeat present', hb.some(r=>r.script==='depth'), hb);
+  ck('  rows_seen carries the inserted count', Number(hb.find(r=>r.script==='depth').rows_seen)===2, hb);
+
+  // A1 · a submission attests LIVENESS ONLY — it must NOT overwrite the version
+  // and problem the userscript panel self-reports via /ingest/heartbeat. If it
+  // did, a live-but-broken panel's "problem" message would be erased on its very
+  // next post. Set an explicit panel report, then post another submission, and
+  // prove version/problem survive while last_seen_at and rows_seen advance.
+  await post('heartbeat',{script:'orders',version:'9.9.9',rowsSeen:0,problem:'PANEL: order tab empty'});
+  const {rows:before}=await db.query("select last_seen_at from client_heartbeat where script='orders'");
+  await new Promise(r=>setTimeout(r,1100));
+  await post('orders',{batchId:'o-2',capturedAt:new Date().toISOString(),
+    orders:[{orderId:'A2',symbol:'ABAR',side:'Buy',status:'FILLED',price:176,quantity:1000,filled:1000}]});
+  const {rows:after}=await db.query("select version,problem,rows_seen,last_seen_at from client_heartbeat where script='orders'");
+  ck('submission preserves the panel version', after[0].version==='9.9.9', after[0]);
+  ck('submission preserves the panel problem', after[0].problem==='PANEL: order tab empty', after[0]);
+  ck('  but liveness (last_seen_at) still advances', new Date(after[0].last_seen_at)>new Date(before[0].last_seen_at), after[0]);
+  ck('  and rows_seen reflects the new post', Number(after[0].rows_seen)===1, after[0]);
+
   // health
   const h=await fetch('http://127.0.0.1:8797/ingest/health',{headers:{Authorization:'Bearer '+T}}).then(r=>r.json());
   ck('health ok', h.ok===true, h);
 
   await db.query("delete from awsat_market_quotes where ingest_source='awsat_client'");
   await db.query("delete from client_submissions");
+  await db.query("delete from client_heartbeat where script in ('quotes','depth','orders','market-summary')");
   console.log(`\ningest API: ${p}/${n}`);
   srv.close(); await db.close(); process.exit(p===n?0:1);
 });
