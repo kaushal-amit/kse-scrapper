@@ -192,8 +192,9 @@ async function scrapeSymbol(page, symbol, { startDay, endDay, runId, maxScrolls 
     const before = collected.size;
 
     for (const row of batch) {
-      const date = hist.tsToDate(row.ts) || hist.parseRowDate(row.dateText);
-      const day = hist.toDayString(date);
+      // CR-12 · same day resolution as the writer (displayed date first, epoch
+      // fallback in Kuwait) so the scroll range and the stored rows agree.
+      const day = hist.rowDay(row);
       if (!day) continue;
 
       if (day < startDay) { reachedStart = true; break; }

@@ -67,6 +67,45 @@ function toDayString(d) {
 }
 
 /**
+ * CR-12 · the session day of a bar's data-row-time, resolved in Asia/Kuwait.
+ *
+ * This is the root of a seven-month off-by-one. `new Date(ts*1000).toISOString()`
+ * reads the epoch in UTC, and a TradingView daily bar stamped at Kuwait-midnight
+ * (UTC+3) lands on 21:00 UTC the day BEFORE — so every stored trade_date was one
+ * day early and the table filled with Saturday sessions Boursa Kuwait does not
+ * have. Kuwait is UTC+3 year-round (no DST): shift the instant by +3h and take
+ * the UTC calendar day, and the true session day comes out whether the epoch is
+ * exchange-local-midnight OR already UTC-midnight.
+ */
+const KUWAIT_OFFSET_MS = 3 * 3600000;
+function tsToKuwaitDay(ts) {
+  const n = Number(ts);
+  if (!(Number.isFinite(n) && n > 0)) return null;
+  return new Date(n * 1000 + KUWAIT_OFFSET_MS).toISOString().slice(0, 10);
+}
+
+/**
+ * The session day for a row: the DISPLAYED date first — parseRowDate builds it
+ * with Date.UTC from the row's own label, which is timezone-free truth — and the
+ * epoch only as a fallback, resolved in Kuwait. The old path trusted the epoch
+ * first and read it in raw UTC, which is the CR-12 corruption.
+ */
+function rowDay(row) {
+  return toDayString(parseRowDate(row && row.dateText)) || tsToKuwaitDay(row && row.ts);
+}
+
+/**
+ * A Boursa Kuwait session runs Sunday–Thursday. A Friday or Saturday trade_date
+ * cannot exist and is the signature of the CR-12 shift — the writer refuses one
+ * so the corruption class can never be stored silently again.
+ */
+function isWeekendDay(dayStr) {
+  if (!dayStr) return false;
+  const dow = new Date(`${dayStr}T00:00:00Z`).getUTCDay(); // 0 Sun … 6 Sat
+  return dow === 5 || dow === 6; // Friday, Saturday
+}
+
+/**
  * Parse a number as the table view writes it.
  *
  * Handles the U+2212 minus sign, thousands separators, non-breaking spaces and
@@ -145,13 +184,22 @@ function buildDailyRows(rows, headers, meta) {
   const reasons = [];
   let skipped = 0;
   let outOfRange = 0;
+  let weekendSkipped = 0;
   const seen = new Set();
 
   for (const row of rows) {
-    // The attribute first; the localised text only as a fallback.
-    const date = tsToDate(row.ts) || parseRowDate(row.dateText);
-    const day = toDayString(date);
+    // CR-12 · the displayed date first (timezone-free), the epoch only as a
+    // fallback resolved in Kuwait — never the raw-UTC epoch, which shifted seven
+    // months of history back by a day.
+    const day = rowDay(row);
     if (!day) { skipped += 1; reasons.push(`unparseable date: ${row.dateText}`); continue; }
+    // A session cannot fall on Fri/Sat. Refuse it loudly rather than store the
+    // corruption; weekendSkipped surfaces in the run summary.
+    if (isWeekendDay(day)) {
+      skipped += 1; weekendSkipped += 1;
+      reasons.push(`weekend date refused: ${day} (${row.dateText || 'ts ' + row.ts}) — a Boursa session cannot be Fri/Sat`);
+      continue;
+    }
 
     if (meta.startDay && day < meta.startDay) { outOfRange += 1; continue; }
     if (meta.endDay && day > meta.endDay) { outOfRange += 1; continue; }
@@ -205,9 +253,10 @@ function buildDailyRows(rows, headers, meta) {
   // Oldest first, so a partial run leaves a contiguous head rather than gaps.
   out.sort((a, b) => (a.trade_date < b.trade_date ? -1 : 1));
 
-  return { rows: out, skipped, outOfRange, reasons: reasons.slice(0, 10) };
+  return { rows: out, skipped, outOfRange, weekendSkipped, reasons: reasons.slice(0, 10) };
 }
 
 module.exports = {
-  parseRowDate, tsToDate, toDayString, parseNumeric, mapColumns, buildDailyRows,
+  parseRowDate, tsToDate, tsToKuwaitDay, rowDay, isWeekendDay, toDayString,
+  parseNumeric, mapColumns, buildDailyRows,
 };
