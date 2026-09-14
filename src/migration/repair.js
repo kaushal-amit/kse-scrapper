@@ -50,9 +50,12 @@ async function findCollisions() {
   const { rows } = await query(`
     SELECT symbol,
            count(*)::int AS rows_involved,
-           array_agg(DISTINCT market ORDER BY market) AS markets
+           array_agg(DISTINCT market ORDER BY market) AS markets,
+           -- F-11 · the DAYS on which the collision actually happened. The
+           -- repair is scoped to these; see repairMarketLabels.
+           array_agg(DISTINCT trading_date ORDER BY trading_date) AS collision_days
       FROM (
-        SELECT symbol, created_at, market
+        SELECT symbol, created_at, market, trading_date
           FROM awsat_market_quotes
          WHERE (symbol, created_at) IN (
            SELECT symbol, created_at FROM awsat_market_quotes
@@ -88,11 +91,54 @@ async function repairMarketLabels({ apply = false, confidence = LABEL_CONFIDENCE
   if (!colliding.length) return { symbols: 0, decided: [], unclear: [], deleted: 0 };
 
   const symbols = colliding.map((c) => c.symbol);
+  const daysBySymbol = new Map(colliding.map((c) => [
+    /*
+     * A `date` now arrives as the text Postgres sent (src/db/pool.js), so this
+     * is a slice rather than a conversion.
+     *
+     * It was `d.toISOString().slice(0, 10)` on a Date — and node-postgres
+     * parses a bare `date` at LOCAL midnight, so under TZ=Asia/Kuwait every
+     * colliding day shifted back one. THIS ARRAY SCOPES A DELETE. The
+     * `trading_date = ANY($3)` clause F-11 added to stop this tool destroying
+     * sessions that were never in question became the clause that selected
+     * them: --apply deleted the uncontested session BEFORE the collision, left
+     * the collision itself in place, and reported success.
+     */
+    c.symbol, (c.collision_days || []).map((d) => (d instanceof Date
+      ? `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+      : String(d).slice(0, 10))),
+  ]));
+
+  /*
+   * F-11 · THE SPLIT IS MEASURED ON THE COLLIDING DAYS ONLY.
+   *
+   * It used to be measured over the symbol's LIFETIME, which is the wrong
+   * denominator for a symbol that genuinely CHANGED market — the case
+   * 026_instruments_symbol_pk.sql documents by name ("DALQANRE x2 same company,
+   * market changed Main -> Auction").
+   *
+   * Concretely: 95,000 rows under Main, 3,000 under Auction after a real move,
+   * and ONE botched sweep during the transition week producing a single
+   * same-instant duplicate. The lifetime share is 0.969, over the 0.9
+   * threshold, so every one of the 3,000 Auction rows was deleted — including
+   * every session that never collided. The whole record of the period the stock
+   * traded on the auction market, destroyed on the evidence of one bad sweep.
+   *
+   * On the colliding days the split is what it should be: a sweep that failed
+   * to switch screens shows the wrong market a handful of times against the
+   * right one many times, ON THOSE DAYS.
+   */
   const { rows: split } = await query(`
-    SELECT symbol, market, count(*)::int AS n
-      FROM awsat_market_quotes
-     WHERE symbol = ANY($1)
-     GROUP BY symbol, market ORDER BY symbol, n DESC`, [symbols]);
+    SELECT q.symbol, q.market, count(*)::int AS n
+      FROM awsat_market_quotes q
+      JOIN (SELECT DISTINCT symbol, trading_date
+              FROM awsat_market_quotes
+             WHERE (symbol, created_at) IN (
+               SELECT symbol, created_at FROM awsat_market_quotes
+                GROUP BY symbol, created_at HAVING count(*) > 1)) d
+        ON d.symbol = q.symbol AND d.trading_date = q.trading_date
+     WHERE q.symbol = ANY($1)
+     GROUP BY q.symbol, q.market ORDER BY q.symbol, n DESC`, [symbols]);
 
   const byMarket = new Map();
   for (const r of split) {
@@ -113,6 +159,9 @@ async function repairMarketLabels({ apply = false, confidence = LABEL_CONFIDENCE
       drop: sorted.slice(1).map((l) => l.market),
       minority: total - sorted[0].n,
       share,
+      // The days the repair is allowed to touch. Everything outside them is a
+      // session that never collided and is not this tool's business.
+      days: daysBySymbol.get(symbol) || [],
       distribution: sorted.map((m) => `${m.market} ${m.n}`).join(' · '),
     };
     if (share >= confidence) decided.push(entry); else unclear.push(entry);
@@ -121,9 +170,11 @@ async function repairMarketLabels({ apply = false, confidence = LABEL_CONFIDENCE
   let deleted = 0;
   if (apply) {
     for (const d of decided) {
+      // Scoped to the colliding days. `trading_date = ANY($3)` is what stops
+      // this destroying sessions that were never in question.
       const { rowCount } = await query(
-        'DELETE FROM awsat_market_quotes WHERE symbol = $1 AND market = ANY($2)',
-        [d.symbol, d.drop]);
+        'DELETE FROM awsat_market_quotes WHERE symbol = $1 AND market = ANY($2) AND trading_date = ANY($3)',
+        [d.symbol, d.drop, d.days]);
       deleted += rowCount;
     }
   }

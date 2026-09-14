@@ -124,7 +124,7 @@ async function migrate({ statusOnly = false } = {}) {
 
   if (files.length === 0) {
     log.warn('no migration files found', { dir: DIR });
-    return { applied: [], skipped: [], drift: [] };
+    return { applied: [], skipped: [], drift: [], pending: [] };
   }
 
   const client = await pool.connect();
@@ -136,7 +136,14 @@ async function migrate({ statusOnly = false } = {}) {
     const { rows } = await client.query('SELECT filename, checksum FROM schema_migrations');
     const applied = new Map(rows.map((r) => [r.filename, r.checksum]));
 
-    const result = { applied: [], skipped: [], drift: [] };
+    /*
+     * `pending` is separate from `applied` deliberately. --status used to push
+     * the files it WOULD apply into `applied`, so a programmatic caller doing
+     * `const { applied } = await migrate({ statusOnly: true })` got a list of
+     * migrations that had NOT been applied, under the key named for the ones
+     * that had. Only the log line distinguished them.
+     */
+    const result = { applied: [], skipped: [], drift: [], pending: [] };
 
     for (const filename of files) {
       const sql = fs.readFileSync(path.join(DIR, filename), 'utf8');
@@ -157,7 +164,7 @@ async function migrate({ statusOnly = false } = {}) {
       }
 
       if (statusOnly) {
-        result.applied.push(filename);
+        result.pending.push(filename);
         log.info('would apply (status only)', { filename });
         continue;
       }
@@ -192,7 +199,7 @@ async function migrate({ statusOnly = false } = {}) {
     }
 
     log.info('migrations complete', {
-      applied: result.applied, skipped: result.skipped.length,
+      applied: result.applied, pending: result.pending, skipped: result.skipped.length,
     });
     return result;
   } finally {

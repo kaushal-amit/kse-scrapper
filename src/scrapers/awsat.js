@@ -336,12 +336,62 @@ function parseSymbol(raw) {
   return { symbol: (s || '').trim().toUpperCase() || null, code: (c || '').trim() || null };
 }
 
+/**
+ * F-05 · A NEGATIVE VALUE IN AN UNSIGNED FIELD IS REFUSED, NOT FLIPPED.
+ *
+ * This used to return Math.abs(n), with the reasoning that "an unsigned field
+ * that came back negative is a misread, not a negative price" — which is right,
+ * and is exactly why the value must not be kept. A misread is a cell read from
+ * the wrong column: a `chg` of -5 drifting into the `bbp` position becomes a
+ * bid of 5, a real, tradeable-looking price that nothing downstream can tell
+ * from a measured one.
+ *
+ * `null` is the honest answer. A nulled bid is a visible gap; an absolute-valued
+ * one is a lie with a plausible face. That is the project's rule — where a fix
+ * has two forms, make the failure loud rather than the value present.
+ *
+ * Counted, not silent: a parser that starts flipping columns produces a rising
+ * count here, which is the signal that something changed in the terminal.
+ */
+let negativeRefusals = 0;
+
+/**
+ * Kuwait is UTC+3 and does not observe DST — the same fact clock.js is built
+ * on. Written out rather than inherited from the host, because nothing pins TZ
+ * and the server may run anywhere.
+ */
+const KUWAIT_OFFSET = '+03:00';
+
+/**
+ * 'YYYY-MM-DD' + 'HH:MM[:SS]' as read from the broker grid -> a real instant.
+ *
+ * Exported so the offset can be tested without standing up a browser: this is
+ * the one place a wrong answer is invisible, because a Date object prints
+ * differently depending on where you print it.
+ */
+function toKuwaitInstant(isoDay, time) {
+  if (!isoDay || !/^\d{1,2}:\d{2}(:\d{2})?$/.test(time || '')) return null;
+  const [h, m, sec] = String(time).split(':');
+  const hhmmss = `${String(h).padStart(2, '0')}:${m}:${sec === undefined ? '00' : sec}`;
+  const d = new Date(`${isoDay}T${hhmmss}${KUWAIT_OFFSET}`);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
 function num(value, allowNegative = false) {
   const n = parse.toNumber(value);
   if (n === null) return null;
-  // An unsigned field that came back negative is a misread, not a negative
-  // price. Production takes the absolute value rather than dropping the row.
-  return (!allowNegative && n < 0) ? Math.abs(n) : n;
+  if (!allowNegative && n < 0) {
+    negativeRefusals += 1;
+    if (negativeRefusals === 1 || negativeRefusals % 50 === 0) {
+      log.warn('refused a negative value in an unsigned field — the cell was misread', {
+        value, refusalsThisProcess: negativeRefusals,
+        note: 'stored as null. Taking the absolute value would store a real-looking '
+          + 'price read from the wrong column.',
+      });
+    }
+    return null;
+  }
+  return n;
 }
 
 /** 'DD-MM-YYYY' -> 'YYYY-MM-DD'. Anything else is null rather than a guess. */
@@ -363,14 +413,22 @@ async function ensureLogin(page) {
     throw err;
   }
 
-  // Persistent, survives restarts and worker respawns. See loginGuard.js.
-  const verdict = guard.check();
+  /*
+   * Persistent, survives restarts and worker respawns. See loginGuard.js.
+   *
+   * H-D · ONE CALL, NOT TWO. This was `guard.check()` followed by
+   * `guard.recordAttempt()` — each correctly locked, with the DECISION made in
+   * the gap between them. Two processes could both read "1 attempt remaining",
+   * both pass, and both attempt against a broker cap of two per day. reserve()
+   * decides and debits inside a single lock, so an attempt that is granted is
+   * already spent and cannot be granted twice.
+   */
+  const verdict = guard.reserve();
   if (!verdict.allowed) {
     const err = new Error(`AWSAT login refused: ${verdict.reason}`);
     err.skipped = true;
     throw err;
   }
-  guard.recordAttempt();
 
   try {
     await page.goto(config.awsat.url, { waitUntil: 'domcontentloaded', timeout: 60_000 });
@@ -499,8 +557,29 @@ async function ensureLogin(page) {
       'exceeded[^.]{0,40}(login|attempt|logon)',
       'maximum\\s+number\\s+of\\s+login',
       'already\\s+(logged|active)',
-      'invalid\\s+(user|password|credential)',
       '1841841',
+      /*
+       * H-I · `invalid (user|password|credential)` USED TO BE ON THIS LIST, and
+       * it does not belong.
+       *
+       * A rejected credential is the broker saying "that was wrong", not "this
+       * account is disabled". It was harmless while F-02's refund existed and
+       * the lockout cleared itself overnight. It stopped being harmless the
+       * moment F-02 made the lockout a fact about the ACCOUNT that carries
+       * forward until a human clears it: one mistyped AWSAT_PASS, or a password
+       * rotated at the broker and not yet in .env, and the scraper disables
+       * itself INDEFINITELY — needing `npm run awsat:login-state --
+       * --reset-lockout` on a morning nobody knows to run it.
+       *
+       * The cost of getting this wrong in each direction is asymmetric and both
+       * are covered. Treating a bad password as a lockout: the capture is dead
+       * until someone notices, with a banner blaming the broker. Treating it as
+       * an ordinary failed attempt: it debits one of the two attempts, the
+       * second one debits the other, and the budget then refuses further logins
+       * anyway — which is the protection the cap exists to give. The budget
+       * already handles repeated bad credentials; the lockout flag does not
+       * need to, and cannot undo itself.
+       */
     ].join('|'), 'i');
 
     if (BROKER_LOCKOUT.test(detail)) guard.recordLockout(detail);
@@ -624,6 +703,45 @@ async function clickVisibleText(page, label, timeout = 6_000) {
     await page.waitForTimeout(150);
   }
   return false;
+}
+
+/**
+ * WHICH MARKET THE TOGGLE IS ACTUALLY SHOWING, or null if it cannot be read.
+ *
+ * P2 · THE SWEEP USED TO ASSUME IT.
+ *
+ *   // The terminal opens on this market; the toggle shows whichever is current.
+ *   let current = MARKETS[0];
+ *
+ * True of a freshly opened terminal and false of every sweep after the first,
+ * because the page is SHARED and PERSISTENT — this file's own header says "ONE
+ * page, shared by every AWSAT job" — and the sweep never switched back. After
+ * sweep 1 the board is displaying Main Market.
+ *
+ * On sweep 2, i = 0 labelled whatever was on screen 'Premier Market' with NO
+ * VERIFICATION AT ALL: the selectMarket check the file argues for so carefully
+ * only ran for i > 0. Then i = 1 tried to open the dropdown by clicking the
+ * text "Premier Market", which is not what the toggle says any more, so the
+ * switch failed and Main was skipped.
+ *
+ * The result, with AWSAT_BOARD_MODE=dom or on any cycle where the socket path
+ * threw: Main Market's ~98 symbols written to awsat_market_quotes and
+ * instruments with market='Premier Market'. Every row a real, current price
+ * under the wrong market — and the log line read
+ * "awsat: market swept {market: 'Premier Market', symbols: 98}".
+ *
+ * It is read rather than assumed, and an unreadable toggle is a refusal:
+ * labelling a hundred rows by assumption is the failure, not the fallback.
+ */
+async function readMarketToggle(page, markets = MARKETS) {
+  for (const m of markets) {
+    const loc = page.getByText(m, { exact: true }).filter({ visible: true });
+    const n = await loc.count().catch(() => 0);
+    for (let i = 0; i < n; i += 1) {
+      if (await loc.nth(i).isVisible().catch(() => false)) return m;
+    }
+  }
+  return null;
 }
 
 /**
@@ -848,17 +966,47 @@ async function scrapeBoard({ runId }) {
     const symbols = [];
     const seenAcrossMarkets = new Set();
 
-    // The terminal opens on this market; the toggle shows whichever is current.
-    let current = MARKETS[0];
+    /*
+     * P2 · READ the toggle; do not assume MARKETS[0].
+     *
+     * The page is shared and persistent and the sweep does not switch back, so
+     * on every cycle after the first the board is already showing the LAST
+     * market. `let current = MARKETS[0]` then mislabelled it, and because the
+     * i > 0 guard skipped verification for the first market, nothing checked.
+     */
+    let current = await readMarketToggle(boardPage);
 
     for (let i = 0; i < MARKETS.length; i += 1) {
       const market = MARKETS[i];
 
-      if (i > 0) {
+      if (current !== market) {
+        if (!current) {
+          // Unreadable toggle. Everything after this would be labelled by
+          // assumption, and a hundred rows under the wrong market is worse
+          // than a sweep that did not run.
+          log.error('awsat: cannot read which market the board is showing — '
+            + 'refusing to sweep rather than labelling rows by assumption',
+          { want: market, markets: MARKETS });
+          continue;
+        }
+
         const sw = await selectMarket(boardPage, current, market);
         if (!sw.switched) {
           log.error('awsat: market switch failed — skipping rather than storing '
             + 'another market\'s rows under its name', { market, reason: sw.reason });
+          continue;
+        }
+
+        /*
+         * AND VERIFY IT LANDED. selectMarket reports that it clicked, not that
+         * the board changed — a click that opened the dropdown and selected a
+         * greyed-out entry returns switched: true.
+         */
+        const now = await readMarketToggle(boardPage);
+        if (now !== market) {
+          log.error('awsat: the market switch reported success but the toggle '
+            + 'still shows something else — skipping', { want: market, toggle: now });
+          current = now;
           continue;
         }
         current = market;
@@ -1019,7 +1167,28 @@ async function scrapeDepth({ runId }) {
               .find((b) => b.querySelector(args.cell));
             if (!box) return false;
             const label = box.querySelector(args.cell);
-            return label && label.textContent.toUpperCase().includes(args.symbol);
+            if (!label) return false;
+            /*
+             * P2 · WORD BOUNDARY, NOT includes().
+             *
+             * "ABARRE" contains "ABAR". The sibling userscript solved this and
+             * says why (awsat-depth-all.user.js, findResult): a substring match
+             * happily selects the RIGHTS LINE when the real listing is one row
+             * further down. This scraper selects by typing the ticker and
+             * pressing Enter, which takes the highlighted dropdown row —
+             * precisely the mechanism that lands on the rights line.
+             *
+             * And both of this file's guards were the same substring test, so
+             * both passed on the same wrong panel: the waitForFunction
+             * verification here, and the F-17 owns() re-check at the read. One
+             * operator defeated the guard and its backstop.
+             *
+             * The ticker is matched as a whole token, which is what keeps ABAR
+             * off ABARRE while still matching "ABAR - 633".
+             */
+            const token = new RegExp(`(^|[^A-Z0-9])${
+              String(args.symbol).replace(/[^A-Z0-9]/gi, '')}([^A-Z0-9]|$)`);
+            return token.test(label.textContent.toUpperCase());
           },
           {
             container: SEL.bodyContainer, depth: SEL.depthContainer,
@@ -1054,10 +1223,44 @@ async function scrapeDepth({ runId }) {
          * touch on both sides.
          */
         const levelsRaw = await readTarget.evaluate((cfg) => {
-          const scopes = [...document.querySelectorAll(cfg.depthContainer)];
-          if (!scopes.length) return null;
+          const all = [...document.querySelectorAll(cfg.depthContainer)];
+          if (!all.length) return null;
 
           const clean = (t) => (t || '').replace(/[\u202A\u202B\u202C]/g, '').replace(/\s+/g, ' ').trim();
+
+          /*
+           * F-17 · READ THE CONTAINER THAT WAS VERIFIED, not the deepest one.
+           *
+           * Verification takes the FIRST container whose symbol cell matches the
+           * symbol we searched for. The read then walked EVERY container and
+           * kept whichever produced the most levels — so with two quote panels
+           * open (a pinned one plus the searched one), verification could pass
+           * on panel A while panel B's deeper, stale ladder for a DIFFERENT
+           * symbol was stored under A's name. That is precisely the failure the
+           * waitForFunction verification exists to prevent, defeated by the
+           * read step.
+           *
+           * The container is now chosen the same way verification chooses it:
+           * the first one whose own symbol cell says it is this symbol. If none
+           * does, nothing is read — a ladder we cannot attribute is worth less
+           * than no ladder.
+           */
+          /*
+           * P2 · and the same WORD BOUNDARY here, for the same reason.
+           *
+           * This was `text.includes(cfg.want)`, so "ABARRE - 634" satisfied a
+           * search for ABAR and the rights line's ladder was stored as ABAR's
+           * book — every level, every price real, and both guards passing.
+           */
+          const token = new RegExp(`(^|[^A-Z0-9])${
+            String(cfg.want).replace(/[^A-Z0-9]/gi, '')}([^A-Z0-9]|$)`);
+          const owns = (box) => {
+            const cell = box.querySelector(cfg.symbolCell);
+            const text = cell ? clean(cell.textContent).toUpperCase() : '';
+            return !!text && token.test(text);
+          };
+          const scopes = all.filter(owns);
+          if (!scopes.length) return { levels: [], unattributed: all.length };
 
           let best = [];
           for (const scope of scopes) {
@@ -1078,6 +1281,27 @@ async function scrapeDepth({ runId }) {
             });
 
             if (!bids.length && !offers.length) continue;
+
+            /*
+             * F-17 · SORT EACH SIDE. The comment above has always said the two
+             * sides are "sorted on its own — bids high to low, offers low to
+             * high", and no sort existed: levels were DOM order. If the
+             * terminal ever renders the touch at the BOTTOM of a column — which
+             * it does for the bid side in some layouts — level 1 held the WORST
+             * bid and the WORST offer, and every consumer (the buyers-per-seller
+             * ratio, the bid-protection check) read the wrong end of the book
+             * while every price in it was real.
+             *
+             * Sorting by the parsed number, not the string: '9' > '10'
+             * lexically, and these are prices.
+             */
+            const px = (v) => {
+              const x = Number(String(v).replace(/[^0-9.-]/g, ''));
+              return Number.isFinite(x) ? x : null;
+            };
+            bids.sort((a, b) => (px(b.price) ?? -Infinity) - (px(a.price) ?? -Infinity));
+            offers.sort((a, b) => (px(a.price) ?? Infinity) - (px(b.price) ?? Infinity));
+
             const n = Math.max(bids.length, offers.length);
             const out = [];
             for (let i = 0; i < n; i += 1) {
@@ -1092,12 +1316,25 @@ async function scrapeDepth({ runId }) {
             if (out.length > best.length) best = out;
           }
           return best;
-        }, SEL);
+        }, { ...SEL, want: String(symbol).toUpperCase() });
 
         if (levelsRaw === null) {
           throw new Error(
             `no ladder matched AWSAT_SEL_DEPTH="${SEL.depthContainer}".`,
           );
+        }
+
+        /*
+         * F-17 · a container that exists but does not claim this symbol yields
+         * nothing, loudly. A ladder we cannot attribute is worth less than no
+         * ladder — it would be stored under a symbol it does not belong to.
+         */
+        if (levelsRaw && !Array.isArray(levelsRaw) && levelsRaw.unattributed !== undefined) {
+          log.warn('awsat: no depth container claimed this symbol — skipping it', {
+            symbol, containers: levelsRaw.unattributed,
+            note: 'verification passed earlier; the panel changed between the check and the read.',
+          });
+          continue;
         }
 
         const rows = levelsRaw;
@@ -1244,7 +1481,25 @@ async function scrapeOrders({ runId }) {
       if (r.order_stamp) {
         const [d, t] = String(r.order_stamp).trim().split(/\s+/);
         const iso = toDate(d);
-        if (iso && /^\d{1,2}:\d{2}(:\d{2})?$/.test(t || '')) orderTime = new Date(`${iso}T${t}`);
+        /*
+         * F-06 · THE BROKER'S CLOCK IS KUWAIT'S, AND IT IS PINNED.
+         *
+         * This was `new Date(\`${iso}T${t}\`)`. An ISO string with no offset is
+         * parsed as HOST LOCAL TIME, and order_time is timestamptz — so on a
+         * UTC container a cell reading "10-08-2026 13:03:30" was stored as
+         * 13:03:30Z, which is 16:03:30 Kuwait. Every order timestamp three
+         * hours late, silently, and reconciliation against minute quotes (which
+         * ARE Kuwait-correct, via clock.tradingDay) matching the wrong minute.
+         *
+         * Nothing pins TZ — there is no TZ= in .env.example or any Dockerfile —
+         * and clock.js is built on the explicit premise that the server may run
+         * anywhere. So the offset is written here rather than inherited.
+         *
+         * +03:00 is a constant, not a guess: Kuwait does not observe DST, which
+         * is the same fact clock.js relies on. If that ever changes this needs
+         * a zone lookup, not a different number.
+         */
+        orderTime = toKuwaitInstant(iso, t);
       }
 
       orders.push({
@@ -1279,5 +1534,5 @@ module.exports = {
   scrapeBoard, scrapeDepth, scrapeOrders, closeSession, SOURCE,
   sharedPageForDiagnostics,
   scrapeBoardFromSocket, compareBoards, BOARD_MODE,
-  parseSymbol, num, toDate, FIELD_MAP, SEL, MARKETS, WHEEL_DELTA,
+  parseSymbol, num, toDate, toKuwaitInstant, KUWAIT_OFFSET, FIELD_MAP, SEL, MARKETS, WHEEL_DELTA,
 };

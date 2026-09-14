@@ -1,4 +1,13 @@
 'use strict';
+/*
+ * F-12 · the three constants below are NOT in config/thresholds.js, on purpose.
+ *
+ * `analyse()` is retired (see the note at its definition) and this engine is
+ * kept only as reference for what symbol_day may later draw on. Promoting its
+ * numbers into the sanctioned threshold file would publish them as live
+ * settings and invite someone to tune a retired engine. They are plain literals
+ * with this note instead, and the moment any of it is wired up they move.
+ */
 /**
  * Daily stock analysis — computes per-symbol metrics for a trading day.
  *
@@ -25,9 +34,9 @@ const log = require('../logger');
 
 /** Defaults from the reference config; overridable per deployment. */
 const CFG = {
-  minSwingFils: Number(process.env.ANALYSIS_MIN_SWING_FILS || 2.0),
-  volSpikeMultiplier: Number(process.env.ANALYSIS_VOL_SPIKE_MULT || 2.0),
-  targetProfitFils: Number(process.env.ANALYSIS_TARGET_PROFIT_FILS || 2.0),
+  minSwingFils: 2.0 /* retired engine — see the note below */,
+  volSpikeMultiplier: 2.0 /* retired engine */,
+  targetProfitFils: 2.0 /* retired engine */,
   fibLevels: (process.env.ANALYSIS_FIB_LEVELS || '0.236,0.382,0.500,0.618,0.786')
     .split(',').map(Number),
 };

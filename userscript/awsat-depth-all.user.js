@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         awsat / DirectFN — Depth for ALL symbols
 // @namespace    local.trading.tools
-// @version      2.3.0
+// @version      2.4.1
 // @description  Level-1 depth for every symbol from the price socket each cycle (no switching, meets the 1-1.5 min ceiling), plus a round-robin full-ladder sweep of the open symbol. Posts to Server 1.
 // @match        *://*.awsatbroker.com/*
 // @match        *://awsatbroker.com/*
@@ -48,7 +48,7 @@
   // ── CONFIG ────────────────────────────────────────────────────────────────
   // The running build, shown on the panel: two scripts both reporting
   // 2.0.0 cost a session diagnosing a bug that was already fixed.
-  var VERSION = '2.3.0';
+  var VERSION = '2.4.1';
 
   var SERVER          = 'https://socket.99labs.space';
   var TOKEN           = 'trading';
@@ -94,7 +94,6 @@
    *
    * Edit this to the handful you care about most if the server is often down.
    */
-  var FALLBACK_SYMBOLS = ['NBK', 'KFH', 'ZAIN', 'GBK', 'ABK', 'BOUBYAN', 'KIB', 'BURG'];
   var symbolListReachable = false;
   var lastSearchSeen = null;
   /**
@@ -322,15 +321,44 @@
   }, 2000);
 
   // ── submission with idempotency + retry ───────────────────────────────────
+  /*
+   * 2.4.0 · H10 · EVERY POST HAS A DEADLINE.
+   *
+   * It had none. A request that never settles leaves the promise pending for
+   * ever: the sweep's own counter never advances, the retry queue never learns
+   * it should hold this batch, and the panel sits on its last message looking
+   * like a script that is simply between cycles. One hung POST could silence
+   * the feed for the rest of the session with nothing anywhere saying so.
+   *
+   * Six seconds. The sweep's cadence is about a minute and a full ladder costs
+   * ~0.9 s, so a POST still in flight after six is not slow, it is stuck.
+   */
+  var POST_TIMEOUT_MS = 6000;
+
   function submit(batch) {
-    return nativeFetch(SERVER + '/depth', {
-      method: 'POST', body: JSON.stringify(batch),
-    }).then(function (r) {
+    var ctl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+    var timer = setTimeout(function () {
+      if (ctl) ctl.abort();
+    }, POST_TIMEOUT_MS);
+
+    var opts = { method: 'POST', body: JSON.stringify(batch) };
+    if (ctl) opts.signal = ctl.signal;
+
+    return nativeFetch(SERVER + '/depth', opts).then(function (r) {
+      clearTimeout(timer);
       if (r.status >= 400 && r.status < 500 && r.status !== 401) {
         throw Object.assign(new Error('HTTP ' + r.status), { permanent: true });
       }
       if (!r.ok) throw new Error('HTTP ' + r.status);
       return r.json().catch(function () { return {}; });
+    }).catch(function (e) {
+      clearTimeout(timer);
+      // An abort is a TIMEOUT, and must be retryable — not permanent. Naming it
+      // matters: "AbortError" in the panel tells nobody anything.
+      if (e && e.name === 'AbortError') {
+        throw new Error('timed out after ' + POST_TIMEOUT_MS + 'ms');
+      }
+      throw e;
     });
   }
   function flush() {
@@ -705,19 +733,61 @@
                     + seen.visible.slice(0, 2).join(' | ')));
             return done(false);
           }
+          /*
+           * 2.4.1 · H-H — WHAT IS ON SCREEN BEFORE WE SELECT.
+           *
+           * The verification below asks two questions: does the HEADER name the
+           * symbol we asked for, and has the ladder stopped changing. Neither
+           * can tell the new symbol's book from the PREVIOUS one's.
+           *
+           * The ladder widget names no stock at all — it is bare Quantity/Bid
+           * and Offer/Quantity columns, which is why the symbol is read from
+           * the order ticket's header one widget up. But the header flips as
+           * soon as the terminal ACCEPTS the selection, and the ladder repaints
+           * afterwards. In the window between those two events the header says
+           * the new symbol while the ladder still holds the old one's prices —
+           * unchanged, and therefore "stable" — and the old book is stored
+           * under the new name. That is the precise failure this verification
+           * exists to prevent, passed by the verification itself.
+           *
+           * A label cannot close it, because there is no label on the thing
+           * being read. Content can: the book we accept must DIFFER from the
+           * one that was on screen before we asked for this symbol.
+           *
+           * Two symbols whose ladders are byte-identical are then skipped, and
+           * that is the right way round. The cost is one missed ladder in a
+           * round-robin that returns in seconds; the cost of the alternative is
+           * one symbol's depth stored under another symbol's name, silently and
+           * unrecoverably. The skip says which case it was.
+           */
+          var before = JSON.stringify(readLadder());
+          var hadBookBefore = readLadder().length > 0;
+
           selectByMouse(el);
 
-          // The book must belong to this symbol AND be stable — the widget
-          // clears its rows before refilling, and a cleared ladder is neither
-          // the old book nor the new one.
-          var lastSnapshot = null, stableFor = 0;
+          // The book must belong to this symbol, be stable — the widget clears
+          // its rows before refilling, and a cleared ladder is neither the old
+          // book nor the new one — AND not be the book already on screen.
+          var lastSnapshot = null, stableFor = 0, sawOnlyStale = false;
           waitFor(function () {
             if (!bookReady(want)) { stableFor = 0; return false; }
             var snap = JSON.stringify(readLadder());
+            // Nothing was on screen before, so there is no stale book this
+            // could be mistaken for.
+            if (hadBookBefore && snap === before) {
+              sawOnlyStale = true; stableFor = 0; return false;
+            }
+            sawOnlyStale = false;
             stableFor = (snap === lastSnapshot) ? stableFor + 1 : 0;
             lastSnapshot = snap;
             return stableFor >= 2;
           }, BOOK_TIMEOUT).then(function (ok) {
+            if (!ok && sawOnlyStale) {
+              stats.lastSkipReason = want + ': the header named it but the ladder '
+                + 'never changed from the previous symbol’s book — not captured '
+                + 'rather than stored under the wrong name';
+              return done(false);
+            }
             if (ok) {
               // Re-read after confirming, so what is posted is what was verified.
               var levels = readLadder();
@@ -737,12 +807,30 @@
                 return done(false);
               }
               levels = real;
-              post({
+              /*
+               * 2.4.0 · H9 · the sweep waits for the SERVER's answer.
+               *
+               * This used to fire and forget, and report the symbol captured
+               * the moment the ladder was read. A sweep that read all eight and
+               * posted none reported "swept 8/8" with a heartbeat of 8 — panel,
+               * roster and /health all agreeing the feed was healthy while the
+               * database received nothing. done(read, accepted) reports both,
+               * and the heartbeat carries `accepted`, because that is the one
+               * that means the data exists.
+               *
+               * A failed POST is still queued for retry by post(), so waiting
+               * here costs nothing but the truth.
+               */
+              return post({
                 batchId: uuid(), token: TOKEN, capturedAt: new Date().toISOString(),
                 symbol: target.symbol, code: target.code,
                 levels: levels, source: 'awsat_client',
-              }).catch(function () {});
-              return done(true);
+              }).then(function () {
+                return done(true, true);
+              }).catch(function (e) {
+                stats.lastSkipReason = want + ': read but not accepted — ' + e.message;
+                return done(true, false);
+              });
             }
             if (++attempt < 3) return tryOnce();
             stats.lastSkipReason = want + ': book never loaded (showing '
@@ -792,10 +880,29 @@
          * wake-ups fall off the end.
          */
         if (list.length > LADDER_MAX_SAFE) {
+          /*
+           * 2.4.0 · H11 · THE GAP IS THE SCRIPT'S OWN PROBLEM, NOT A MESSAGE.
+           *
+           * Truncating was right and reporting it in stats.msg was not enough:
+           * msg is overwritten by the next sweep's own line a minute later, so
+           * the fact that slots 7 and 8 are never swept disappeared within a
+           * cycle. It is now the panel's `problem` — the field that survives to
+           * the server's roster and to /health — so a slot the trader thinks is
+           * being watched, and is not, is visible from outside the browser.
+           */
+          stats.slotGap = list.length - LADDER_MAX_SAFE;
+          stats.problem = list.length + ' slots but only ' + LADDER_MAX_SAFE
+            + ' fit the sweep — slot' + (stats.slotGap > 1 ? 's ' : ' ')
+            + list.slice(LADDER_MAX_SAFE).map(function (x) {
+              return (typeof x === 'string' ? x : x.symbol);
+            }).join(', ') + ' are NOT being captured';
           stats.msg = list.length + ' slots, sweeping the first '
             + LADDER_MAX_SAFE + ' — a switch measured 4.34s average, so more '
             + 'than that does not fit a 25s sweep';
           list = list.slice(0, LADDER_MAX_SAFE);
+        } else {
+          stats.slotGap = 0;
+          stats.problem = null;
         }
         LADDER_SYMBOLS = list.map(function (x) {
           return typeof x === 'string' ? { symbol: x, code: null } : x;
@@ -804,13 +911,22 @@
           + (j.wakeup || 0) + ' wake-up';
       })
       .catch(function (e) {
-        // Keep whatever we had. Falling back to a hardcoded list would sweep
-        // symbols nobody chose and quietly fill the table with them.
+        /*
+         * S13 · NO HARDCODED FALLBACK LIST.
+         *
+         * The comment beside it already said why one is wrong — "falling back
+         * to a hardcoded list would sweep symbols nobody chose and quietly
+         * fill the table with them" — and the code did it anyway whenever the
+         * script started while /depth-symbols was unreachable. Eight bank
+         * tickers would then be swept all session, and awsat_stock_depth would
+         * fill with depth for symbols the trader never picked, indistinguishable
+         * from depth they did.
+         *
+         * Sweeping nothing is the honest state: the panel says the list could
+         * not be fetched, and the gap is visible instead of being papered over.
+         */
         if (!LADDER_SYMBOLS.length) {
-          LADDER_SYMBOLS = FALLBACK_SYMBOLS.map(function (x) {
-            return { symbol: x, code: null };
-          });
-          stats.listSource = 'FALLBACK — /depth-symbols unreachable (' + e.message + ')';
+          stats.listSource = 'NO LIST — /depth-symbols unreachable (' + e.message + '); sweeping nothing';
         } else {
           stats.listSource = 'kept previous list — ' + e.message;
         }
@@ -860,7 +976,8 @@
       }
 
       var i = 0;
-      var ok = 0;
+      var ok = 0;          // 2.4.0 · H9 · the SERVER accepted it
+      var read = 0;        //           the ladder was read locally
       var skipped = 0;
 
       function next() {
@@ -870,16 +987,44 @@
         if (i >= targets.length || Date.now() - started > LADDER_BUDGET_MS) {
           sweeping = false;
           stats.sweeps = (stats.sweeps || 0) + 1;
+          /*
+           * 2.4.0 · H9 · `ok` counts what the SERVER ACCEPTED, not what the
+           * browser read.
+           *
+           * It used to count a successful local read. A sweep that read all
+           * eight ladders and failed to POST any of them reported "swept 8/8"
+           * and a heartbeat of 8 — the panel, the roster and /health all agreed
+           * the feed was healthy while the database received nothing. Read and
+           * accepted are different facts and are now both shown; the heartbeat
+           * carries the accepted one, because that is the one that means data
+           * exists.
+           */
           stats.msg = 'swept ' + ok + '/' + targets.length
+            + (read !== ok ? ' (read ' + read + ', ' + (read - ok) + ' not accepted)' : '')
             + (skipped ? ' · ' + skipped + ' skipped' : '')
             + ' in ' + Math.round((Date.now() - started) / 100) / 10 + 's';
-          heartbeat(ok, ok === 0 ? ('0 captured of ' + targets.length + ' — ' + stats.msg) : null);
+          heartbeat(ok, ok === 0
+            ? ('0 accepted of ' + targets.length + ' — ' + stats.msg)
+            : (stats.problem || null));
+
+          /*
+           * 2.4.0 · H10 · flush the retry queue at the END of every sweep.
+           *
+           * Batches landed in the queue and nothing drained them except the
+           * next failure, so a single network blip parked a ladder until the
+           * one after it also failed. The sweep has just finished and the
+           * browser is idle — this is the moment to try again.
+           */
+          if (retryQueue.length) {
+            flush().catch(function () {});
+          }
           refresh();
           return;
         }
         var target = targets[i++];
-        captureLadder(target, function (good) {
-          if (good) ok += 1; else skipped += 1;
+        captureLadder(target, function (good, accepted) {
+          if (good) read += 1; else skipped += 1;
+          if (accepted) ok += 1;
           next();
         });
       }

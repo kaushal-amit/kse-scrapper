@@ -32,6 +32,10 @@ const clock = require('../market/clock');
 const marketMetrics = require('../jobs/marketDayMetrics');
 const symbolCheck = require('../reconcileSymbols');
 const validate = require('../validate');
+const slotGuards = require('./slotGuards');
+const slotConfig = require('../config/slots');
+const security = require('./ingestSecurity');
+const boardFreshness = require('./boardFreshness');
 const parse = require('../scrapers/parse');
 const log = require('../logger');
 
@@ -94,7 +98,7 @@ async function replayIfSeen(batchId) {
   };
 }
 
-async function recordSubmission(batchId, kind, source, capturedAt, counts) {
+async function recordSubmission(batchId, kind, source, capturedAt, counts, partial = false) {
   // A1 · The heartbeat is a BYPRODUCT of every accepted submission, not a
   // separate call only orders made. Before this, depth/quotes/market-summary
   // posted rows into client_submissions but never touched client_heartbeat, so
@@ -121,10 +125,13 @@ async function recordSubmission(batchId, kind, source, capturedAt, counts) {
   if (!batchId) return;
   await query(
     `INSERT INTO client_submissions
-       (batch_id, ingest_source, kind, captured_at, rows_offered, rows_inserted, rows_rejected)
-     VALUES ($1, $2, $3, $4, $5, $6, $7)
+       (batch_id, ingest_source, kind, captured_at, rows_offered, rows_inserted, rows_rejected, partial)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
      ON CONFLICT (batch_id) DO NOTHING`,
-    [batchId, source, kind, capturedAt, counts.offered, counts.inserted, counts.rejected],
+    // S6 · `partial` is a fact only the CLIENT knows. The server sees fewer rows
+    // and cannot tell "the grid is shorter" from "I did not reach the bottom" —
+    // and absence from a partial capture is not evidence an order is gone.
+    [batchId, source, kind, capturedAt, counts.offered, counts.inserted, counts.rejected, !!partial],
   ).catch((err) => log.error('could not record client submission', { batchId, err: err.message }));
 }
 
@@ -136,15 +143,41 @@ async function recordSubmission(batchId, kind, source, capturedAt, counts) {
  * remotely.
  */
 async function recordHeartbeat({ script, source = 'awsat_client', version = null, rowsSeen = null, problem = null }) {
-  if (!script) return;
-  await query(
-    `INSERT INTO client_heartbeat (script, source, version, rows_seen, problem, last_seen_at)
-       VALUES ($1, $2, $3, $4, $5, now())
-     ON CONFLICT (script, source) DO UPDATE SET
-       version = EXCLUDED.version, rows_seen = EXCLUDED.rows_seen,
-       problem = EXCLUDED.problem, last_seen_at = now()`,
-    [script, source, version, rowsSeen, problem],
-  ).catch((err) => log.error('could not record heartbeat', { script, err: err.message }));
+  if (!script) return { ok: false, error: 'no script name' };
+  /*
+   * F-18 · rowsSeen is COERCED, and the outcome is REPORTED.
+   *
+   * Two things were wrong. The value was `Number.isFinite(Number(b.rowsSeen)) ?
+   * Number(...) : null` at the route, so 12.5 or 2^31 reached an `integer`
+   * column and Postgres rejected the row. And this function swallowed that
+   * rejection while the route returned {ok:true} unconditionally.
+   *
+   * The result: last_seen_at never advanced, /health reported the panel as
+   * `silent` while it was alive and posting every cycle — the precise
+   * "stopped and running-but-empty are indistinguishable" failure migration 038
+   * was written to end, inverted — and the panel was told its check-in had
+   * succeeded, so it had no way to know.
+   */
+  const rows = (rowsSeen === null || rowsSeen === undefined) ? null : Math.trunc(Number(rowsSeen));
+  const safeRows = (Number.isFinite(rows) && Math.abs(rows) <= 2_147_483_647) ? rows : null;
+  if (rows !== null && safeRows === null) {
+    log.warn('heartbeat: rowsSeen is not a storable integer — recording null', { script, rowsSeen });
+  }
+
+  try {
+    await query(
+      `INSERT INTO client_heartbeat (script, source, version, rows_seen, problem, last_seen_at)
+         VALUES ($1, $2, $3, $4, $5, now())
+       ON CONFLICT (script, source) DO UPDATE SET
+         version = EXCLUDED.version, rows_seen = EXCLUDED.rows_seen,
+         problem = EXCLUDED.problem, last_seen_at = now()`,
+      [script, source, version, safeRows, problem],
+    );
+    return { ok: true };
+  } catch (err) {
+    log.error('could not record heartbeat', { script, err: err.message });
+    return { ok: false, error: err.message };
+  }
 }
 
 // The scripts that SHOULD be checking in. "Absent" (never ran) looks identical
@@ -199,10 +232,30 @@ function toQuoteRow(r, meta) {
   const symbol = parse.toSymbol(r.symbol || r.code);
   if (!symbol) return null;
 
+  /*
+   * F-05 · A NEGATIVE VALUE IN AN UNSIGNED FIELD IS REFUSED, NOT FLIPPED.
+   *
+   * This returned Math.abs(x), which made validate.js's negative-price check
+   * DEAD CODE on the entire ingest path:
+   *
+   *     // A negative price is always a misread; the row is not worth keeping.
+   *     if (isImpossible(q[f], MAX_PRICE)) return { ok: false, ... }
+   *
+   * isImpossible tests n < 0, and the sign was already gone. Reproduced with
+   * the real parser: `"(12.5)"` (accounting negative) and `"−5"` (U+2212) —
+   * both documented features of parse.toNumber — arrived as last_price 12.5 and
+   * bid 5, and validateQuote returned ok. The row was then stored with
+   * ingest_source awsat_client and source_precedence 2, the HIGHEST precedence,
+   * so it outranked the server's own capture of the same minute.
+   *
+   * Returning null lets the validator do its job: a null price is a gap the
+   * gates can see, and an impossible one is refused with a reason.
+   */
   const n = (v, signed = false) => {
     const x = parse.toNumber(v);
     if (x === null) return null;
-    return (!signed && x < 0) ? Math.abs(x) : x;
+    if (!signed && x < 0) return null;
+    return x;
   };
 
   return {
@@ -251,7 +304,13 @@ function createRouter() {
    * GET, both POSTs, and the backend's stale check all follow the published
    * number — never a literal.
    */
-  const SLOT_COUNT = Math.max(1, Number(process.env.SLOT_COUNT || 5));
+  /*
+   * P2 · and it is now read from src/config/slots.js rather than computed here,
+   * because src/wakeup.js had its own `[4, 5, 6, 7, 8]` literal and the two
+   * disagreed. The wake-up scan seated symbols in slots this endpoint refuses
+   * to address, the GET below served them, and the client dropped them.
+   */
+  const SLOT_COUNT = slotConfig.slotCount();
 
   /**
    * CORS. Without it nothing from the terminal ever arrives.
@@ -265,10 +324,36 @@ function createRouter() {
    * INGEST_ORIGIN restricts it; '*' is the default because these endpoints are
    * already token-authenticated and write-only, and an origin allowlist that
    * silently blocks the one browser you are testing from is its own trap.
+   *
+   * H-C · THE HEADER IS ECHOED PER REQUEST, NEVER SET FROM THE ENV VERBATIM.
+   * Access-Control-Allow-Origin accepts exactly ONE origin, or '*'. This used
+   * to be `res.set('…-Allow-Origin', process.env.INGEST_ORIGIN || '*')`, which
+   * is correct for a single origin and catastrophic for the shape the
+   * allowlist exists to serve: set
+   *
+   *   INGEST_ORIGIN=https://www.awsatbroker.com,https://awsatbroker.com
+   *
+   * — the two origins the terminal actually serves the userscripts from — and
+   * every browser rejects the comma-list as an illegal header value. fetch()
+   * fails with a network error, the response is discarded, and NOTHING is
+   * written to the server log, because the answer never reaches the page. The
+   * capture silently stops for exactly the configuration the feature was added
+   * to support.
+   *
+   * resolveOrigin (src/api/ingestSecurity.js) returns the ONE value this
+   * request may be answered with, or null when the caller's origin is not on
+   * the list. A refused origin gets NO Allow-Origin header at all — the
+   * browser then blocks the response on its own, which is the loud form: the
+   * page sees a CORS failure rather than a silent 200 it is not allowed to
+   * read.
    */
-  const ORIGIN = process.env.INGEST_ORIGIN || '*';
+  const ALLOW = security.parseOrigins(process.env.INGEST_ORIGIN);
   router.use((req, res, next) => {
-    res.set('Access-Control-Allow-Origin', ORIGIN);
+    const allowed = security.resolveOrigin(req.get('Origin'), ALLOW);
+    if (allowed !== null) res.set('Access-Control-Allow-Origin', allowed);
+    // Vary regardless: the answer depends on the request's Origin even when
+    // the answer is "no header", and a cache that missed that would serve one
+    // origin's permission to another.
     res.set('Vary', 'Origin');
     res.set('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
     res.set('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-ingest-token');
@@ -430,6 +515,34 @@ function createRouter() {
               WHERE i2.symbol = w.symbol AND i2.is_tradeable = false)
          ORDER BY w.slot_no`, [day]);
 
+      /*
+       * P2 · A ROW ABOVE THE PUBLISHED COUNT IS NOT SERVED, AND IS NAMED.
+       *
+       * This query had no slot_no bound at all — it served whatever was in the
+       * table. Migration 024 permits 1-8, both POSTs validate 1..SLOT_COUNT,
+       * and the wake-up scan used to write 6, 7 and 8. Six entries went to a
+       * client that sweeps five; the client truncated in slot order and the
+       * newest wake-up — the symbol that had just fired — was the one dropped,
+       * its ladder never captured, with every server-side record saying it was
+       * promoted.
+       *
+       * Bounding the query alone would hide the row instead. It is separated
+       * out and REPORTED, because a row nobody can address through either POST
+       * needs an operator, not a filter.
+       */
+      const beyond = rows.filter((r) => Number(r.slot_no) > SLOT_COUNT);
+      const served = rows.filter((r) => Number(r.slot_no) <= SLOT_COUNT);
+      if (beyond.length) {
+        log.error('depth_watchlist holds slot(s) ABOVE SLOT_COUNT — not served, '
+          + 'and not addressable through /slots/:n or /depth-symbols', {
+          slotCount: SLOT_COUNT,
+          beyond: beyond.map((r) => `${r.slot_no}:${r.symbol}`),
+          fix: 'raise SLOT_COUNT to cover them, or release them in the database',
+        });
+      }
+      rows.length = 0;
+      rows.push(...served);
+
       const preDay = rows.filter((r) => r.slot_type === 'PRE_DAY').length;
 
       if (!rows.length) {
@@ -471,6 +584,17 @@ function createRouter() {
         pre_day: preDay,
         wakeup: rows.length - preDay,
         slotCount: SLOT_COUNT, // G-5 · the address space POST /slots/:n validates against
+        /*
+         * Present only when something is wrong. A row above SLOT_COUNT is not
+         * swept and cannot be released through either POST, so the client's
+         * panel — the one surface an operator is actually looking at during a
+         * session — says so rather than silently listing one symbol fewer.
+         */
+        ...(beyond.length ? {
+          beyondSlotCount: beyond.map((r) => ({ slot: r.slot_no, symbol: r.symbol })),
+          warning: `${beyond.length} slot(s) above SLOT_COUNT=${SLOT_COUNT} are held `
+            + 'but not swept, and cannot be released through the API',
+        } : {}),
       });
     } catch (err) {
       log.error('depth-symbols failed', { err: err.message });
@@ -521,24 +645,13 @@ function createRouter() {
     if (!symbol) return res.status(400).json({ ok: false, error: 'symbol is required' });
 
     try {
-      const { rows: known } = await query(
-        'SELECT is_tradeable, broker_status FROM instruments WHERE symbol = $1', [symbol]);
-      // SPR-03 · a symbol not in the instruments list is refused, not assigned.
-      // The duplicate check already guarded one bad input; an unknown symbol (a
-      // typo like ZZZZ) fell straight through and evicted the live slot silently.
-      if (!known.length) {
-        return res.status(400).json({
-          ok: false,
-          error: `${symbol} is not a listed symbol`,
-          detail: 'not in the instruments list — check the spelling before displacing a live slot.',
-        });
-      }
-      if (known.length && known[0].is_tradeable === false) {
-        return res.status(400).json({
-          ok: false,
-          error: `${symbol} is not tradeable`,
-          detail: `broker_status ${known[0].broker_status || 'unknown'} — a slot on it `
-            + 'would sweep a book nobody can act on.',
+      // SPR-03 · a symbol not in the instruments list is refused, not assigned;
+      // and a non-tradeable one would sweep a book nobody can act on. Both live
+      // in slotGuards now, so POST /depth-symbols enforces the same rules.
+      const assignable = await slotGuards.symbolIsAssignable(symbol);
+      if (!assignable.ok) {
+        return res.status(assignable.status).json({
+          ok: false, error: assignable.error, detail: assignable.detail,
         });
       }
 
@@ -568,37 +681,20 @@ function createRouter() {
        * watching something you are not in.
        */
       if (here) {
-        const { rows: busy } = await query(`
-          SELECT
-            (SELECT count(*)::int FROM position
-              WHERE symbol = $1 AND is_open) AS open_positions,
-            (SELECT count(*)::int FROM awsat_order_list
-              WHERE symbol = $1 AND trading_date = $2
-                AND order_status IN ('Queued', 'Pending', 'Partially Filled')) AS queued`,
-        [here.symbol, day]);
-
-        // B3 · the BACKEND'S record is authoritative for what is held. Read
-        // spread.order_leg (a filled/carried/POSTED leg) and spread.claim —
-        // reads of spread.* are allowed. Guarded, so a scraper-only DB (no
-        // backend schema) simply falls back to the public.* check above.
-        let backendHeld = 0;
-        if (await query(`SELECT to_regclass('spread.order_leg') AS t`).then((r) => !!r.rows[0].t).catch(() => false)) {
-          const { rows: bk } = await query(`
-            SELECT (SELECT count(*)::int FROM spread.order_leg
-                      WHERE symbol = $1 AND status IN ('FILLED','CARRIED','POSTED')) AS legs,
-                   (SELECT count(*)::int FROM spread.claim WHERE symbol = $1) AS claims`,
-          [here.symbol]).catch(() => ({ rows: [{ legs: 0, claims: 0 }] }));
-          backendHeld = Number(bk[0].legs || 0) + Number(bk[0].claims || 0);
-        }
-
-        if (busy[0].open_positions > 0 || busy[0].queued > 0 || backendHeld > 0) {
-          return res.status(409).json({
+        /*
+         * A SLOT HOLDING A POSITION OR A LIVE ORDER CANNOT BE DISPLACED.
+         *
+         * Losing the book on a symbol you are IN is the one case where a swap
+         * costs more than it gains — you would be blind on the position while
+         * watching something you are not in. In slotGuards so the bulk
+         * endpoint, which releases the whole day at once, enforces it too.
+         */
+        const displaceable = await slotGuards.slotIsDisplaceable(here.symbol, day);
+        if (!displaceable.ok) {
+          return res.status(displaceable.status).json({
             ok: false,
             error: `slot ${slot} holds ${here.symbol}, which cannot be displaced`,
-            detail: busy[0].open_positions > 0 || backendHeld > 0
-              ? `${here.symbol} has an open position or order the backend is tracking — `
-                + 'losing its book would leave you blind on a symbol you are in.'
-              : `${here.symbol} has ${busy[0].queued} queued order(s).`,
+            detail: displaceable.detail,
             holding: here.symbol,
           });
         }
@@ -670,6 +766,22 @@ function createRouter() {
       if (seen.has(sym)) return res.status(400).json({ ok: false, error: `${sym} appears twice — one symbol, one slot` });
       seen.add(sym);
     }
+    /*
+     * THE SAME GUARDS POST /slots/:n ENFORCES.
+     *
+     * This endpoint writes the same table to the same effect and used to
+     * enforce none of them — so a bulk call could release the slot the trader
+     * had a position in, and seat a symbol that is in no instruments row. The
+     * narrow endpoint refused with 409 what this one accepted with 200.
+     */
+    const normalised = slots.map((s) => ({ slot: Number(s.slot), symbol: String(s.symbol).trim().toUpperCase() }));
+    const guard = await slotGuards.checkBulkAssignment(normalised, day);
+    if (!guard.ok) {
+      return res.status(guard.status || 400).json({
+        ok: false, error: guard.error, detail: guard.detail, holding: guard.holding,
+      });
+    }
+
     const { pool } = require('../db/pool');
     const client = await pool.connect();
     try {
@@ -697,10 +809,22 @@ function createRouter() {
     } finally {
       client.release();
     }
-    const { rows } = await query(
-      `SELECT trading_date, slot_no, symbol, slot_type FROM depth_watchlist
-        WHERE trading_date = $1 AND released_at IS NULL ORDER BY slot_no`, [day]);
-    return res.json({ ok: true, date: day, slots: rows });
+    /*
+     * The read-back used to sit OUTSIDE the try. Express 4 does not catch an
+     * async handler's rejection, so if this query failed after the COMMIT the
+     * request was never answered at all — the write had landed and the caller
+     * could not tell, so it retried and re-released the whole list. A failed
+     * read-back must never un-say a successful write.
+     */
+    try {
+      const { rows } = await query(
+        `SELECT trading_date, slot_no, symbol, slot_type FROM depth_watchlist
+          WHERE trading_date = $1 AND released_at IS NULL ORDER BY slot_no`, [day]);
+      return res.json({ ok: true, date: day, slots: rows });
+    } catch (err) {
+      log.error('bulk depth-symbols: read-back failed after COMMIT', { err: err.message });
+      return res.json({ ok: true, date: day, slots: null, readBackError: err.message });
+    }
   });
 
   /** Liveness for the userscript's panel. */
@@ -773,7 +897,19 @@ function createRouter() {
     const summary = body.summary || {};
 
     const when = checkCapturedAt(body.capturedAt);
-    if (!when.ok) return res.status(400).json({ ok: false, error: when.error });
+    /*
+     * P2 · `when.reason`, not `when.error`.
+     *
+     * checkCapturedAt returns { ok, reason }. There is no `error` field, so this
+     * answered `400 {"ok": false}` with no reason at all — while the other three
+     * callers of the same function all read `when.reason` correctly.
+     *
+     * The market-summary userscript surfaces the server's reason on its panel
+     * and had nothing to show: a bare 400 on one endpoint while the others name
+     * the cause. The "make the failure loud" principle failing on the one branch
+     * that exists to be loud.
+     */
+    if (!when.ok) return res.status(400).json({ ok: false, error: when.reason });
 
     const num = (v) => {
       if (v === null || v === undefined || v === '') return null;
@@ -996,22 +1132,70 @@ function createRouter() {
     const body = req.body || {};
     const items = Array.isArray(body.items) ? body.items : [{ source: 'unknown', d: body }];
 
+    /*
+     * S12 · BOUNDED. Three ways, because this writes to disk on the request
+     * thread from a client-supplied array:
+     *
+     *   · at most DEBUG_MAX_ITEMS per request — the array had no length cap, so
+     *     one payload could hold hundreds of files' worth of writes and block
+     *     the event loop through all of them while the live capture waited;
+     *   · at most DEBUG_MAX_BYTES per file, down from 2 MB;
+     *   · at most DEBUG_KEEP files in tmp/ — the oldest are removed after each
+     *     write, so a client stuck in a loop cannot fill the disk. It used to
+     *     keep every dump for ever; the four that ended up committed to git
+     *     came from exactly this pile.
+     *
+     * The excess is REPORTED, not silently dropped: a debug endpoint that
+     * quietly discards half of what you sent it is worse than no endpoint,
+     * because you will read the half you got as the whole.
+     */
+    const MAX_ITEMS = Number(process.env.DEBUG_MAX_ITEMS || 5);
+    const MAX_BYTES = Number(process.env.DEBUG_MAX_BYTES || 512 * 1024);
+    const KEEP = Number(process.env.DEBUG_KEEP || 40);
+    const take = items.slice(0, Number.isFinite(MAX_ITEMS) && MAX_ITEMS > 0 ? MAX_ITEMS : 5);
+    const dropped = items.length - take.length;
+
     try {
       const dir = path.resolve(__dirname, '..', '..', 'tmp');
       fs.mkdirSync(dir, { recursive: true });
       const written = [];
-      for (const item of items) {
+      let truncated = 0;
+      for (const item of take) {
         const tag = String(item.source || 'debug').replace(/[^\w.-]/g, '_').slice(0, 60);
-        const file = path.join(dir, `client-${tag}-${Date.now()}.txt`);
+        const file = path.join(dir, `client-${tag}-${Date.now()}-${written.length}.txt`);
         const payload = typeof item.d === 'string' ? item.d : JSON.stringify(item.d, null, 2);
-        fs.writeFileSync(file, String(payload).slice(0, 2_000_000), 'utf8');
+        const text = String(payload);
+        const cap = Number.isFinite(MAX_BYTES) && MAX_BYTES > 0 ? MAX_BYTES : 512 * 1024;
+        if (text.length > cap) truncated += 1;
+        fs.writeFileSync(file, text.slice(0, cap), 'utf8');
         written.push(file);
       }
-      log.warn('client posted a debug dump', { count: written.length, files: written });
-      return res.json({ ok: true, written: written.length, files: written });
+
+      // Sweep the pile. Names carry a timestamp, so lexical order is age order.
+      let removed = 0;
+      try {
+        const keep = Number.isFinite(KEEP) && KEEP > 0 ? KEEP : 40;
+        const all = fs.readdirSync(dir).filter((f) => f.startsWith('client-')).sort();
+        for (const f of all.slice(0, Math.max(0, all.length - keep))) {
+          fs.unlinkSync(path.join(dir, f));
+          removed += 1;
+        }
+      } catch (sweepErr) {
+        log.warn('could not sweep old debug dumps', { err: sweepErr.message });
+      }
+
+      log.warn('client posted a debug dump', {
+        offered: items.length, written: written.length, dropped, truncated, removed,
+      });
+      // Server paths are not handed back — the client cannot use them and they
+      // describe the deployment. The count and the caps are what it needs.
+      return res.json({
+        ok: true, written: written.length, dropped, truncated,
+        limits: { maxItems: MAX_ITEMS, maxBytes: MAX_BYTES, keep: KEEP },
+      });
     } catch (err) {
       log.error('could not store the debug dump', { err: err.message });
-      return res.status(500).json({ ok: false, error: err.message });
+      return res.status(500).json({ ok: false, error: 'could not store the debug dump' });
     }
   });
 
@@ -1025,13 +1209,26 @@ function createRouter() {
   router.post('/heartbeat', async (req, res) => {
     const b = req.body || {};
     if (!b.script) return res.status(400).json({ ok: false, error: 'script is required' });
-    await recordHeartbeat({
+    const result = await recordHeartbeat({
       script: String(b.script).slice(0, 40),
       source: b.source === 'awsat_server' ? 'awsat_server' : 'awsat_client',
       version: b.version != null ? String(b.version).slice(0, 20) : null,
       rowsSeen: Number.isFinite(Number(b.rowsSeen)) ? Number(b.rowsSeen) : null,
       problem: b.problem != null ? String(b.problem).slice(0, 300) : null,
     });
+    /*
+     * F-18 · a failed write is not {ok:true}.
+     *
+     * It used to be. The panel was told its check-in succeeded while
+     * last_seen_at had not moved, so /health reported it `silent` and the panel
+     * had no way to know — the exact failure migration 038 exists to prevent,
+     * with the sign flipped. 200 with ok:false rather than a 5xx: the check-in
+     * is advisory and the client must not treat it as a reason to retry the
+     * whole cycle, but it must be able to see that it did not land.
+     */
+    if (!result.ok) {
+      return res.json({ ok: false, error: 'the check-in was not recorded', detail: result.error });
+    }
     return res.json({ ok: true });
   });
 
@@ -1113,16 +1310,42 @@ function createRouter() {
         await markBrokerStatus(unmatched, 'UNMATCHED');
       }
 
-      // Everything that DID store is captured. Recorded so a symbol leaving the
-      // scrape is a state change with a date, not an absence nobody can date.
-      const captured = [...new Set(mapped.map((r) => r.symbol).filter(Boolean))];
+      /*
+       * Everything that DID store is captured. Recorded so a symbol leaving the
+       * scrape is a state change with a date, not an absence nobody can date.
+       *
+       * P2 · AND IT NOW MEANS WHAT THE COMMENT SAYS. This read `mapped` — the
+       * pre-validation list, everything the client OFFERED. `checked.rows` is
+       * what survived validateAll and is what insertQuotes actually stored.
+       *
+       * A symbol whose every row was REFUSED — a price above MAX_PRICE after a
+       * column shift, say — was still stamped CAPTURED with today's date. And
+       * broker_status_on exists precisely to be the date the status CHANGED, so
+       * the row asserted the symbol was being captured on a day none of its
+       * quotes stored. The UNMATCHED detection directly above is the mechanism
+       * that makes a dropped symbol visible; this defeated it one line later.
+       */
+      const stored = Array.isArray(checked.rows) ? checked.rows : [];
+      const captured = [...new Set(stored.map((r) => r.symbol).filter(Boolean))];
       if (captured.length) await markBrokerStatus(captured, 'CAPTURED');
+
+      /*
+       * H11 · is the board still MOVING? The heartbeat proves the feed is
+       * posting; it cannot prove it is posting anything new. A terminal whose
+       * websocket has died keeps rendering its last board, and every capture
+       * then looks healthy while every price is frozen. Never blocks the
+       * ingest — a freshness check that can fail the capture it observes has
+       * the priority backwards.
+       */
+      const freshness = await boardFreshness.recordAndCheck({
+        rows: checked.rows, capturedAt: when.capturedAt, tradingDate: meta.tradingDate, source,
+      });
 
       await recordSubmission(batchId, 'quotes', source, when.capturedAt, counts);
       // The quotes handler derives a per-row trading_date from each record's
       // capture time; the RUN belongs to the session it arrived in.
       await logRun('ingest.quotes', clock.tradingDay(), counts, started);
-      log.info('ingest: quotes accepted', { source, batchId, ...counts });
+      log.info('ingest: quotes accepted', { source, batchId, ...counts, boardFrozen: freshness.frozen });
 
       // Every cycle, per the consistency requirement. Reported, never blocking:
       // a short capture is still worth storing, and refusing it would turn a
@@ -1138,6 +1361,11 @@ function createRouter() {
         ok: true,
         duplicate: false,
         ...counts,
+        // H11 · the panel shows this. A capture the server accepted but that did
+        // not MOVE the board is the failure the heartbeat cannot see, so it has
+        // to reach the one screen a human is actually looking at.
+        boardFrozen: freshness.frozen,
+        identicalCaptures: freshness.identical,
         coverage: coverage && coverage.checked ? {
           expected: coverage.expected,
           matched: coverage.matched,
@@ -1289,6 +1517,19 @@ function createRouter() {
       });
     }
 
+    /*
+     * The batch cap /quotes and /depth have always had, and this endpoint did
+     * not. The trader's own order list is a few dozen rows; anything past the
+     * cap is a client bug or a retry loop, and letting it through means one
+     * request holding a pool connection while the live 15 s depth and quote
+     * cycles queue behind it.
+     */
+    if (ordersIn.length > MAX_BATCH_ROWS) {
+      return res.status(413).json({
+        ok: false, error: `batch too large: ${ordersIn.length} orders (max ${MAX_BATCH_ROWS})`,
+      });
+    }
+
     const when = checkCapturedAt(body.capturedAt);
     if (!when.ok) return res.status(400).json({ ok: false, error: when.reason });
 
@@ -1350,6 +1591,15 @@ function createRouter() {
           raw: o.raw || o,
           run_id: null,
           created_at: when.capturedAt,
+          /*
+           * 039 · the OBSERVATION's own instant, and part of its identity
+           * (order_id, observed_at, ingest_source). Taken from the client's
+           * capturedAt, not the server's clock, so a replayed batch lands on
+           * the same key and is a no-op rather than a second sighting of the
+           * same moment.
+           */
+          observed_at: when.capturedAt,
+          last_seen_at: when.capturedAt,
         });
       }
 
@@ -1361,7 +1611,7 @@ function createRouter() {
         rejected: malformed + checked.rejected + result.rejected,
       };
 
-      await recordSubmission(batchId, 'orders', 'awsat_client', when.capturedAt, counts);
+      await recordSubmission(batchId, 'orders', 'awsat_client', when.capturedAt, counts, body.partial === true);
       await logRun('ingest.orders', tradingDate, counts, started);
       log.info('ingest: orders accepted', { batchId, ...counts });
       return res.json({ ok: true, duplicate: false, ...counts });

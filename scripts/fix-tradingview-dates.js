@@ -59,10 +59,24 @@ const ISO_DAY = /^\d{4}-\d{2}-\d{2}$/;
  * both unreadable here and one DST-free-zone assumption away from naming the
  * wrong day. Every date printed by this script goes through here.
  */
+/*
+ * AND IT USED getUTC*, in the function whose docblock is about naming the right
+ * day. node-postgres parses a bare `date` at LOCAL midnight, so under
+ * TZ=Asia/Kuwait every date this printed was the day BEFORE the row's — including
+ * the line labelled "<- the evidence for --from". An operator following that
+ * evidence would set --from one day early; weekend_below_window is 0 (the gate
+ * catches a --from that is too LATE) and the final gate only checks that no
+ * weekend rows remain, which they would not. One extra day of previously-correct
+ * tradingview_history shifted +1, silently, on the table that feeds prev_close
+ * and chg_1d.
+ *
+ * `date` columns now arrive as text (src/db/pool.js), so the string branch runs.
+ * The Date branch reads LOCAL components.
+ */
 function isoDay(v) {
   if (v === null || v === undefined) return '—';
   if (v instanceof Date) {
-    return `${v.getUTCFullYear()}-${String(v.getUTCMonth() + 1).padStart(2, '0')}-${String(v.getUTCDate()).padStart(2, '0')}`;
+    return `${v.getFullYear()}-${String(v.getMonth() + 1).padStart(2, '0')}-${String(v.getDate()).padStart(2, '0')}`;
   }
   return String(v).slice(0, 10);
 }

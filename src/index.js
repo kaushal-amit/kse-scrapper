@@ -10,12 +10,17 @@
 
 const { config } = require('./config');
 const clock = require('./market/clock');
+const holidays = require('./market/holidays');
 const db = require('./db/pool');
 const { migrate } = require('./db/migrate');
 const repo = require('./db/repositories');
 const scheduler = require('./scheduler');
+const jobs = require('./jobs');
 const workerHost = require('./scrapeWorkerHost');
+const security = require('./api/ingestSecurity');
 const log = require('./logger');
+const { shouldMigrateOnBoot } = require('./db/migrateOnBoot');
+const thresholdParity = require('./db/thresholdParity');
 
 /**
  * The ingest API is only started when INGEST_TOKEN is set.
@@ -26,12 +31,16 @@ const log = require('./logger');
  */
 function startIngestApi() {
   const token = process.env.INGEST_TOKEN;
-  if (!token) {
-    log.info('ingest API not started — INGEST_TOKEN is not set');
+  /*
+   * A SHORT token used to be a log.warn and the API came up anyway. A warning
+   * at boot is read once, on the day it is added, by the person who already
+   * knows — and what it was guarding is anyone being able to write to the
+   * market-data tables, which noticing later does not undo. It now refuses.
+   */
+  const policy = security.assertTokenPolicy(token);   // throws on a short token
+  if (!policy.start) {
+    log.info(`ingest API not started — ${policy.reason}`);
     return null;
-  }
-  if (token.length < 24) {
-    log.warn('INGEST_TOKEN is short; use at least 24 random characters');
   }
 
   const express = require('express');
@@ -45,14 +54,68 @@ function startIngestApi() {
    * CORS error for what was actually a 413 or a parse failure. Depth is the
    * largest payload sent, which is why depth was the endpoint that showed it.
    */
-  const ORIGIN = process.env.INGEST_ORIGIN || '*';
+  /*
+   * INGEST_ORIGIN is now a comma LIST, and the caller's own origin is echoed
+   * back when it matches. Sending the first entry of a list to every caller
+   * would allow exactly one of them. '*' is still accepted and still the
+   * documented fallback.
+   */
+  const ALLOW = security.parseOrigins(process.env.INGEST_ORIGIN);
+  if (ALLOW.any) {
+    log.warn('INGEST_ORIGIN is not set — any browser origin may post. '
+      + 'Set it to the broker page and the terminal, comma separated.');
+  } else {
+    log.info('ingest origin allowlist', { origins: ALLOW.list });
+  }
+
+  const limiter = security.createRateLimiter();
+  log.info('ingest rate limit', { max: limiter.max, windowMs: limiter.windowMs });
+
   app.use((req, res, next) => {
-    res.set('Access-Control-Allow-Origin', ORIGIN);
+    const origin = security.resolveOrigin(req.get('origin'), ALLOW);
+    if (origin === null) {
+      /*
+       * The browser will only ever see a missing header — it discards the
+       * response and reports "NetworkError", with nothing in its console
+       * naming the cause. So the refusal is loud HERE, where someone can read
+       * it, naming the origin that was turned away and what to add.
+       */
+      log.warn('ingest: origin refused by the allowlist', {
+        origin: req.get('origin'), path: req.path, allowed: ALLOW.list,
+      });
+      return res.status(403).json({
+        ok: false,
+        error: `origin ${req.get('origin')} is not in INGEST_ORIGIN`,
+        hint: 'add it to INGEST_ORIGIN on the server (comma separated) and restart',
+      });
+    }
+    res.set('Access-Control-Allow-Origin', origin);
     res.set('Vary', 'Origin');
     res.set('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
-    res.set('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-ingest-token');
+    res.set('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-ingest-token, x-request-id');
     res.set('Access-Control-Max-Age', '86400');
     if (req.method === 'OPTIONS') return res.status(204).end();
+
+    /*
+     * Rate limit AFTER the preflight answer and BEFORE body parsing, so a
+     * client in a tight retry loop cannot make the process parse 8 MB a time.
+     * /health is exempt: it is how you find out the service is being
+     * rate-limited.
+     */
+    if (req.path !== '/health') {
+      const verdict = limiter.check(req.ip || 'unknown');
+      if (!verdict.allowed) {
+        log.warn('ingest: rate limited', {
+          ip: req.ip, path: req.path, count: verdict.count, max: verdict.max,
+        });
+        res.set('Retry-After', String(verdict.retryAfterSec));
+        return res.status(429).json({
+          ok: false,
+          error: `too many requests: ${verdict.count} in the last ${Math.round(limiter.windowMs / 1000)}s (max ${verdict.max})`,
+          retryAfterSec: verdict.retryAfterSec,
+        });
+      }
+    }
     return next();
   });
 
@@ -84,7 +147,7 @@ function startIngestApi() {
    */
   // eslint-disable-next-line no-unused-vars
   app.use((err, req, res, _next) => {
-    res.set('Access-Control-Allow-Origin', ORIGIN);
+    res.set('Access-Control-Allow-Origin', security.resolveOrigin(req.get('origin'), ALLOW) || '*');
     res.set('Vary', 'Origin');
     const tooBig = err.type === 'entity.too.large' || err.status === 413;
     log.error('ingest request rejected', {
@@ -145,9 +208,65 @@ async function main() {
   // boot because a backend table is missing.
   log.info('thresholds', { source: require('./config/thresholds').summary() });
 
-  // Applying migrations at boot keeps environments consistent; it is a no-op
-  // when everything is already applied.
-  await migrate();
+  /*
+   * S5 · MIGRATE_ON_BOOT — off unless somebody said otherwise. See
+   * shouldMigrateOnBoot, below this function, for H-E and why the default
+   * inverted.
+   *
+   * Applying migrations at boot keeps a developer's environment consistent and
+   * is a no-op once everything is applied. In production it is the wrong shape:
+   * a deploy that restarts the process also, silently, changes the schema — so
+   * a migration renaming a table holding the trader's order history (039) runs
+   * unattended, with no backup taken and nobody watching. The failure mode is
+   * not "the migration is wrong"; it is "nobody decided when it ran".
+   *
+   * In production the deploy step is: back up, `npm run migrate`, restart. If a
+   * migration is pending at boot the process REFUSES to start and names it,
+   * because starting against a schema the code does not match is how you get a
+   * scraper writing to a column that is not there — every minute, for four
+   * hours, with the first error long since scrolled away.
+   */
+  const migrateOnBoot = shouldMigrateOnBoot(process.env);
+
+  if (migrateOnBoot) {
+    log.info('MIGRATE_ON_BOOT is on — applying migrations at boot');
+    await migrate();
+  } else {
+    const status = await migrate({ statusOnly: true });
+    if (status.pending.length) {
+      log.error('REFUSING TO START — migrations are pending and MIGRATE_ON_BOOT is off', {
+        pending: status.pending,
+        fix: 'back up the database, run `npm run migrate`, then start again',
+      });
+      throw new Error(
+        `${status.pending.length} migration(s) pending: ${status.pending.join(', ')}. `
+        + 'Back up, run `npm run migrate`, then start. '
+        + 'Set MIGRATE_ON_BOOT=true to apply them at boot instead (not for production).');
+    }
+    log.info('MIGRATE_ON_BOOT is off — schema is up to date', { applied: status.skipped.length });
+  }
+
+  /*
+   * P2 · THE DATABASE'S NUMBERS AND THE CODE'S NUMBERS MUST BE THE SAME.
+   *
+   * Migration 013 hardcodes the at-offer cutoff and the two regime cutoffs,
+   * while src/config/thresholds.js makes all three configurable. Set
+   * SD_AT_OFFER_MAX=95 and the compute job writes rows the CHECK rejects,
+   * failing the whole chunked INSERT and so the day's compute — at 13:35, on a
+   * constraint violation nobody is watching for. Move a regime cutoff and there
+   * are two live definitions of market_day.regime, the column the trading
+   * backend reads to decide whether to trade at all.
+   *
+   * Checked here rather than left to discovery. See src/db/thresholdParity.js
+   * for why the numbers have to be written twice.
+   */
+  await thresholdParity.assertThresholdParity();
+
+  /*
+   * 040 · load the holiday calendar BEFORE the window status is reported, or
+   * the boot line would say "market OPEN" on a day the calendar knows is shut.
+   */
+  await holidays.load();
 
   // Say plainly whether the market is open and, if not, why. An idle process
   // that explains itself does not get mistaken for a hung one.
@@ -190,20 +309,100 @@ async function main() {
  * Ordered shutdown: stop taking new work, then release resources. Stopping the
  * scheduler first means nothing new starts while the browser is closing.
  */
+/**
+ * How long shutdown may take in total before it stops being polite.
+ *
+ * F-16 · there was NO timeout anywhere in here, and two of the steps can block
+ * for ever: `server.close()` waits for every keep-alive socket, and
+ * `pool.end()` waits for every checked-out client — including the dedicated one
+ * a running job holds for its advisory lock. Either could park the process
+ * until the supervisor's SIGKILL, at which point nothing is flushed anyway and
+ * the Chromium children may be orphaned.
+ */
+const SHUTDOWN_BUDGET_MS = Number(process.env.SHUTDOWN_BUDGET_MS || 30_000);
+
 async function shutdown(signal, exitCode = 0) {
-  if (shuttingDown) return;
+  if (shuttingDown) {
+    /*
+     * F-16 · the re-entrancy guard is right for a second SIGNAL and wrong for a
+     * CRASH during shutdown. It used to return here unconditionally, so an
+     * unrelated async throw while shutdown was parked on server.close() meant
+     * the uncaughtException handler returned immediately, the original shutdown
+     * never resumed, and process.exit was never reached — the process simply
+     * stayed alive, with no exit code for the restart policy to see.
+     */
+    if (exitCode !== 0) {
+      log.error('crashed while already shutting down — exiting now', { signal });
+      process.exit(exitCode);
+    }
+    return;
+  }
   shuttingDown = true;
   log.info('shutting down', { signal });
 
+  // The whole sequence is bounded. Whatever is stuck, the process leaves.
+  const hardStop = setTimeout(() => {
+    log.error('shutdown exceeded its budget — exiting anyway', {
+      budgetMs: SHUTDOWN_BUDGET_MS, stillRunning: jobs.inFlightJobs(),
+    });
+    process.exit(exitCode || 1);
+  }, SHUTDOWN_BUDGET_MS);
+  hardStop.unref();
+
   try {
     scheduler.stop();
-    if (ingestServer) await new Promise((r) => ingestServer.close(r));
+
+    /*
+     * DRAIN BEFORE CLOSING ANYTHING. A job mid-write must be allowed to finish:
+     * closing the pool under it loses that minute's captures, leaves its
+     * scrape_runs row RUNNING for ever (finishRun throws on the closed pool and
+     * is swallowed), and a trading minute cannot be re-scraped.
+     */
+    const drained = await jobs.drain(Math.floor(SHUTDOWN_BUDGET_MS / 2));
+    if (drained.drained) {
+      if (drained.waitedMs) log.info('in-flight jobs finished', { waitedMs: drained.waitedMs });
+    } else {
+      log.warn('in-flight jobs did not finish in time — closing anyway', {
+        waitedMs: drained.waitedMs, stillRunning: drained.stillRunning,
+        note: 'their writes may be incomplete and their scrape_runs rows left RUNNING',
+      });
+    }
+
+    if (ingestServer) {
+      /*
+       * closeIDLEConnections, not closeAllConnections.
+       *
+       * The problem stated here is idle sockets: server.close() waits for every
+       * open keep-alive connection, so one userscript tab sitting idle stalls
+       * the whole shutdown before stopAll() or db.close() are reached.
+       *
+       * P2 · AND THE CALL WAS THE OTHER ONE. Node's closeAllConnections()
+       * destroys ALL connections, INCLUDING those currently serving a request.
+       * A SIGTERM at 13:05 — a deploy, a container restart — landing while
+       * POST /ingest/quotes is inside repo.insertQuotes tore that request's
+       * socket out: the client saw a network error for a batch that may or may
+       * not have landed, and recordSubmission may not have written the
+       * client_submissions row that makes the retry a replay rather than a
+       * duplicate. That minute's ~137 quotes cannot be re-scraped.
+       *
+       * jobs.drain() above does not cover it — it tracks SCHEDULED jobs, and an
+       * HTTP handler is not one. Idle sockets are closed, in-flight requests
+       * are allowed to finish, and SHUTDOWN_BUDGET_MS is still the backstop if
+       * one never does.
+       */
+      if (typeof ingestServer.closeIdleConnections === 'function') {
+        ingestServer.closeIdleConnections();
+      }
+      await new Promise((r) => ingestServer.close(r));
+    }
     // Workers own the browsers; stopping them closes those too.
     await workerHost.stopAll();
     await db.close();
+    clearTimeout(hardStop);
     log.info('shutdown complete');
     process.exit(exitCode);
   } catch (err) {
+    clearTimeout(hardStop);
     log.error('error during shutdown', { err: log.serializeError(err) });
     process.exit(1);
   }

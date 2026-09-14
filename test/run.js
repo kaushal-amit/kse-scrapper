@@ -15,7 +15,6 @@
 const assert = require('assert');
 const clock = require('../src/market/clock');
 const parse = require('../src/scrapers/parse');
-const transform = require('../src/scrapers/transform');
 const validate = require('../src/validate');
 const repo = require('../src/db/repositories');
 const db = require('../src/db/pool');
@@ -46,8 +45,12 @@ async function scheduleTests() {
   const cases = [
     ['2026-08-16T05:59:59Z', false, 'Sun 08:59:59 — one second before open'],
     ['2026-08-16T06:00:00Z', true, 'Sun 09:00:00 — open boundary is inclusive'],
-    ['2026-08-16T09:59:59Z', true, 'Sun 12:59:59 — final second'],
-    ['2026-08-16T10:00:00Z', false, 'Sun 13:00:00 — close boundary is exclusive'],
+    ['2026-08-16T09:59:59Z', true, 'Sun 12:59:59 — inside'],
+    // S8 · the window runs to 13:30 now: Boursa Kuwait's continuous trading
+    // does, and a 13:00 window never captured the closing prints.
+    ['2026-08-16T10:00:00Z', true, 'Sun 13:00:00 — still inside since S8'],
+    ['2026-08-16T10:29:59Z', true, 'Sun 13:29:59 — final second'],
+    ['2026-08-16T10:30:00Z', false, 'Sun 13:30:00 — close boundary is exclusive'],
     ['2026-08-17T08:00:00Z', true, 'Mon 11:00'],
     ['2026-08-18T08:00:00Z', true, 'Tue 11:00'],
     ['2026-08-19T08:00:00Z', true, 'Wed 11:00'],
@@ -140,59 +143,12 @@ async function transformTests() {
     change_percent: ['chg %', 'change %'], volume: ['vol', 'volume'],
   };
 
-  await test('transform: header row is never stored as an instrument', () => {
-    const out = transform.buildQuotes(header, [header, ['ABAR', 'Al Arabi', '176', '+2', '+1.2%', '1.2M']], ALIASES, meta);
-    assert.strictEqual(out.quotes.length, 1);
-    assert.strictEqual(out.quotes[0].symbol, 'ABAR');
-  });
 
-  await test('transform: exact header match beats a prefix match', () => {
-    // "chg" must not capture the "chg %" column.
-    const idx = transform.resolveColumns(header, ALIASES);
-    assert.strictEqual(idx.change_amount, 3);
-    assert.strictEqual(idx.change_percent, 4);
-  });
 
-  await test('transform: a column inserted upstream does not shift the data', () => {
-    const h2 = ['Symbol', 'Name', 'NEW', 'Price', 'Chg', 'Chg %', 'Vol'];
-    const out = transform.buildQuotes(h2, [h2, ['ABAR', 'Al Arabi', 'x', '176', '+2', '+1.2%', '1.2M']], ALIASES, meta);
-    assert.strictEqual(out.quotes[0].last_price, 176);
-  });
 
-  await test('transform: a suspended symbol with no prices is KEPT, not dropped', () => {
-    // Regression: an all-blank row was being mistaken for a header and silently
-    // discarded, losing exactly the rows most worth noticing.
-    const out = transform.buildQuotes(header, [header, ['ABAR', 'Al Arabi', '—', '', '—', '']], ALIASES, meta);
-    assert.strictEqual(out.quotes.length, 1);
-    assert.strictEqual(out.quotes[0].last_price, null);
-  });
 
-  await test('transform: price coverage detects selector drift', () => {
-    const good = transform.buildQuotes(header, [header, ['A', 'x', '1', '', '', '']], ALIASES, meta);
-    assert.strictEqual(transform.priceCoverage(good.quotes), 1);
-    const drifted = transform.buildQuotes([], [['A', 'x', '—', '—', '—', '—']], ALIASES, meta);
-    assert.strictEqual(transform.priceCoverage(drifted.quotes), 0);
-  });
 
-  await test('transform: depth levels number sequentially and cap at 20', () => {
-    const rows = Array.from({ length: 30 }, (_, i) => [`${i * 10}`, `${100 - i}`, `${200 + i}`, `${i * 5}`]);
-    const levels = transform.buildDepthLevels(rows, 'ABAR', meta);
-    assert.strictEqual(levels.length, 20);
-    assert.strictEqual(levels[0].level, 1);
-    assert.strictEqual(levels[19].level, 20);
-  });
 
-  await test('transform: an order without an id is dropped, one without a symbol is kept', () => {
-    const rows = [
-      ['A1', 'ABAR', 'Buy', 'FILLED', '176', '1000', '1000'],
-      ['', 'ABAR', 'Buy', 'OPEN', '176', '10', '0'],
-      ['A3', '', 'Sell', 'OPEN', '177', '500', '0'],
-    ];
-    const orders = transform.buildOrders(rows, meta);
-    assert.strictEqual(orders.length, 2);
-    assert.strictEqual(orders[0].remaining_qty, 0);
-    assert.strictEqual(orders[1].symbol, null);
-  });
 }
 
 // ── 3. validation ───────────────────────────────────────────────────────────
@@ -295,10 +251,11 @@ async function persistenceTests() {
     assert.strictEqual((await repo.insertDepth(levels)).inserted, 0);
   });
 
-  await test('persist: awsat_order_list keeps ONE row per order', async () => {
-    // Orders are upserted on order_id, so re-seeing an order updates it rather
-    // than logging another sighting. Ten orders means ten rows, however many
-    // times the scraper runs.
+  await test('persist: awsat_order_list shows ONE row per order', async () => {
+    // 039 · orders are APPENDED, one row per sighting, and awsat_order_list is
+    // a view showing each order's latest state. Ten orders means ten rows in
+    // the view however many times the scraper runs — the sightings accumulate
+    // underneath it in awsat_order_obs.
     const at = new Date();
     const orders = [
       { order_id: `${TAG}-1`, symbol: 'TSTA', side: 'BUY', order_status: 'OPEN', price: 176, quantity: 1000, filled_quantity: 0, remaining_qty: 1000, order_time: null, trading_date: day, run_id: runId, created_at: at },
@@ -344,7 +301,9 @@ async function schemaTests() {
     // trail. Anything superseded by migration 005 was dropped by 008.
     for (const t of ['tradingview_watchlist', 'tradingview_history',
       'symbol_day', 'market_day', 'awsat_market_quotes', 'awsat_stock_depth',
-      'awsat_order_list', 'instruments', 'scrape_runs']) {
+      // 039 · the orders BASE TABLE is awsat_order_obs; awsat_order_list is the
+      // view over it, and this check reads BASE TABLE only.
+      'awsat_order_obs', 'instruments', 'scrape_runs']) {
       assert.ok(names.includes(t), `missing table: ${t}`);
     }
   });
@@ -353,7 +312,7 @@ async function schemaTests() {
     const { rows } = await db.query(
       `SELECT conname FROM pg_constraint WHERE contype IN ('u','p')
          AND conrelid::regclass::text IN
-           ('awsat_market_quotes','awsat_stock_depth','awsat_order_list',
+           ('awsat_market_quotes','awsat_stock_depth','awsat_order_obs',
             'tradingview_watchlist','tradingview_history')`);
     const names = rows.map((r) => r.conname).join(' ');
     // Renamed alongside their tables by 002. A violation reporting
@@ -362,7 +321,22 @@ async function schemaTests() {
     assert.match(names, /tradingview_watchlist_key/);
     assert.match(names, /awsat_quotes_key/);
     assert.match(names, /awsat_depth_key/);
-    assert.match(names, /awsat_orders_order_id_key/);
+    /*
+     * 039 · orders are append-only. The dedup key is no longer (order_id) — one
+     * order has many sightings — it is (order_id, observed_at, ingest_source):
+     * the same order, seen at the same instant, by the same collector. That is
+     * a UNIQUE INDEX rather than a constraint, so it is checked separately.
+     */
+    assert.doesNotMatch(names, /awsat_orders_order_id_key/,
+      'the order_id unique constraint must be GONE — it would block a second sighting');
+  });
+
+  await test('schema: the orders dedup key is the OBSERVATION, not the order', async () => {
+    const { rows } = await db.query(
+      `SELECT indexname FROM pg_indexes
+        WHERE schemaname = 'public' AND tablename = 'awsat_order_obs'`);
+    const names = rows.map((r) => r.indexname).join(' ');
+    assert.match(names, /awsat_order_obs_key/);
   });
 
   await test('schema: prices are numeric, not floating point', async () => {
@@ -376,11 +350,12 @@ async function schemaTests() {
 // ── run ─────────────────────────────────────────────────────────────────────
 
 async function cleanup() {
+  // 039 · awsat_order_list is a VIEW now; the rows live in awsat_order_obs.
   for (const t of ['tradingview_watchlist', 'awsat_market_quotes', 'awsat_stock_depth',
-    'awsat_order_list', 'tradingview_history']) {
+    'awsat_order_obs', 'tradingview_history']) {
     await db.query(`DELETE FROM ${t} WHERE symbol LIKE 'TST%'`);
   }
-  await db.query("DELETE FROM awsat_order_list WHERE order_id LIKE 'selftest%'");
+  await db.query("DELETE FROM awsat_order_obs WHERE order_id LIKE 'selftest%'");
   await db.query('DELETE FROM scrape_runs WHERE scraper LIKE $1', [`${TAG}%`]);
   await db.query('DELETE FROM instruments WHERE symbol LIKE $1', ['TST%']);
 }

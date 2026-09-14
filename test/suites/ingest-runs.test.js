@@ -19,7 +19,7 @@ const srv=app.listen(8813, async()=>{
   await db.query("delete from scrape_runs where scraper like 'ingest.%'");
   await db.query("delete from awsat_market_quotes where ingest_source='awsat_client'");
   await db.query("delete from awsat_stock_depth where ingest_source='awsat_client'");
-  await db.query("delete from awsat_order_list where order_id like 'IR-%'");
+  await db.query("delete from awsat_order_obs where order_id like 'IR-%'");
 
   const at=new Date().toISOString();
 
@@ -72,7 +72,7 @@ const srv=app.listen(8813, async()=>{
   await db.query("delete from scrape_runs where scraper like 'ingest.%'");
   await db.query("delete from awsat_market_quotes where ingest_source='awsat_client'");
   await db.query("delete from awsat_stock_depth where ingest_source='awsat_client'");
-  await db.query("delete from awsat_order_list where order_id like 'IR-%'");
+  await db.query("delete from awsat_order_obs where order_id like 'IR-%'");
   console.log(`\ningest runs: ${p}/${n}`);
   srv.close(); await db.close(); process.exit(p===n?0:1);
 });

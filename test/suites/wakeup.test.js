@@ -76,15 +76,28 @@ let p=0,n=0;const ck=(t,c,x)=>{n++;if(c)p++;else console.log('  FAIL:',t,JSON.st
   const again=await wake.scan(day,9);
   ck('an existing holder is not re-promoted', again.promoted===0, again);
 
-  // ── fill 4-8, then the swap rule ──
-  for(const [sym,tr] of [['WKB',60],['WKC',70],['WKD',80],['WKE',90]]){
+  // ── fill every wake-up slot, then the swap rule ──
+  //
+  // P2 · this used to fill "4-8" and assert five holders, from wakeup.js's own
+  // `[4, 5, 6, 7, 8]` literal. Slots 6-8 are outside SLOT_COUNT: the sweep
+  // cannot reach them, the client truncates them away, and neither POST can
+  // release them. The range is now derived, and so is this fixture — a test
+  // that restates the number under test proves only that it was copied.
+  const WAKE_SLOTS = require('../../src/config/slots').wakeupSlots();
+  ck('there is at least one wake-up slot to fill', WAKE_SLOTS.length >= 1, WAKE_SLOTS);
+
+  const fillers=[['WKB',60],['WKC',70],['WKD',80],['WKE',90]].slice(0, WAKE_SLOTS.length - 1);
+  for(const [sym,tr] of fillers){
     for(let i=1;i<=10;i++) await q(sym,'1994-06-'+String(i+9).padStart(2,'0'),10,6);
     await q(sym,day,tr,6);
     await mv(sym,tr);
   }
   await wake.scan(day,9);
   const holders=await wake.currentHolders(day);
-  ck('all five wake-up slots held', holders.length===5, holders.map(h=>h.slot));
+  ck('every wake-up slot the sweep can reach is held',
+     holders.length===WAKE_SLOTS.length, {held:holders.map(h=>h.slot), space:WAKE_SLOTS});
+  ck('and none of them is outside the published address space',
+     holders.every(h=>WAKE_SLOTS.includes(Number(h.slot))), holders.map(h=>h.slot));
 
   // A faster newcomer is BLOCKED when every slot is held — even at 30x.
   // It used to evict the lowest pace, which could overwrite a symbol chosen

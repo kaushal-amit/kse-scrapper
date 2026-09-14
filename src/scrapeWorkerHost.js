@@ -74,16 +74,72 @@ class SkippedError extends Error {
 /**
  * How long a queued job may wait before it is no longer worth running.
  *
- * Defaults to the job's own cadence. A one-minute scraper that finally starts
- * ninety seconds late would stamp its rows with a minute that has already
- * passed — and the next run is about to capture the current one properly. Late
- * data is not better than no data here; it is a wrong row that looks right.
+ * S2 · A WALL-CLOCK DEADLINE, NEVER BELOW THE BLOCKING JOB'S OWN TIMEOUT.
+ *
+ * This used to be a flat 60 s — the job's own cadence, on the reasoning that a
+ * one-minute scraper starting ninety seconds late stamps its rows with a minute
+ * that has already passed. That reasoning is right, and the number was set
+ * without reference to the 300 s timeout on the SAME SHARED BROWSER.
+ *
+ * The three AWSAT jobs are serialised behind one browser. Login alone measures
+ * ~65 s on the live terminal, so a board run of ~90 s is the normal case — and
+ * anything queued behind it was already past a 60 s deadline before pump() even
+ * looked at it. Both queued jobs were then rejected as SkippedError, which by
+ * design does not count toward consecutive_failures. Every minute, for four
+ * hours: awsat_stock_depth and the order list received ZERO rows for a whole
+ * session, with no alarm anywhere. (Review F-03.)
+ *
+ * So the floor is the blocking job's own timeout plus a margin. A queued job
+ * that waits that long has genuinely lost its minute; one that waits 70 s
+ * behind a normal login has not.
  */
-function staleAfterMs(job) {
-  // The daily history job runs once and has no minute to be late for, so the
-  // staleness rule that protects minute-cadence scrapers would only cancel it.
-  if (job === 'tradingview.backfill') return 6 * 60 * 60_000;
-  return Number(process.env.SCRAPE_STALE_AFTER_MS) || 60_000;
+const QUEUE_MARGIN_MS = 5 * 60_000;
+
+/*
+ * Jobs that are long BY NATURE, not by malfunction. They are exempt from the
+ * staleness rule themselves, and they do not raise the floor for their
+ * neighbours: a quotes tick queued behind a 45-minute backfill genuinely HAS
+ * lost its minute, and the next tick will capture the current one properly.
+ * Cancelling it is right. The floor exists to stop a NORMAL job being cancelled
+ * for waiting less than the job in front of it is allowed to take.
+ */
+const LONG_JOBS = new Set(['tradingview.backfill']);
+
+function staleAfterMs(job, source) {
+  // Runs once, and has no minute to be late for.
+  if (LONG_JOBS.has(job)) return 6 * 60 * 60_000;
+
+  const configured = Number(process.env.SCRAPE_STALE_AFTER_MS) || 60_000;
+
+  /*
+   * The floor: the longest a job on this browser may RUN, plus the margin. Any
+   * shorter and the queue cancels work for being late by less than the thing in
+   * front of it is allowed to take — which is not a staleness rule, it is a
+   * guarantee that the second job never runs.
+   */
+  const longestOnThisBrowser = Math.max(
+    0,
+    ...Object.entries(TIMEOUT_MS)
+      .filter(([j]) => SOURCE_OF[j] === source && !LONG_JOBS.has(j))
+      .map(([, ms]) => ms),
+  );
+  const floor = longestOnThisBrowser ? longestOnThisBrowser + QUEUE_MARGIN_MS : 0;
+
+  if (configured < floor) {
+    warnOnce(`queue-stale-${source}`,
+      'SCRAPE_STALE_AFTER_MS is shorter than the longest job on this browser can run — '
+      + 'raising it, or a queued job could never start',
+      { source, configured, longestOnThisBrowser, using: floor });
+    return floor;
+  }
+  return configured;
+}
+
+const _warned = new Set();
+function warnOnce(key, message, data) {
+  if (_warned.has(key)) return;
+  _warned.add(key);
+  log.warn(message, data);
 }
 
 function spawn(source) {
@@ -216,7 +272,7 @@ function runScrape(job, runId, args = null) {
     state.queue.push({
       job, runId, source, args, resolve, reject,
       enqueuedAt: now,
-      deadline: now + staleAfterMs(job),
+      deadline: now + staleAfterMs(job, source),
     });
 
     if (state.inFlight) {
@@ -249,4 +305,4 @@ async function stopAll() {
   }));
 }
 
-module.exports = { runScrape, stopAll, SkippedError, SOURCE_OF, TIMEOUT_MS };
+module.exports = { runScrape, stopAll, SkippedError, SOURCE_OF, TIMEOUT_MS, staleAfterMs, QUEUE_MARGIN_MS };

@@ -33,7 +33,7 @@ const log = require('../logger');
  * Minimum captures before a day counts as a bar. A symbol seen three times
  * cannot produce a meaningful high or low.
  */
-const MIN_CAPTURES = Number(process.env.HISTORY_MIN_CAPTURES || 10);
+const MIN_CAPTURES = require('../config/thresholds').get('history_min_captures');
 
 async function finalise(tradingDay, runId) {
   const day = tradingDay || clock.tradingDay();

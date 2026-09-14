@@ -30,12 +30,30 @@ const MIN_GAP_MS = Number(process.env.NOTIFY_MIN_GAP_MS || 60_000);
  */
 const lastSent = new Map();
 
+/** Record a DELIVERED push against the throttle. Success only — see shouldSend. */
+function throttleKey(signal) { return `${signal.symbol}|${signal.signal}`; }
+
+function markSent(signal) {
+  lastSent.set(throttleKey(signal), Date.now());
+}
+
 function shouldSend(signal) {
-  const key = `${signal.symbol}|${signal.signal}`;
+  const key = throttleKey(signal);
   const now = Date.now();
   const previous = lastSent.get(key);
   if (previous && now - previous < MIN_GAP_MS) return false;
-  lastSent.set(key, now);
+  /*
+   * F-18 · the throttle is NOT stamped here any more.
+   *
+   * It used to be: shouldSend recorded the timestamp and then push() tried to
+   * deliver. A push that FAILED — a slow webhook aborted at TIMEOUT_MS — had
+   * therefore already consumed its slot, so the next evaluation 15-20 s later
+   * was throttled, and the aggregate counted the miss as `throttled` rather
+   * than `failed`: an intentional suppression, in the report, for an alert that
+   * never reached the phone.
+   *
+   * markSent() is called by the caller on success only.
+   */
   return true;
 }
 
@@ -81,6 +99,8 @@ async function push(signal) {
       log.warn('notify: rejected', { status: res.status, signal: signal.signal });
       return { sent: false, reason: `HTTP ${res.status}` };
     }
+    // The slot is consumed by a DELIVERED push, not an attempted one.
+    markSent(signal);
     return { sent: true };
   } catch (err) {
     log.warn('notify: failed', { err: err.message, signal: signal.signal });
@@ -101,4 +121,4 @@ async function pushAll(signals) {
   };
 }
 
-module.exports = { push, pushAll, format, shouldSend, _lastSent: lastSent };
+module.exports = { push, pushAll, format, shouldSend, markSent, _lastSent: lastSent };

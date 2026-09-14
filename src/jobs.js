@@ -33,6 +33,47 @@ const log = require('./logger');
 const running = new Set();
 
 /**
+ * The PROMISES of jobs currently in flight, so shutdown can drain them.
+ *
+ * F-16 · the scheduler fires and forgets by design — awaiting in a cron
+ * callback would hold the tick behind a slow scrape — so nothing anywhere held
+ * a reference to a running job. `scheduler.stop()` therefore only stopped NEW
+ * ticks: a SIGTERM landing inside `repo.insertQuotes` tore the connection out
+ * from under it, the insert threw, `finishRun` threw on the closed pool and was
+ * swallowed, and the run row was left RUNNING for ever. That minute's ~137
+ * quotes were gone, and a trading minute cannot be re-scraped.
+ */
+const inFlight = new Set();
+
+/** How many jobs are running, and which. For the shutdown log. */
+function inFlightJobs() { return [...running]; }
+
+/**
+ * Wait for every in-flight job, or until `timeoutMs`.
+ *
+ * Bounded, because a drain that can hang for ever is worse than a lost write:
+ * the supervisor's SIGKILL then takes the process with the browsers still
+ * attached, and nothing is flushed anyway. Returns what was still running when
+ * it gave up, so the log can name it.
+ */
+async function drain(timeoutMs = 20_000) {
+  if (!inFlight.size) return { drained: true, waitedMs: 0, stillRunning: [] };
+  const started = Date.now();
+  let timer;
+  const deadline = new Promise((resolve) => { timer = setTimeout(resolve, timeoutMs); });
+  await Promise.race([
+    Promise.allSettled([...inFlight]),
+    deadline,
+  ]);
+  clearTimeout(timer);
+  return {
+    drained: inFlight.size === 0,
+    waitedMs: Date.now() - started,
+    stillRunning: [...running],
+  };
+}
+
+/**
  * AWSAT server jobs run only in server mode.
  *
  * Reported as SKIPPED, not FAILED — a job that is off by configuration is not a
@@ -95,13 +136,65 @@ async function runJob(name, fn, args) {
   // A DEDICATED connection: an advisory lock is held by the session that took
   // it, so a pooled query would release it the moment the client went back.
   const { pool } = require('./db/pool');
-  const lockClient = await pool.connect().catch(() => null);
+
+  /*
+   * F-04 · NEITHER FAILURE PATH IS SWALLOWED ANY MORE.
+   *
+   * Both used to be silent, and each lied in its own way:
+   *
+   *   · `pool.connect().catch(() => null)` — a rejection meant lockClient was
+   *     null, the whole `if (lockClient)` block was skipped, and the job then
+   *     RAN WITH NO LOCK AT ALL, with not one log line. The protection the
+   *     block exists for was simply off. Concretely: the pool is exhausted at
+   *     13:31 because daily.instruments is still running when daily.symbolday
+   *     fires; connect() times out; both the deployed scheduler and a local one
+   *     take the null path and compute symbol_day for the same date
+   *     concurrently — the exact case this comment block warns about, where "if
+   *     they ever disagreed there would be no way to tell which won".
+   *
+   *   · `catch { holdsLock = false; }` on the query — a Postgres restart
+   *     invalidates the session holding the lock and makes this throw. The job
+   *     was then recorded as "another process holds the advisory lock", which
+   *     is FALSE, and costs an operator an afternoon looking for a second
+   *     scheduler that does not exist.
+   *
+   * Now: a job that cannot take its lock does not run. Refusing is the loud
+   * option, and the alternative is two processes writing the same rows.
+   */
+  let lockClient = null;
+  try {
+    lockClient = await pool.connect();
+  } catch (err) {
+    log.error('REFUSING to run — could not take a connection for the advisory lock', {
+      job: name, err: err.message,
+      note: 'running unlocked risks a second process computing the same rows, and '
+        + 'if they disagreed there would be no way to tell which won',
+    });
+    return { status: 'SKIPPED', reason: 'no connection for the advisory lock' };
+  }
+
   let holdsLock = false;
-  if (lockClient) {
+  let lockError = null;
+  {
     try {
       const { rows } = await lockClient.query('SELECT pg_try_advisory_lock($1) AS got', [lockKey]);
       holdsLock = rows[0].got === true;
-    } catch { holdsLock = false; }
+    } catch (err) {
+      lockError = err;
+      holdsLock = false;
+    }
+
+    if (lockError) {
+      lockClient.release();
+      log.error('REFUSING to run — the advisory lock could not be taken', {
+        job: name, err: lockError.message,
+        note: 'NOT "another process holds it" — the lock query itself failed. A '
+          + 'Postgres restart invalidates the session that held the lock and '
+          + 'produces exactly this.',
+      });
+      return { status: 'SKIPPED', reason: `advisory lock query failed: ${lockError.message}` };
+    }
+
     if (!holdsLock) {
       lockClient.release();
       log.warn('skipped — another process holds this job', {
@@ -139,11 +232,52 @@ async function runJob(name, fn, args) {
     runId = await repo.startRun(name, tradingDay);
     log.info('job started', { job: name, runId });
 
-    const { extracted, inserted, rejected = 0 } = await fn(runId, args);
+    const result = await fn(runId, args);
+    const { extracted, inserted, rejected = 0 } = result;
+
+    /*
+     * F-04 · THE JOB'S OWN STATUS IS FORWARDED.
+     *
+     * `status` was neither destructured nor consulted — every completed run was
+     * written SUCCESS. fastLoop returns PARTIAL in two places, and
+     * 001_init.sql's CHECK has allowed PARTIAL since the beginning, so the
+     * schema was built for this and the writer never used it.
+     *
+     * What that cost: a writer/schema mismatch makes signals.evaluate throw
+     * shapeError for every symbol; fastLoop returns
+     * {extracted: 0, inserted: 0, status: 'PARTIAL', shapeErrors: 8}; the run
+     * is recorded SUCCESS with zero rows, and the boot report prints
+     * "signals.fast: SUCCESS". Seven checks are dead for the session and every
+     * dashboard is green — the exact "silence looks identical to success" mode
+     * this file's header says it exists to prevent.
+     *
+     * Only the values the CHECK constraint allows are honoured, and anything
+     * else is a bug in the job rather than a reason to write an illegal row.
+     */
+    const ALLOWED = new Set(['SUCCESS', 'PARTIAL']);
+    let status = 'SUCCESS';
+    if (result.status && result.status !== 'SUCCESS') {
+      if (ALLOWED.has(result.status)) {
+        status = result.status;
+      } else {
+        log.error('job returned a status finishRun cannot store — recording SUCCESS', {
+          job: name, returned: result.status, allowed: [...ALLOWED],
+        });
+      }
+    }
 
     await repo.finishRun(runId, {
-      status: 'SUCCESS', rowsExtracted: extracted, rowsInserted: inserted, startedAt,
+      status, rowsExtracted: extracted, rowsInserted: inserted, startedAt,
     });
+
+    // A PARTIAL run is a degraded one. It must be as visible as a failure in
+    // the log, because in scrape_runs it is only one word different.
+    if (status === 'PARTIAL') {
+      log.error('job completed PARTIAL — some of its work did not run', {
+        job: name, runId, ...(result.skipped ? { skipped: result.skipped } : {}),
+        ...(result.shapeErrors ? { shapeErrors: result.shapeErrors } : {}),
+      });
+    }
 
     // Extracted rows that reached neither the database nor a duplicate are lost
     // data, and a trading minute cannot be re-scraped. Say so at error level.
@@ -159,7 +293,19 @@ async function runJob(name, fn, args) {
     log.info('job finished', {
       job: name, runId, extracted, inserted, rejected, ms: Date.now() - startedAt,
     });
-    return { status: 'SUCCESS', extracted, inserted, rejected };
+    /*
+     * P2 · `status`, NOT THE LITERAL 'SUCCESS'.
+     *
+     * F-04 computed this status and passed it to finishRun, so scrape_runs
+     * recorded PARTIAL correctly — and then this line discarded it. The row
+     * said PARTIAL and the return value said SUCCESS.
+     *
+     * src/runOnce.js exits `result.status === 'SUCCESS' ? 0 : 1`, so
+     * `npm run run:once -- signals.fast` exited 0, printed as a success, for a
+     * run in which the shape-error limit had disabled evaluation and the checks
+     * never executed. Any deploy or CI step gating on that exit code saw green.
+     */
+    return { status, extracted, inserted, rejected };
   } catch (err) {
     // A job that never got onto the browser is SKIPPED, not FAILED. Recording
     // it as a failure inflates consecutive_failures and fires alerts for a
@@ -336,7 +482,19 @@ async function fastLoop(runId) {
 
   let fired = 0;
   let snapshots = 0;
-  let shapeErrors = 0;
+  /*
+   * F-18 · shapeErrors is PROCESS state, not per-invocation state.
+   *
+   * It was a local, re-initialised on every tick, and incremented once per
+   * symbol in a loop bounded by the depth slots — at most 8. The limit is 20.
+   * So `evaluationDisabled` was UNREACHABLE, and the limiter that exists to
+   * stop a shape mismatch printing 24 error lines a minute for four hours
+   * (~5,760 identical lines, burying every other log line in the session — the
+   * exact outcome its own comment describes) never once fired.
+   *
+   * Counting consecutively ACROSS ticks is what the limit was always meant to
+   * mean: twenty consecutive failures is a broken writer, not a bad minute.
+   */
   const toPush = [];
 
   // Evaluation is off for this process — a shape mismatch does not fix itself
@@ -377,6 +535,7 @@ async function fastLoop(runId) {
     let hits;
     try {
       hits = signals.evaluate(prev, now);
+      // One success clears the run: the mismatch was transient, or fixed.
       shapeErrors = 0;
     } catch (err) {
       if (!err.shapeError) throw err;
@@ -387,6 +546,7 @@ async function fastLoop(runId) {
         log.error('signals.fast: evaluation DISABLED for this process after '
           + `${SHAPE_ERROR_LIMIT} consecutive shape errors. symbol_minute rows `
           + `are still being written.\n  Missing column: ${(err.missingColumns || []).join(', ')}`
+          + `\n  Last error: ${err.message}`
           + '\n  Restart after fixing the writer.');
       }
       continue;
@@ -460,6 +620,8 @@ async function fastLoop(runId) {
  */
 const SHAPE_ERROR_LIMIT = Number(process.env.SIG_SHAPE_ERROR_LIMIT || 20);
 let evaluationDisabled = false;
+// Consecutive shape errors ACROSS invocations. See the note in fastLoop.
+let shapeErrors = 0;
 let lastShapeError = null;
 
 let fastLoopEmptyRuns = 0;
@@ -575,7 +737,20 @@ async function run(name, args) {
     log.error('unknown job', { job: name, known: Object.keys(JOBS) });
     return { status: 'FAILED' };
   }
-  return runJob(name, fn, args);
+  /*
+   * F-16 · REGISTERED WHILE IT RUNS, so shutdown can wait for it.
+   *
+   * The scheduler fires and forgets — correctly, because awaiting inside a cron
+   * callback holds the next tick behind a slow scrape — so this is the only
+   * place with a reference to the promise.
+   */
+  const promise = runJob(name, fn, args);
+  inFlight.add(promise);
+  try {
+    return await promise;
+  } finally {
+    inFlight.delete(promise);
+  }
 }
 
 module.exports = {
@@ -585,4 +760,23 @@ module.exports = {
   // Exported for the lock test: two callers racing one job name.
   _runJob: runJob,
   _hashJobName: hashJobName,
+  /*
+   * F-18 · the shape-error state, readable. `lastShapeError` was assigned and
+   * never read anywhere in the repo — the one captured diagnostic was thrown
+   * away. It and the counter are now both reachable, so /health and the tests
+   * can say WHY evaluation stopped rather than only that it did.
+   */
+  // F-16 · shutdown drains these before closing the pool.
+  drain,
+  inFlightJobs,
+  _signalHealth: () => ({
+    evaluationDisabled,
+    shapeErrors,
+    limit: SHAPE_ERROR_LIMIT,
+    lastShapeError: lastShapeError ? {
+      message: lastShapeError.message,
+      missingColumns: lastShapeError.missingColumns || [],
+    } : null,
+  }),
+  _resetSignalHealth: () => { evaluationDisabled = false; shapeErrors = 0; lastShapeError = null; },
 };

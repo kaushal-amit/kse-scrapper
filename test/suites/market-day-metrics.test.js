@@ -19,14 +19,28 @@ ck('11 unchanged', b.unchanged===11, b.unchanged);
 ck('8 with no previous close, excluded from all three', b.no_prev_close===8, b.no_prev_close);
 ck('the four sum to 136', b.advancing+b.declining+b.unchanged+b.no_prev_close===136);
 
-// ── M1 · pct_advancing = 18 on the FULL denominator ──
-ck('M1: 24/136 = 17.65, rounds to 18', Math.round(b.pct_advancing)===18, b.pct_advancing);
+// ── M1 · pct_advancing over the symbols that were MEASURED ──
+//
+// H-J · this asserted 24/136 = 17.65. Eight of those 136 had no previous close,
+// so they could never be in the numerator — and dividing by them was dividing by
+// symbols whose direction nobody measured. The honest denominator is the 128
+// that had one: 24/128 = 18.75.
+//
+// The difference is small here because 17 August was a good capture. It is not
+// small on the day after a gap, which is exactly when the number is read.
+ck('M1: 24 of the 128 MEASURED = 18.75',
+   Math.round(b.pct_advancing*100)/100===18.75, b.pct_advancing);
+ck('and not 24/136 — the eight unmeasured symbols are not in the denominator',
+   Math.round(b.pct_advancing*100)/100!==17.65, b.pct_advancing);
+ck('measured_symbols says what it was computed over', b.measured_symbols===128, b.measured_symbols);
 ck('the ratio denominator would give 20.5 — stored separately',
    Math.round(b.pct_advancing_ratio*10)/10===20.5, b.pct_advancing_ratio);
 ck('the two are NOT the same number', b.pct_advancing!==b.pct_advancing_ratio);
 
-// ── M2 · regime at 18 ──
-ck('M2: 17.65 -> RISK_OFF', m.regimeOf(b.pct_advancing)==='RISK_OFF');
+// ── M2 · regime ──
+// Still RISK_OFF: the correction moves the number by one point, not across a
+// cutoff, on a day whose capture was good.
+ck('M2: 18.75 -> RISK_OFF', m.regimeOf(b.pct_advancing)==='RISK_OFF');
 
 // ── M3/M4 · 25 August, 52% ──
 const aug25=[];

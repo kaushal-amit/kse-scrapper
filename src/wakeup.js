@@ -24,14 +24,29 @@
 const { query } = require('./db/pool');
 const preflight = require('./db/preflight');
 const T = require('./config/thresholds');
+const slots = require('./config/slots');
 const clock = require('./market/clock');
 const log = require('./logger');
 
 const PACE_MIN = T.get('wakeup_pace_min');
 const TRADES_MIN = T.get('wakeup_trades_min');
-const BASELINE_DAYS = Number(process.env.WAKEUP_BASELINE_DAYS || 10);
-const WAKEUP_SLOTS = [4, 5, 6, 7, 8];
-const LOT = 100;
+const BASELINE_DAYS = T.get('wakeup_baseline_sessions');
+/*
+ * P2 · READ, NOT RESTATED. This was `[4, 5, 6, 7, 8]` — a literal sitting
+ * beside a router comment that says the GET, both POSTs and the backend's
+ * stale check "all follow the published number — never a literal".
+ *
+ * With SLOT_COUNT=5 the sweep has slots 4 and 5 for wake-ups. The literal
+ * offered 6, 7 and 8: the scan seated a symbol in slot 6, reported it
+ * promoted, and the client — which truncates the list to what it can sweep —
+ * dropped it. Its ladder was never captured, and neither documented endpoint
+ * could release the slot, because both validate against SLOT_COUNT.
+ *
+ * A function, not a constant, so an operator who changes SLOT_COUNT and
+ * restarts gets the change here too.
+ */
+const wakeupSlots = () => slots.wakeupSlots();
+const LOT = T.get('wakeup_lot_shares');
 
 /**
  * B2 · the current session budget, from the backend's spread.gate_config — the
@@ -40,14 +55,50 @@ const LOT = 100;
  * Falls back to WAKEUP_BUDGET_KD, then 2000, when the store is unreachable.
  */
 async function currentBudgetKd() {
+  /*
+   * F-13 · A FALLBACK BUDGET IS ANNOUNCED, NOT SUBSTITUTED SILENTLY.
+   *
+   * The catch swallowed EVERY error, not only "the spread schema is absent".
+   * A connection blip during a backend deploy therefore replaced the real
+   * session budget with 2,000 KD without a word. At a true budget of 600 KD on
+   * a 250-fil stock that is a floor of 2,400,000 shares instead of 720,000 —
+   * symbols that should fire do not, and nothing in the log says the number
+   * was a guess.
+   *
+   * The two cases are now distinguished: a missing schema is the documented
+   * scraper-only case and is expected; anything else is a failure and says so.
+   * Either way the fallback is logged the first time it is used, because a
+   * default that nobody knows is in force is indistinguishable from a
+   * measurement.
+   */
   try {
     const { rows } = await query(
       `SELECT config FROM spread.gate_config ORDER BY version DESC LIMIT 1`);
     const v = rows[0] && rows[0].config ? rows[0].config['session-budget'] : null;
     const n = Number(typeof v === 'object' && v ? v.numericValue : v);
     if (Number.isFinite(n) && n > 0) return n;
-  } catch { /* spread schema may be absent in a scraper-only DB */ }
-  return Number(process.env.WAKEUP_BUDGET_KD || 2000);
+    warnBudgetFallback('spread.gate_config holds no usable session-budget');
+  } catch (err) {
+    const absent = /does not exist/i.test(err.message || '');
+    warnBudgetFallback(absent
+      ? 'spread.gate_config is absent (scraper-only database)'
+      : `spread.gate_config could not be read: ${err.message}`);
+  }
+  return T.get('wakeup_budget_fallback_kd');
+}
+
+let budgetFallbackWarned = null;
+function warnBudgetFallback(reason) {
+  const using = T.get('wakeup_budget_fallback_kd');
+  if (budgetFallbackWarned === reason) return;
+  budgetFallbackWarned = reason;
+  log.warn('wake-up: using a FALLBACK session budget', {
+    reason,
+    budgetKd: using,
+    note: 'the absolute-volume floor is computed from this. A wrong budget moves '
+      + 'the floor proportionally, and nothing downstream can tell a fallback '
+      + 'from a measurement.',
+  });
 }
 
 /**
@@ -131,11 +182,48 @@ function movementVerdict(m, pace, budgetKd) {
     (m.moveFromOpen != null && Math.abs(m.moveFromOpen) >= moveOpen);
   const movement =
     (m.rangeFils != null && m.rangeFils >= rangeMin) &&
-    (m.upMoves >= 1);
-  const sharesAtBudget = m.price > 0 ? Math.floor((budgetKd * 1000) / m.price / LOT) * LOT : 0;
-  const floor = Math.round(floorShares * sharesAtBudget * floorFrac);
-  const absVol = m.volumeToday >= floor;
-  return { fires: activity && movement && absVol, activity, movement, absVol, floor };
+    // F-12 · the one term in this function that was a literal. Every other
+    // number here comes from the threshold file, and config/thresholds.js says
+    // so in as many words: "Every number here, never a literal in wakeup.js."
+    (m.upMoves != null && m.upMoves >= T.get('wakeup_upmoves_min'));
+  /*
+   * F-13 · AN UNMEASURABLE PRICE IS NOT A FLOOR OF ZERO.
+   *
+   * This was `m.price > 0 ? … : 0`. m.price is null when the symbol's captures
+   * carry no usable last_price — `null > 0` is false, so sharesAtBudget became
+   * 0, the floor became 0, and `absVol` became `volumeToday >= 0`: ALWAYS TRUE.
+   * The most permissive possible answer, produced by the absence of the number
+   * the test is built on.
+   *
+   * A thinly-quoted symbol could then claim a depth slot ahead of a real
+   * candidate on a floor of zero shares, where a 250-fil stock would have had
+   * to clear 240,000.
+   *
+   * NOT COMPUTED is the answer: without a price the floor cannot be stated, so
+   * the test cannot pass. The verdict carries the reason so the log says which
+   * term was missing rather than only that the symbol did not fire.
+   */
+  const sharesAtBudget = (m.price != null && m.price > 0)
+    ? Math.floor((budgetKd * 1000) / m.price / LOT) * LOT
+    : null;
+  const floor = sharesAtBudget === null ? null : Math.round(floorShares * sharesAtBudget * floorFrac);
+  const absVol = floor === null ? false : m.volumeToday >= floor;
+
+  const notComputed = [];
+  if (m.price == null || m.price <= 0) notComputed.push('price');
+  if (m.rangeFils == null) notComputed.push('rangeFils');
+  if (m.upMoves == null) notComputed.push('upMoves');
+
+  return {
+    fires: activity && movement && absVol,
+    activity,
+    movement,
+    absVol,
+    floor,
+    // Empty means every term was measured. Non-empty means the verdict is a
+    // refusal for want of data, not a measurement that came out negative.
+    notComputed,
+  };
 }
 
 /**
@@ -289,7 +377,7 @@ async function scan(day = clock.tradingDay(), atHour = null) {
   for (const cand of firing) {
     if (heldSymbols.has(cand.symbol)) continue;      // holds for the session
 
-    const free = WAKEUP_SLOTS.find((s) => !held.has(s));
+    const free = wakeupSlots().find((s) => !held.has(s));
     let slot = free;
     let replaced = null;
 
@@ -428,7 +516,10 @@ async function dryRun({ sessions = 5, atHour = 13 } = {}) {
     const paced = await computePace(d.trading_date, atHour);
     const paceBy = new Map(paced.map((p) => [p.symbol, p.pace]));
     const fired = moves.filter((m) => movementVerdict(m, paceBy.get(m.symbol) ?? null, budgetKd).fires);
-    out.push({ day: clock.toDay ? clock.toDay(d.trading_date) : String(d.trading_date).slice(0, 10),
+    // S13 · this was `clock.toDay ? clock.toDay(...) : ...`. clock has never
+    // exported toDay, so the guard was permanently false and only made the
+    // reader think there was a second path. The slice IS the path.
+    out.push({ day: String(d.trading_date).slice(0, 10),
       examined: moves.length, fired: fired.length, symbols: fired.map((f) => f.symbol) });
   }
   const avg = out.length ? out.reduce((s, r) => s + r.fired, 0) / out.length : 0;
@@ -439,5 +530,5 @@ async function dryRun({ sessions = 5, atHour = 13 } = {}) {
 module.exports = {
   scan, computePace, computeMovement, movementVerdict, dryRun, currentBudgetKd,
   currentHolders, holderPaces, slottedSymbols,
-  PACE_MIN, TRADES_MIN, WAKEUP_SLOTS,
+  PACE_MIN, TRADES_MIN, wakeupSlots,
 };

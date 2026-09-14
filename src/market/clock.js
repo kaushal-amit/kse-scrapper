@@ -18,6 +18,9 @@
  */
 
 const { config } = require('../config');
+// Required lazily inside the predicate would be cleaner for the cycle, but the
+// cycle does not exist: holidays requires db/pool and logger only.
+const holidays = require('./holidays');
 
 const TZ = config.market.timezone;
 
@@ -78,8 +81,33 @@ function localTime(date = new Date()) {
   return `${String(p.hour).padStart(2, '0')}:${String(p.minute).padStart(2, '0')}`;
 }
 
+/**
+ * A trading day is a configured weekday that is ALSO not a holiday.
+ *
+ * 040 · the weekday rule is not the whole calendar. On an Eid the exchange is
+ * shut on a weekday, and without this the AWSAT jobs log in — spending one of
+ * the day's two attempts on a terminal with nothing to show — and the nightly
+ * computes write a symbol_day row built from no captures, which looks like
+ * every other row and is made of nothing.
+ *
+ * The calendar is loaded at boot. When none is loaded isHoliday is false for
+ * every day, so this is exactly the old behaviour; the boot warns about that
+ * rather than this predicate guessing.
+ */
 function isTradingDay(date = new Date()) {
-  return config.market.tradingDays.includes(parts(date).weekdayIndex);
+  if (!config.market.tradingDays.includes(parts(date).weekdayIndex)) return false;
+  return !holidays.isHoliday(tradingDay(date));
+}
+
+/**
+ * S8 · is `date` before the SIGNAL window's end?
+ *
+ * The signal jobs raise alerts a human acts on; capture keeps running to the
+ * close because the closing prints are data. Separating the two is the whole
+ * point of SIGNALS_END_TIME.
+ */
+function isBeforeSignalsEnd(date = new Date()) {
+  return parts(date).minutesOfDay < config.market.signalsEndMinutes;
 }
 
 /**
@@ -137,6 +165,7 @@ function minuteBucket(date = new Date()) {
 module.exports = {
   parts,
   tradingDay,
+  isBeforeSignalsEnd,
   localTime,
   isTradingDay,
   isWithinWindow,

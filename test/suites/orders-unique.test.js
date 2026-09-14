@@ -5,7 +5,7 @@ const repo=require('../../src/db/repositories');
 const db=require('../../src/db/pool');
 let p=0,n=0;const ck=(t,c,x)=>{n++;if(c)p++;else console.log('  FAIL:',t,JSON.stringify(x))};
 (async()=>{
-  await db.query("delete from awsat_order_list where order_id like 'UQ-%'");
+  await db.query("delete from awsat_order_obs where order_id like 'UQ-%'");
   const day='2026-08-25';
   const mk=(id,status,filled,at)=>({order_id:id,symbol:'ABAR',side:'BUY',order_status:status,
     price:176,quantity:1000,filled_quantity:filled,remaining_qty:1000-filled,
@@ -52,7 +52,7 @@ let p=0,n=0;const ck=(t,c,x)=>{n++;if(c)p++;else console.log('  FAIL:',t,JSON.st
   const r=await repo.insertOrders([{symbol:'ABAR',side:'BUY',trading_date:day,created_at:new Date()}]);
   ck('id-less order dropped', r.inserted===0, r);
 
-  await db.query("delete from awsat_order_list where order_id like 'UQ-%'");
+  await db.query("delete from awsat_order_obs where order_id like 'UQ-%'");
   console.log(`\norders uniqueness: ${p}/${n}`);
   await db.close(); process.exit(p===n?0:1);
 })().catch(async e=>{console.error('CRASH:',e.message);await db.close();process.exit(1)});

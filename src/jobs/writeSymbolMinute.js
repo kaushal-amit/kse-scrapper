@@ -24,10 +24,14 @@ const clock = require('../market/clock');
 const log = require('../logger');
 
 /** Both sides above this and nothing trading is FROZEN. */
-const BIG_QTY = Number(process.env.SIG_BIG_QTY || 100_000);
+// F-12 · the SAME source signals.js reads. These used to be defined here as
+// their own literals, so setting one and not the other made
+// symbol_minute.is_frozen and signals.frozen() disagree about "big" in the
+// same row — and is_frozen is the one persisted for the backend.
+const BIG_QTY = require('../config/thresholds').get('sig_big_qty');
 
 /** A wall is size at a price level worth noticing. */
-const WALL_QTY = Number(process.env.SIG_WALL_QTY || 200_000);
+const WALL_QTY = require('../config/thresholds').get('sig_wall_qty');
 
 const num = (v) => (v === null || v === undefined ? null : Number(v));
 

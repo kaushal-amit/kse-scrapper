@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AWSAT / DirectFN — Server 1 Capture
 // @namespace    local.trading.tools
-// @version      2.3.0
+// @version      2.4.0
 // @description  Reads the price socket in the page's own context and submits quotes, depth and orders to Server 1. No second login, no refresh, no scrolling. Credentials never leave the browser.
 // @match        *://*.awsatbroker.com/*
 // @match        *://awsatbroker.com/*
@@ -30,7 +30,7 @@
   // ── CONFIG ────────────────────────────────────────────────────────────────
   // The running build, shown on the panel: two scripts both reporting
   // 2.0.0 cost a session diagnosing a bug that was already fixed.
-  var VERSION = '2.3.0';
+  var VERSION = '2.4.0';
 
   var SERVER      = 'https://scrapper.99labs.space'; // Server 1 base URL
   var TOKEN       = 'CHANGE-ME';                    // must equal INGEST_TOKEN
@@ -410,7 +410,37 @@
     });
   }
 
+  var SCRIPT_NAME = 'awsat-capture';
+
+  /*
+   * P2 · AN UNEDITED TOKEN REFUSES, LOUDLY, INSTEAD OF 401-LOOPING.
+   *
+   * This ships 'CHANGE-ME' while awsat-orders and awsat-depth-all ship the real
+   * default. A tab installed and not edited posts with a token the server
+   * rejects — and 401 is deliberately retryable, so the retry queue fills to
+   * MAX_RETRY_QUEUE and then DROPS THE OLDEST MINUTE, every minute. The
+   * heartbeat 401s too, so the server sees nothing at all: not a broken client,
+   * not a silent one, nothing. It looks exactly like a tab that was never
+   * opened.
+   *
+   * A configuration that cannot work should say so once, not fail invisibly
+   * four hundred times.
+   */
+  var TOKEN_PLACEHOLDER = TOKEN === 'CHANGE-ME' || !TOKEN;
+  if (TOKEN_PLACEHOLDER) {
+    try {
+      console.error('[%s] TOKEN is still "%s" — edit it to match INGEST_TOKEN on '
+        + 'the server. NOTHING will be posted until you do.', SCRIPT_NAME, TOKEN);
+    } catch (e) {}
+  }
+
   function post(kind, body) {
+    if (TOKEN_PLACEHOLDER) {
+      stats.lastResult = 'NOT POSTING — TOKEN is still CHANGE-ME. Edit it to '
+        + 'match INGEST_TOKEN on the server.';
+      refresh();
+      return Promise.resolve();
+    }
     // The batchId is created ONCE and kept across retries. Regenerating it
     // would make every retry look like new data to the server and defeat the
     // idempotency this depends on.
@@ -452,7 +482,43 @@
       refresh(); return;
     }
     heartbeat(records.length, null);            // alive, with N symbols
-    post('quotes', { capturedAt: new Date().toISOString(), source: 'awsat_client', records: records });
+
+    /*
+     * P2 · THE UNMATCHED LIST IS SENT, AND THE MASTER IS RE-FETCHED ON IT.
+     *
+     * Two dead paths for one failure mode, and it is the failure mode this file
+     * was written for.
+     *
+     * 1 · The POST omitted `unmatched` entirely. The SERVER reads
+     *     body.unmatched and marks those instruments UNMATCHED — the path
+     *     test/suites/unmatched-reporting.test.js proves end to end. It had no
+     *     producer. The server's own comment on that handler reads: "The panel
+     *     showed 'unmatched: 11' and nobody read it. A number in a UI…" — and
+     *     this client still put it only in the panel.
+     *
+     * 2 · maybeRefetchMaster's documented ON UNMATCHED trigger — "a symbol
+     *     arrives the master does not know. Precise, and it self-heals within
+     *     one poll" — had no call site. Only the 30-minute periodic timer
+     *     called it, and with NO symbols, so `novel` was always empty and
+     *     permanentlyUnmatched was never written: wholly dead code.
+     *
+     * ABAR, ACICO, NIND and SOKOUK sat in exactly this state for eight days.
+     * Their quotes arrived on the socket, the master did not know them, they
+     * were dropped — and recovery waited up to thirty minutes per occurrence
+     * instead of one poll, with instruments.broker_status never set, so the
+     * loss was invisible in the database and to /health. Visible only to
+     * somebody reading a number on a browser panel.
+     */
+    var missing = [];
+    unmatched.forEach(function (s) { missing.push(s); });
+    if (missing.length) maybeRefetchMaster('unmatched', missing);
+
+    post('quotes', {
+      capturedAt: new Date().toISOString(),
+      source: 'awsat_client',
+      records: records,
+      unmatched: missing,
+    });
   }
   setInterval(cycle, POST_EVERY_MS);
 

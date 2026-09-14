@@ -24,9 +24,26 @@ const log = require('../logger');
 const SOURCE = 'tradingview';
 
 /** Chart URL for a symbol. Overridable for a different exchange prefix. */
+/**
+ * F-18 · THE INTERVAL IS PINNED, AND THE ROWS ARE CHECKED.
+ *
+ * The URL carried no interval, so the chart opened on whatever the saved layout
+ * held. This file's own header records having seen exactly that — it describes a
+ * thead group row reading "Date·1m".
+ *
+ * On a 1-minute chart the failure is silent and total: `dateText` is "09:31",
+ * parseRowDate cannot match it, rowDay falls through to the epoch, and every
+ * minute of a session yields the same day string. buildDailyRows' dedupe then
+ * keeps ONE ARBITRARY MINUTE BAR per day and writes it as that day's OHLCV —
+ * open ≈ high ≈ low ≈ close, volume one minute's — and stamps it
+ * session_finalised_at. Nothing errors; the row count looks healthy.
+ */
+const INTERVAL = process.env.TRADINGVIEW_INTERVAL || '1D';
+
 function chartUrl(symbol) {
   const prefix = process.env.TRADINGVIEW_EXCHANGE || 'KSE';
-  return `https://www.tradingview.com/chart/?symbol=${encodeURIComponent(`${prefix}:${symbol}`)}`;
+  return `https://www.tradingview.com/chart/?symbol=${encodeURIComponent(`${prefix}:${symbol}`)}`
+    + `&interval=${encodeURIComponent(INTERVAL)}`;
 }
 
 /**

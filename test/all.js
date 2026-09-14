@@ -24,6 +24,7 @@ try { require('dotenv').config(); } catch { /* dotenv optional */ }
 const { spawnSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
+const { requireTestDb } = require('./dbguard');
 
 const SUITES = path.join(__dirname, 'suites');
 
@@ -90,6 +91,16 @@ function run(file) {
 }
 
 function main() {
+  /*
+   * S-01 · REFUSE the trading database, once, for the whole run.
+   *
+   * Every suite below spawns its own process, so a per-suite guard is checked
+   * dozens of times and, more to the point, only AFTER the runner has already
+   * started work. Checking here means `npm test` pointed at `kse` stops before
+   * a single row is touched, and names the database it refused.
+   */
+  requireTestDb('npm test');
+
   const files = fs.existsSync(SUITES)
     ? fs.readdirSync(SUITES).filter((f) => f.endsWith('.test.js')).sort()
     : [];

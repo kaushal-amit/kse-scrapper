@@ -70,11 +70,14 @@ const CLOSING_SESSIONS = new Set([
   'Trading', 'Close Auction Acceptance', 'Trading at Last', 'Close-Of-Day',
 ]);
 
-const TINY_SHARES = Number(process.env.SD_TINY_SHARES || 100);
-const AT_OFFER_INVALIDATES_RATIO = Number(process.env.SD_AT_OFFER_MAX || 90);
-const THIN_ABSOLUTE_MINUTES = Number(process.env.SD_THIN_MINUTES || 60);
-const THIN_MEDIAN_FRACTION = Number(process.env.SD_THIN_FRACTION || 0.80);
-const CRAWLER_MAX_PRICE = Number(process.env.SD_CRAWLER_MAX_PX || 100);
+const T = require('../config/thresholds');
+
+// F-12 · the same concept as signals.js's tiny print, so the same key.
+const TINY_SHARES = T.get('sig_tiny_trade_shares');
+const AT_OFFER_INVALIDATES_RATIO = T.get('sd_at_offer_invalidates_pct');
+const THIN_ABSOLUTE_MINUTES = T.get('sd_thin_absolute_minutes');
+const THIN_MEDIAN_FRACTION = T.get('sd_thin_median_fraction');
+const CRAWLER_MAX_PRICE = T.get('sd_crawler_max_price_fils');
 
 const n = (v) => {
   if (v === null || v === undefined || v === '') return null;
@@ -218,6 +221,8 @@ function movementBlock(rows) {
   let boughtAtOffer = 0;
   let soldAtBid = 0;
   let insideSpread = 0;
+  let insideSpreadSteps = 0;   // steps with a readable book, priced between
+  let unbookedSteps = 0;      // steps whose book did not render at all
 
   for (const { prev, now, traded } of steps) {
     const before = n(prev.last_price);
@@ -246,6 +251,18 @@ function movementBlock(rows) {
       soldAtBid += traded;
     } else {
       insideSpread += traded;
+      /*
+       * P2 · A STEP WHOSE BOOK WE COULD NOT READ IS NOT A STEP INSIDE THE
+       * SPREAD.
+       *
+       * This branch catches both: a print genuinely between the bid and the
+       * offer, and a step where bid/offer (or the price itself) did not render
+       * at all — a halt, pre-open, a limit, a short capture. They are counted
+       * apart now, because one belongs in the pct_at_offer denominator and the
+       * other cannot.
+       */
+      if (after !== null && bid !== null && offer !== null) insideSpreadSteps += 1;
+      else unbookedSteps += 1;
     }
 
     if (before === null || after === null) continue;
@@ -265,7 +282,33 @@ function movementBlock(rows) {
   }
 
   const pct = (a, b) => (b ? Number(((100 * a) / b).toFixed(4)) : null);
-  const priced = atOffer + atBid + (steps.length - atOffer - atBid);
+
+  /*
+   * P2 · THE DENOMINATOR IS THE STEPS WHOSE BOOK WAS ACTUALLY READ.
+   *
+   * It was `atOffer + atBid + (steps.length - atOffer - atBid)`, which reduces
+   * algebraically to steps.length. The name `priced` and the tautological
+   * arithmetic both say a measured denominator was intended and never arrived.
+   *
+   * A step with no book falls into the else branch above and used to be counted
+   * as inside the spread. It can never reach the atOffer numerator, and it was
+   * in the denominator.
+   *
+   * WHAT THAT COST. A symbol sitting at the offer on every step where the book
+   * WAS read, with half the day's steps unbooked, reported pct_at_offer 50
+   * instead of ~100. buySellRatio() then does not trip
+   * sd_at_offer_invalidates_pct, and publishes the ratio TMI rule 5 exists to
+   * refuse — and because the STORED pct_at_offer is 50, migration 013's
+   * symbol_day_ratio_invalid_at_offer CHECK accepts the row as well. The
+   * database-level enforcement is defeated by the same wrong number it is
+   * enforcing on.
+   *
+   * shares_inside_spread still carries the unbooked VOLUME. "We could not see
+   * where this traded" is not "it traded at the offer", and that column is
+   * descriptive rather than a gate — but unbooked_steps is reported beside it
+   * so the shortfall is visible rather than inferred.
+   */
+  const priced = atOffer + atBid + insideSpreadSteps;
 
   return {
     moves,
@@ -283,6 +326,9 @@ function movementBlock(rows) {
     bought_at_offer: boughtAtOffer,
     sold_at_bid: soldAtBid,
     shares_inside_spread: insideSpread,
+    // P2 · what the pct_at_offer denominator is, and what it had to leave out.
+    priced_steps: priced,
+    unbooked_steps: unbookedSteps,
     trades_at_offer: atOffer,
     trades_at_bid: atBid,
     pct_at_offer: pct(atOffer, priced),
@@ -315,7 +361,12 @@ function movementBlock(rows) {
  * is the moves_2plus mistake, where the name said one thing and the rule did
  * another.
  */
-const SESSION_MIDPOINT_MIN = 11 * 60 + 15;     // 11:15 Kuwait
+// F-12 · a CLOCK TIME, and it was written as arithmetic on literals — wrong
+// the moment the session's hours change, which END_TIME has already done once.
+const SESSION_MIDPOINT_MIN = (() => {
+  const hhmm = T.get('sd_session_midpoint_hhmm');
+  return Math.floor(hhmm / 100) * 60 + (hhmm % 100);
+})();     // 11:15 Kuwait
 
 function flowBlock(rows) {
   const steps = volumeSteps(rows);
@@ -389,7 +440,11 @@ function rangeSource(rows) {
     const k = new Date(new Date(r.created_at).getTime() + 3 * 3600_000);
     return k.getUTCHours() * 60 + k.getUTCMinutes();
   }));
-  return latest >= 13 * 60 + 10 ? 'FULL' : 'SHORT';
+  const fullAt = (() => {
+    const hhmm = T.get('sd_range_full_hhmm');
+    return Math.floor(hhmm / 100) * 60 + (hhmm % 100);
+  })();
+  return latest >= fullAt ? 'FULL' : 'SHORT';
 }
 
 /**

@@ -57,10 +57,24 @@ function run(file, html, ms = 9000) {
   ck('both sells are read, one filled one cancelled', sells.length === 2
      && sells.some((r) => r.status === 'Filled') && sells.some((r) => r.status === 'Cancelled'), sells.map((r) => r.status));
 
+  /*
+   * 2.8.0 · the key is SYMBOL · SIDE · STAMP. Price and quantity were in it and
+   * are gone, because they are exactly what an AMEND changes: amending a
+   * resting order used to change its synthetic id, so the server saw one id
+   * stop being reported and another appear — one order abandoned mid-life and
+   * another born at the amended price, two rows where the trader has one. The
+   * abandoned one then read UNSEEN and stopped protecting its slot while still
+   * live.
+   */
   ck('the same order yields the SAME id on a second read (stable → de-duped)',
      (() => { const first = orders.find((r) => r.status === 'Cancelled');
-       return first && first.orderId === 'syn:EQUIPMENT|Sell|187|3,310|08-09-202610:42:39'; })(),
+       return first && first.orderId === 'syn:EQUIPMENT|Sell|08-09-202610:42:39'; })(),
      orders.find((r) => r.status === 'Cancelled') && orders.find((r) => r.status === 'Cancelled').orderId);
+
+  ck('the id carries NO price — an amend must keep its id',
+     orders.every((r) => !/\|187\||\|188\|/.test(r.orderId)), orders.map((r) => r.orderId));
+  ck('and no quantity either',
+     orders.every((r) => !/3,310|3,500/.test(r.orderId)), orders.map((r) => r.orderId));
 
   ck('the panel does not read "empty"', !/active and empty|waiting for the order list/.test(o.panel || ''), o.panel);
 

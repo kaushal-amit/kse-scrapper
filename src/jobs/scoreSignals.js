@@ -54,7 +54,21 @@ const MODE = {
   FROZEN: 'still',
 };
 
-const MIN_MOVE_FILS = Number(process.env.SCORE_MIN_MOVE_FILS || 1);
+/**
+ * How far past the target a capture may be and still answer the question.
+ *
+ * The grid is ~60 s, so a few minutes of tolerance absorbs an ordinary gap. A
+ * capture 40 minutes late is not "the price 5 minutes later" by any reading,
+ * and treating it as one is how a quiet hour becomes a measured move.
+ */
+const FORWARD_TOLERANCE_MIN = require('../config/thresholds').get('score_forward_tolerance_min');
+
+/** The Kuwait trading day a signal's timestamp belongs to. */
+function tradingDayOf(at) {
+  return clock.tradingDay(at instanceof Date ? at : new Date(at));
+}
+
+const MIN_MOVE_FILS = require('../config/thresholds').get('score_min_move_fils');
 
 /** Grade one horizon's price against the signal's claim. null = not gradable. */
 function grade(base, px, mode) {
@@ -67,11 +81,30 @@ function grade(base, px, mode) {
 }
 
 /**
- * The price a given number of minutes after a moment.
+ * The price a given number of minutes after a moment, WITHIN THE SAME SESSION.
  *
  * The FIRST capture at or after the target, not the nearest — "the price five
  * minutes later" must not be satisfied by a print from four minutes later
  * because it happens to be closer.
+ *
+ * F-15 · BOUNDED TO THE SIGNAL'S OWN TRADING DAY, AND TO A WINDOW.
+ *
+ * Neither query used to bound the forward search at all. A signal firing at
+ * 13:05 with a 60-minute horizon looked for the first capture at or after
+ * 14:05 — and continuous trading ends at 13:30, so it returned the NEXT
+ * SESSION'S OPENING PRINT. On a Thursday that is three calendar days and a
+ * weekend later, gap included.
+ *
+ * `was_right` then recorded a win that measures an overnight gap rather than a
+ * 60-minute book signal. And because halts cluster late in the session, this
+ * preferentially corrupted the HALT_RESUME family — the one setup the strategy
+ * is actually built on. These numbers are the evidence base for deciding
+ * whether any of these signals work at all.
+ *
+ * A signal whose horizon runs past the close is NOT COMPUTED. That is the
+ * honest answer: the session ended before the question could be asked, and a
+ * cross-session price is not a late answer to it — it is an answer to a
+ * different question.
  */
 async function priceAfter(symbol, from, minutes) {
   // symbol_minute FIRST — it is the finest grid, but it exists only for the 8–17
@@ -80,18 +113,28 @@ async function priceAfter(symbol, from, minutes) {
   // forward price was never filled (1 of 15 WAKEUP rows). Fall back to the
   // board-wide awsat_market_quotes (~60 s, every symbol) so every signal gets a
   // forward price.
+  //
+  // Both are bounded the same way: at or after the target, on the SAME trading
+  // day, and within a tolerance of the target so a long capture gap does not
+  // silently answer with a much later print.
   const { rows } = await query(
     `SELECT last_price FROM symbol_minute
-      WHERE symbol = $1 AND ts >= $2::timestamptz + ($3 || ' minutes')::interval
+      WHERE symbol = $1
+        AND ts >= $2::timestamptz + ($3 || ' minutes')::interval
+        AND ts <  $2::timestamptz + (($3::int + $5::int) || ' minutes')::interval
+        AND trading_date = $4::date
         AND last_price IS NOT NULL
-      ORDER BY ts ASC LIMIT 1`, [symbol, from, minutes],
+      ORDER BY ts ASC LIMIT 1`, [symbol, from, minutes, tradingDayOf(from), FORWARD_TOLERANCE_MIN],
   );
   if (rows.length) return Number(rows[0].last_price);
   const { rows: q } = await query(
     `SELECT last_price FROM awsat_market_quotes
-      WHERE symbol = $1 AND created_at >= $2::timestamptz + ($3 || ' minutes')::interval
+      WHERE symbol = $1
+        AND created_at >= $2::timestamptz + ($3 || ' minutes')::interval
+        AND created_at <  $2::timestamptz + (($3::int + $5::int) || ' minutes')::interval
+        AND trading_date = $4::date
         AND last_price IS NOT NULL AND last_price > 0
-      ORDER BY created_at ASC LIMIT 1`, [symbol, from, minutes],
+      ORDER BY created_at ASC LIMIT 1`, [symbol, from, minutes, tradingDayOf(from), FORWARD_TOLERANCE_MIN],
   );
   return q.length ? Number(q[0].last_price) : null;
 }

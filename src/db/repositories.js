@@ -362,6 +362,10 @@ async function insertDepth(levels) {
 const ORDER_COLUMNS = [
   'order_id', 'symbol', 'side', 'order_status', 'price', 'quantity',
   'filled_quantity', 'remaining_qty', 'order_time', 'trading_date',
+  // 039 · observed_at is WHEN this sighting was made, and with order_id and
+  // ingest_source it is the observation's identity. The three legacy
+  // timestamps stay because the table still carries the columns.
+  'observed_at',
   'ingest_source', 'run_id', 'created_at', 'first_seen_at', 'last_seen_at',
   // Added by 014. net_value is the P&L number.
   'avg_price', 'order_value', 'net_value', 'status_reason', 'raw',
@@ -376,8 +380,10 @@ const ORDER_COLUMNS = [
  * sighting for ever and never learn that an order filled. An order's status is
  * the whole point of watching it, so a later sighting must win.
  *
- * created_at and first_seen_at are preserved from the original row; everything
- * that can change is taken from the new sighting.
+ * 039 · That rule now lives in the awsat_order_list VIEW (latest non-null wins
+ * per column), and this function APPENDS one row per sighting to
+ * awsat_order_obs. Nothing is updated, so nothing can be lost by an UPDATE
+ * clause that was wrong on one path.
  */
 async function insertOrders(orders) {
   if (!orders.length) return { offered: 0, inserted: 0, rejected: 0 };
@@ -391,102 +397,89 @@ async function insertOrders(orders) {
     if (!o.order_id || seen.has(o.order_id)) continue;
     seen.add(o.order_id);
     const at = o.created_at || new Date();
+    // 039 · observed_at is the sighting's own instant and part of the
+    // observation's identity. It is taken from last_seen_at when the caller
+    // supplied one — that is the capture time the ingest path already carries —
+    // so a replayed batch lands on the same key and is a no-op.
     rows.push({
       ...o,
       ingest_source: o.ingest_source || 'awsat_server',
       created_at: at,
       first_seen_at: at,
-      last_seen_at: at,
+      last_seen_at: o.last_seen_at || at,
+      observed_at: o.observed_at || o.last_seen_at || at,
     });
   }
   if (!rows.length) return { offered: orders.length, inserted: 0, rejected: 0 };
 
   const cols = ORDER_COLUMNS.join(', ');
-  const values = [];
-  const tuples = rows.map((row, r) => {
-    const ph = ORDER_COLUMNS.map((c, i) => {
-      values.push(row[c] === undefined ? null : row[c]);
-      return `$${r * ORDER_COLUMNS.length + i + 1}`;
-    });
-    return `(${ph.join(', ')})`;
-  });
 
-  try {
-    const res = await query(
-      `INSERT INTO awsat_order_list (${cols}) VALUES ${tuples.join(', ')}
-       ON CONFLICT (order_id) DO UPDATE SET
-         symbol          = COALESCE(EXCLUDED.symbol, awsat_order_list.symbol),
-         side            = COALESCE(EXCLUDED.side, awsat_order_list.side),
-         order_status    = EXCLUDED.order_status,
-         price           = EXCLUDED.price,
-         quantity        = EXCLUDED.quantity,
-         filled_quantity = EXCLUDED.filled_quantity,
-         remaining_qty   = EXCLUDED.remaining_qty,
-         order_time      = COALESCE(EXCLUDED.order_time, awsat_order_list.order_time),
-         ingest_source   = EXCLUDED.ingest_source,
-         run_id          = EXCLUDED.run_id,
-         avg_price       = COALESCE(EXCLUDED.avg_price, awsat_order_list.avg_price),
-         order_value     = COALESCE(EXCLUDED.order_value, awsat_order_list.order_value),
-         -- net_value is the P&L. COALESCE so a later sighting that omits it
-         -- cannot erase a value already captured.
-         net_value       = COALESCE(EXCLUDED.net_value, awsat_order_list.net_value),
-         status_reason   = COALESCE(EXCLUDED.status_reason, awsat_order_list.status_reason),
-         code            = COALESCE(EXCLUDED.code, awsat_order_list.code),
-         order_type      = COALESCE(EXCLUDED.order_type, awsat_order_list.order_type),
-         exchange        = COALESCE(EXCLUDED.exchange, awsat_order_list.exchange),
-         portfolio       = COALESCE(EXCLUDED.portfolio, awsat_order_list.portfolio),
-         raw             = COALESCE(EXCLUDED.raw, awsat_order_list.raw),
-         -- EXECUTIONS, derived from what we actually observe.
-         --
-         -- The order grid does not report a fill count, but it does report the
-         -- filled quantity — so every time that RISES between sightings, one
-         -- more execution has happened. The settlement fee is per execution,
-         -- so this number is the difference between 1.680 and 2.285 on a
-         -- 6,100-share sell that filled as 5,350 + 750.
-         executions_observed = CASE
-           WHEN EXCLUDED.filled_quantity IS NOT NULL
-            AND awsat_order_list.filled_quantity IS NOT NULL
-            AND EXCLUDED.filled_quantity > awsat_order_list.filled_quantity
-           THEN COALESCE(awsat_order_list.executions_observed, 1) + 1
-           ELSE COALESCE(awsat_order_list.executions_observed, 1)
-         END,
-         -- first_seen_at and created_at keep the ORIGINAL sighting.
-         last_seen_at    = EXCLUDED.last_seen_at,
-         sighting_count  = awsat_order_list.sighting_count + 1,
-         updated_at      = now()
-       RETURNING order_id`,
-      values,
-    );
-    return { offered: orders.length, inserted: res.rowCount, rejected: 0 };
-  } catch (err) {
-    // Same reasoning as insertMany: one bad order must not lose the rest.
-    log.warn('order batch failed — retrying row by row', { rows: rows.length, err: err.message });
-    let inserted = 0;
-    let rejected = 0;
-    for (const row of rows) {
-      try {
-        const one = await query(
-          `INSERT INTO awsat_order_list (${cols})
-           VALUES (${ORDER_COLUMNS.map((_, i) => `$${i + 1}`).join(', ')})
-           ON CONFLICT (order_id) DO UPDATE SET
-             order_status = EXCLUDED.order_status,
-             filled_quantity = EXCLUDED.filled_quantity,
-             remaining_qty = EXCLUDED.remaining_qty,
-             last_seen_at = EXCLUDED.last_seen_at,
-             sighting_count = awsat_order_list.sighting_count + 1,
-             updated_at = now()`,
-          ORDER_COLUMNS.map((c) => (row[c] === undefined ? null : row[c])),
-        );
-        inserted += one.rowCount;
-      } catch (rowErr) {
-        rejected += 1;
-        log.error('order rejected by the database', {
-          reason: rowErr.message, row: JSON.stringify(row).slice(0, 300),
-        });
+  /*
+   * 039 · APPEND, do not upsert.
+   *
+   * Orders are written to awsat_order_obs, one row per SIGHTING;
+   * awsat_order_list is now a VIEW deriving each order's latest state,
+   * sighting_count and executions_observed from those rows.
+   *
+   * The twenty-column ON CONFLICT clause this replaced was the fragile part of
+   * the old design: executions_observed is the per-execution settlement fee
+   * multiplier — it is money — and it was accumulated by an UPDATE that had to
+   * be correct on every path, every time. It was not: the row-by-row fallback
+   * omitted net_value and executions_observed entirely, so a single bad row in
+   * a batch left the rest with a stale P&L and an under-counted fee, with
+   * nothing left on the table to recompute them from. Derived from
+   * observations, a wrong reading is a wrong ROW, and the row next to it still
+   * says what was true.
+   *
+   * ON CONFLICT DO NOTHING on (order_id, observed_at, ingest_source): the same
+   * order, observed at the same instant, by the same collector, is the same
+   * observation — so a replayed batch is a no-op rather than a duplicate.
+   */
+  const size = chunkSize(ORDER_COLUMNS.length);
+  let inserted = 0;
+  let rejected = 0;
+
+  for (let off = 0; off < rows.length; off += size) {
+    const slice = rows.slice(off, off + size);
+    const values = [];
+    const tuples = slice.map((row, r) => {
+      const ph = ORDER_COLUMNS.map((c, i) => {
+        values.push(row[c] === undefined ? null : row[c]);
+        return `$${r * ORDER_COLUMNS.length + i + 1}`;
+      });
+      return `(${ph.join(', ')})`;
+    });
+
+    try {
+      const res = await query(
+        `INSERT INTO awsat_order_obs (${cols}) VALUES ${tuples.join(', ')}
+         ON CONFLICT (order_id, observed_at, ingest_source) DO NOTHING`,
+        values,
+      );
+      inserted += res.rowCount;
+    } catch (err) {
+      // Same reasoning as insertMany: one bad order must not lose the rest.
+      log.warn('order chunk failed — retrying row by row', { rows: slice.length, err: err.message });
+      for (const row of slice) {
+        try {
+          const one = await query(
+            `INSERT INTO awsat_order_obs (${cols})
+             VALUES (${ORDER_COLUMNS.map((_, i) => `$${i + 1}`).join(', ')})
+             ON CONFLICT (order_id, observed_at, ingest_source) DO NOTHING`,
+            ORDER_COLUMNS.map((c) => (row[c] === undefined ? null : row[c])),
+          );
+          inserted += one.rowCount;
+        } catch (rowErr) {
+          rejected += 1;
+          log.error('order rejected by the database', {
+            reason: rowErr.message, row: JSON.stringify(row).slice(0, 300),
+          });
+        }
       }
     }
-    return { offered: orders.length, inserted, rejected };
   }
+
+  return { offered: orders.length, inserted, rejected };
 }
 
 // ─── daily history ──────────────────────────────────────────────────────────

@@ -1,4 +1,5 @@
 'use strict';
+const T = require('../config/thresholds');
 /**
  * src/jobs/marketDayMetrics.js — the market-wide arithmetic, no database.
  *
@@ -37,23 +38,63 @@ function breadth(rows) {
   const traded = rows.length;
   const directional = advancing + declining;
 
+  /*
+   * H-J · THE DENOMINATOR IS THE SYMBOLS THAT WERE MEASURED.
+   *
+   * It was `traded` — rows.length — which INCLUDES the noPrev symbols. Those
+   * have no previous close, so this function's own rule (stated above) excludes
+   * them from advancing, declining and unchanged alike: they can never appear
+   * in the numerator. Dividing by them is dividing by symbols whose direction
+   * nobody measured.
+   *
+   * The effect is one-directional and it is a downgrade: every unmeasurable
+   * symbol pushes pct_advancing toward zero and the regime toward RISK_OFF. The
+   * day after a gap in the capture — exactly when a lot of symbols lack a
+   * previous close — the market reads risk-off because the capture was down,
+   * and the session gate then says do not trade.
+   *
+   * `unchanged` STAYS in the denominator. That is the calibration: 24 of 136 is
+   * the 17.6% quoted all month, and a day where 60 rise, 50 fall and 26 sit
+   * still is not a risk-on day. What changes is only that symbols with no
+   * measurement at all stop counting as if they had sat still.
+   */
+  const measured = advancing + declining + unchanged;
+
+  /*
+   * And below a floor of measured symbols the percentage is NOT COMPUTED at
+   * all. A breadth reading over eleven stocks carries the same column and the
+   * same authority as one over 136, and nothing downstream can tell them apart
+   * — so the one that cannot describe the market says so instead.
+   */
+  const enough = traded > 0
+    && (measured / traded) >= T.get('md_breadth_min_measured_frac');
+
   return {
     symbols_traded: traded,
     advancing,
     declining,
     unchanged,
     no_prev_close: noPrev,
+    /** How many symbols the percentages below are actually computed over. */
+    measured_symbols: measured,
     /**
-     * THE GATE, on the FULL denominator.
+     * THE GATE, over every symbol whose direction was MEASURED.
      *
-     * 24 of 136 is 17.6%, which is the 18% quoted all month and the number the
-     * thresholds were set against. The alternative — advancing over
-     * advancing+declining — discards the symbols that did not move, and a day
-     * where 60 rise, 50 fall and 26 sit still is not a risk-on day.
+     * `unchanged` is in the denominator and stays there — that is the
+     * calibration the regime cutoffs were set against. The alternative,
+     * advancing over advancing+declining, discards the symbols that did not
+     * move, and a day where 60 rise, 50 fall and 26 sit still is not a risk-on
+     * day. It is kept beside this as pct_advancing_ratio for comparison.
+     *
+     * The 18% quoted all month was 24 of 136 on 17 August. Eight of those 136
+     * had no previous close, so the honest figure for that session is 24 of
+     * 128 — 18.75%. One point, on a day whose capture was good; the correction
+     * is much larger on the day after a gap, which is precisely when this
+     * number gets read.
      */
-    pct_advancing: traded ? Number(((100 * advancing) / traded).toFixed(4)) : null,
+    pct_advancing: enough ? Number(((100 * advancing) / measured).toFixed(4)) : null,
     /** Stored for comparison only. regime is decided by pct_advancing. */
-    pct_advancing_ratio: directional
+    pct_advancing_ratio: (enough && directional)
       ? Number(((100 * advancing) / directional).toFixed(4)) : null,
     thin_symbols: rows.filter((r) => r.data_quality === 'THIN').length,
   };
@@ -125,7 +166,8 @@ function over3xDaily(rows, trailing) {
     // No history, or an average of zero, makes the multiple unknowable rather
     // than infinite — a symbol with no past would otherwise fire every day.
     if (today === null || !avg || avg <= 0) continue;
-    if (today >= 3 * avg) count += 1;
+    // F-12 · the multiple in the column's own name, read from the file.
+    if (today >= T.get('md_over_multiple') * avg) count += 1;
   }
   return count;
 }
@@ -154,8 +196,10 @@ function volumeVs20d(todayVolume, priorVolumes) {
  */
 function regimeOf(pctAdvancing) {
   if (pctAdvancing === null || pctAdvancing === undefined) return null;
-  if (pctAdvancing < 35) return 'RISK_OFF';
-  if (pctAdvancing <= 50) return 'NEUTRAL';
+  // F-12 · market_day.regime is read by the trading backend. Its two cutoffs
+  // were literals here with no provenance.
+  if (pctAdvancing < T.get('md_regime_risk_off_pct')) return 'RISK_OFF';
+  if (pctAdvancing <= T.get('md_regime_neutral_pct')) return 'NEUTRAL';
   return 'RISK_ON';
 }
 

@@ -7,7 +7,15 @@ let p=0,n=0;const ck=(t,c,x)=>{n++;if(c)p++;else console.log('  FAIL:',t,x===und
 (async()=>{
   // --- parsing ported from production ---
   ck('symbol "ABAR - 101" split', JSON.stringify(awsat.parseSymbol('ABAR - 101'))==='{"symbol":"ABAR","code":"101"}', awsat.parseSymbol('ABAR - 101'));
-  ck('unsigned negative -> abs', awsat.num('-5')===5);
+  /*
+   * F-05 · an unsigned field that came back negative is a MISREAD — a cell read
+   * from the wrong column — so it is refused, not flipped. Taking the absolute
+   * value turned a `chg` of -5 that had drifted into the `bbp` position into a
+   * bid of 5: a real, tradeable-looking price nothing downstream could tell
+   * from a measured one.
+   */
+  ck('unsigned negative -> null, NOT its absolute value', awsat.num('-5')===null, awsat.num('-5'));
+  ck('and a signed field keeps its sign', awsat.num('-5', true)===-5);
   ck('signed keeps negative', awsat.num('-2.5',true)===-2.5);
   ck('U+2212 minus', awsat.num('\u22122.5',true)===-2.5, awsat.num('\u22122.5',true));
   ck('DD-MM-YYYY -> ISO', awsat.toDate('20-08-2026')==='2026-08-20');

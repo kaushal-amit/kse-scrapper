@@ -21,14 +21,37 @@ function bool(name, fallback) {
   return v === 'true' || v === '1';
 }
 
+/**
+ * A comma list from the environment.
+ *
+ * F-18 · UNSET and EXPLICITLY EMPTY are different things.
+ *
+ * This returned the fallback for both, so an operator writing
+ * `ENABLED_SCRAPERS=` — the natural way to say "run nothing" — got all thirteen
+ * jobs instead, including the AWSAT ones. The worker launched Chromium, logged
+ * in, and spent one of the day's TWO login attempts doing the exact opposite of
+ * what was asked. And `scheduler.js`'s "no scrapers enabled" warning never
+ * fired, because thirteen were.
+ *
+ * Unset means "no opinion, use the default". Empty means "none", and the two
+ * cannot share an answer when getting it wrong costs a login attempt.
+ */
 function list(name, fallback) {
   const v = process.env[name];
-  if (v === undefined || v.trim() === '') return fallback;
+  if (v === undefined) return fallback;
+  if (v.trim() === '') return [];
   return v.split(',').map((s) => s.trim()).filter(Boolean);
 }
 
 /** 'HH:MM' -> minutes since midnight. Rejects anything malformed. */
 function parseTime(name, fallback) {
+  // F-18 · an explicitly empty START_TIME=/END_TIME= is a mistake, not a
+  // request for the default: it silently moved the capture window. Same class
+  // as list() above, lower cost.
+  if (process.env[name] !== undefined && String(process.env[name]).trim() === '') {
+    throw new Error(`${name} is set but empty. Remove it to use the default (${fallback}), `
+      + 'or give it a value — an empty setting silently moved the capture window.');
+  }
   const raw = process.env[name] || fallback;
   const m = /^(\d{1,2}):(\d{2})$/.exec(raw.trim());
   if (!m) throw new Error(`${name} must be HH:MM (got "${raw}")`);
@@ -52,7 +75,34 @@ try {
 
 function buildConfig() {
   const start = parseTime('START_TIME', '09:00');
-  const end = parseTime('END_TIME', '13:00');
+  /*
+   * S8 · 13:30, not 13:00.
+   *
+   * Boursa Kuwait's continuous trading runs to 13:30. A 13:00 window stopped
+   * half an hour before the close and never captured the closing prints, so the
+   * day's high, low and close were built from a session that was still running.
+   */
+  const end = parseTime('END_TIME', '13:30');
+
+  /*
+   * S8 · THE SIGNAL WINDOW IS NOT THE CAPTURE WINDOW.
+   *
+   * Capture runs to the close because the closing prints are data. The fast
+   * loop and the wake-up scan must NOT: they fire alerts a human is expected to
+   * act on, and there is no acting on a signal raised at 13:29 when continuous
+   * trading ends at 13:30. Defaults to 13:00 — the last half hour is captured
+   * and not alerted on.
+   *
+   * Defaults to END_TIME when that is earlier, so a narrowed capture window
+   * cannot leave the signal window hanging past it.
+   */
+  const signalsEnd = parseTime('SIGNALS_END_TIME', '13:00');
+  if (signalsEnd.minutes > end.minutes) {
+    throw new Error(
+      `SIGNALS_END_TIME (${signalsEnd.text}) is after END_TIME (${end.text}) — `
+      + 'the fast loop would be scheduled past the capture window and evaluate '
+      + 'minutes nothing was captured for.');
+  }
 
   if (end.minutes <= start.minutes) {
     throw new Error(`END_TIME (${end.text}) must be after START_TIME (${start.text})`);
@@ -110,7 +160,12 @@ function buildConfig() {
   return {
   db: {
     url: required('DATABASE_URL'),
-    ssl: bool('DB_SSL', false),
+    // TLS is resolved in src/db/sslMode.js from DB_SSL_MODE (DB_SSL is the
+    // deprecated boolean). It deliberately does NOT live here: pool.js is the
+    // only consumer, and a second copy of the decision is how the old hardcoded
+    // `rejectUnauthorized: false` came to override the config without anyone
+    // noticing the config was still being computed.
+    sslMode: process.env.DB_SSL_MODE || null,
   },
 
   market: {
@@ -119,6 +174,8 @@ function buildConfig() {
     endTime: end.text,
     startMinutes: start.minutes,
     endMinutes: end.minutes,
+    signalsEndTime: signalsEnd.text,
+    signalsEndMinutes: signalsEnd.minutes,
     tradingDays,
   },
 

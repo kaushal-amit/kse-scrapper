@@ -6,22 +6,69 @@
  * per statement, and so there is one place that closes cleanly on shutdown.
  */
 
-const { Pool } = require('pg');
+const { Pool, types } = require('pg');
 const { config } = require('../config');
 const log = require('../logger');
 
+const sslMode = require('./sslMode');
+
+/*
+ * ─── A `date` COMES BACK AS THE TEXT POSTGRES SENT ─────────────────────────
+ *
+ * node-postgres parses a bare `date` into a JS Date at LOCAL midnight. On a
+ * server in Kuwait, '2026-04-20'::date becomes 2026-04-19T21:00:00Z — and every
+ * piece of code that then rendered it with getUTC* or toISOString() read the day
+ * BEFORE the one stored.
+ *
+ * That was live in three places, each with its own consequence:
+ *
+ *   · src/market/holidays.js — the calendar loaded one day early, so the
+ *     scraper skipped a real session (unrecoverable: a session not captured
+ *     cannot be re-scraped) and then ran on the actual holiday, spending a
+ *     login attempt on a shut terminal and computing a symbol_day from no
+ *     captures. Exactly the three-part failure migration 040 exists to prevent,
+ *     inverted.
+ *   · src/migration/repair.js — collision_days shifted back a day, so `--apply`
+ *     DELETED quotes from the uncontested session BEFORE the collision and left
+ *     the collision itself untouched. The `trading_date = ANY($3)` clause that
+ *     F-11 added to stop the tool destroying sessions that were never in
+ *     question became the clause that selected them.
+ *   · scripts/fix-tradingview-dates.js — the dry run printed the evidence for
+ *     --from one day early, so the operator would bound the repair a day too
+ *     wide, shifting a day of correct history.
+ *
+ * Each was individually fixable, and each fix would have been one more place
+ * that has to remember. THE TYPE IS THE PROBLEM: a `date` has no time and no
+ * zone, and turning it into an instant is what creates the ambiguity. Postgres
+ * sends 'YYYY-MM-DD'; this hands that string through untouched.
+ *
+ * 1082 is DATE. timestamptz (1184) is deliberately untouched — those ARE
+ * instants, and a Date object is the right shape for them.
+ *
+ * Set here, at the pool, because this module is required by everything that
+ * talks to the database and by nothing that does not.
+ */
+types.setTypeParser(1082, (v) => v);
+
+/*
+ * TLS is decided by DB_SSL_MODE, in src/db/sslMode.js, and announced at boot.
+ *
+ * What was here before was a hardcoded `ssl: { rejectUnauthorized: false }`
+ * sitting directly under a commented-out line that read the config — beneath a
+ * comment explaining why hardcoding false is wrong. It disabled certificate
+ * verification on every connection, AND it forced TLS on even when DB_SSL was
+ * false, so the documented default configuration could not connect to the
+ * documented default database at all.
+ */
+const SSL_MODE = sslMode.resolveMode({ warn: (m) => log.warn(m) });
+log.info(sslMode.describe(SSL_MODE));
+
 const pool = new Pool({
   connectionString: config.db.url,
-  // rejectUnauthorized follows DB_SSL_REJECT_UNAUTHORIZED, default true.
-  // Hardcoding false accepts any certificate, including a substituted one,
-  // which quietly removes the protection TLS was enabled for.
-  // ssl: config.db.ssl ? { rejectUnauthorized: config.db.sslRejectUnauthorized } : false,
+  ssl: sslMode.sslOptions(SSL_MODE),
   max: 10,
   idleTimeoutMillis: 30_000,
   connectionTimeoutMillis: 10_000,
-  ssl: {
-    rejectUnauthorized: false
-  }
 });
 
 // An idle client can be dropped by the server or a network device. Without this

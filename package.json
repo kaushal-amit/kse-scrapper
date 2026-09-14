@@ -32,15 +32,17 @@
     "tv:login": "node scripts/save-tradingview-cookies.js",
     "test": "node test/all.js",
     "check": "node --check src/index.js && node --check src/scheduler.js && echo 'syntax ok'",
-    "test:one": "node test/run.js"
+    "test:one": "node test/run.js",
+    "verify": "node scripts/verify.js"
   },
   "dependencies": {
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
-    "jsdom": "^30.0.1",
-    "node-cron": "^3.0.3",
+    "node-cron": "^4.6.0",
     "pg": "^8.12.0",
-    "playwright": "^1.47.0",
-    "ws": "^8.21.3"
+    "playwright": "^1.47.0"
+  },
+  "devDependencies": {
+    "jsdom": "^30.0.1"
   }
 }

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         awsat / DirectFN — Order List → Server 1
 // @namespace    local.trading.tools
-// @version      2.6.0
+// @version      2.8.1
 // @description  Reads the Order List grid by cell-id and posts it to Server 1. No credentials leave the browser.
 // @match        *://*.awsatbroker.com/*
 // @match        *://awsatbroker.com/*
@@ -31,7 +31,7 @@
    * each, so a session went into diagnosing a bug that was already fixed.
    * A build that cannot identify itself is a build nobody can debug.
    */
-  var VERSION = '2.6.0';
+  var VERSION = '2.8.1';
 
   var SERVER = 'https://scrapper.99labs.space';   // Server 1
   var TOKEN  = 'trading';               // must equal INGEST_TOKEN
@@ -107,8 +107,119 @@
     // The timestamp is what makes it unique; without symbol AND stamp there is
     // no honest stable key, so return nothing rather than a colliding guess.
     if (!sym || !rec.stamp) return null;
-    var parts = [sym, rec.side || '', rec.price || '', rec.quantity || '', rec.stamp];
+    /*
+     * 2.8.0 · SYMBOL · SIDE · STAMP. Price and quantity are GONE from the key.
+     *
+     * They were in it, and that made an AMEND look like a new order: change the
+     * price of a resting order and its synthetic id changed with it, so the
+     * server saw the old id stop being reported and a new id appear. Under
+     * append-only that is one order abandoned mid-life and another born at the
+     * amended price — two rows in awsat_order_list where the trader has one
+     * order, and the abandoned one then reads UNSEEN and stops protecting its
+     * slot while it is still live.
+     *
+     * Symbol, side and placement time do not change once the order exists.
+     * Price and quantity are exactly the things an amend changes, which is why
+     * they cannot be in its identity.
+     */
+    var parts = [sym, rec.side || '', rec.stamp];
     return 'syn:' + parts.join('|').replace(/\s+/g, '');
+  }
+
+  /*
+   * 2.8.0 · SAME-SECOND TWINS TAKE STABLE ORDINALS.
+   *
+   * Dropping price and quantity means two orders on the same symbol, same side,
+   * placed in the same SECOND now collide. That is rare and real — a split
+   * order entered twice, or an algo. The grid renders them in a stable order,
+   * so the second one gets ':2', the third ':3'. Stable across cycles because
+   * the row order is; unique because the ordinal is assigned within the id, not
+   * across the batch.
+   *
+   * Applied to the WHOLE list at once rather than per row, because the ordinal
+   * only means anything relative to its twins.
+   *
+   * 2.8.1 · H-G — THE ORDINAL IS SCOPED TO THE SCAN, NOT TO THE SCROLL WINDOW.
+   *
+   * `counts` was a local of this function, and this function runs once per
+   * rendered window: readOrders scrolls the virtualised grid and calls
+   * readRenderedRows at each position. So the ordinals restarted at every
+   * window.
+   *
+   * Two same-second twins on one symbol and side, A then B:
+   *
+   *   window 1 renders both   -> A takes `base`, B takes `base:2`
+   *   window 2 renders only B -> B takes `base`, because the count restarted
+   *
+   * byId keeps the FIRST record it sees for an id, so B's own reading is
+   * discarded and B is reported as A — or, if the windows come the other way
+   * round, A is. Two live orders collapse into one, and the one that is lost
+   * then reads UNSEEN and stops protecting its slot while it is still resting
+   * in the book.
+   *
+   * `counts` and `assigned` now live in the scan's own state object, created
+   * once per readOrders and threaded through, exactly as `seen` already was.
+   *
+   * `assigned` is what makes the ordinal stable across OVERLAPPING windows: the
+   * scroll deliberately steps two rows at a time so every row is rendered
+   * several times, and counting each re-render would walk a twin's ordinal up
+   * on every step. A row already assigned an id in this scan gets that same id
+   * back, matched on its full cell content rather than on the identity key —
+   * the identity key is deliberately blind to price and quantity, which is
+   * exactly what tells two twins apart.
+   *
+   * A twin whose filled quantity changes mid-scan takes a fresh ordinal. That
+   * is the conservative direction: a scan lasts seconds, and reporting one
+   * order as two costs a duplicate row, while merging two orders into one loses
+   * a live order.
+   */
+  function applySyntheticIds(recs, ids) {
+    var counts = ids.counts;
+    var assigned = ids.assigned;
+    for (var i = 0; i < recs.length; i += 1) {
+      var rec = recs[i];
+      if (rec.orderId) continue;               // a real id always wins
+      var base = syntheticId(rec);
+      if (!base) continue;
+
+      var print = rowFingerprint(rec, base);
+      if (assigned[print]) {
+        rec.orderId = assigned[print];
+        rec.orderIdSynthetic = true;
+        continue;
+      }
+
+      counts[base] = (counts[base] || 0) + 1;
+      rec.orderId = counts[base] === 1 ? base : base + ':' + counts[base];
+      assigned[print] = rec.orderId;
+      rec.orderIdSynthetic = true;
+    }
+    return recs;
+  }
+
+  /** Fresh per-scan ordinal state. One per readOrders, never per window. */
+  function newIdState() {
+    return { counts: {}, assigned: {} };
+  }
+
+  /**
+   * Everything this row said, so the SAME row read again in an overlapping
+   * scroll window is recognised rather than counted twice.
+   *
+   * Deliberately includes price and quantity — the two fields the identity key
+   * leaves out. They are what distinguishes same-second twins from each other,
+   * and here we are asking "is this the same row?", not "is this the same
+   * order?".
+   */
+  function rowFingerprint(rec, base) {
+    var parts = [base];
+    var keys = Object.keys(rec).sort();
+    for (var i = 0; i < keys.length; i += 1) {
+      var k = keys[i];
+      if (k === 'orderId' || k === 'orderIdSynthetic') continue;
+      parts.push(k + '=' + String(rec[k]));
+    }
+    return parts.join('');
   }
 
   /** Every cell-id seen that CELL_MAP does not know. Reported, then dumped. */
@@ -255,7 +366,7 @@
   }
 
   /** Parse whatever rows are rendered right now. */
-  function readRenderedRows(body, noId, seen) {
+  function readRenderedRows(body, noId, seen, ids) {
     noId = noId || [];
     var buckets = new Map();
     body.querySelectorAll('.ember-table-table-row').forEach(function (row) {
@@ -304,17 +415,24 @@
        * grid was full.
        */
       if (!hits) return;
-      // C1 · no id column in the current grid → derive a stable one so the row
-      // is captured instead of silently dropped. A real id, when present, is
-      // never overwritten.
-      if (!rec.orderId) {
-        var syn = syntheticId(rec);
-        if (syn) { rec.orderId = syn; rec.orderIdSynthetic = true; }
-      }
-      if (rec.orderId) out.push(rec);
-      else noId.push(rec);
+      // C1 · no id column in the current grid → a stable one is derived below,
+      // for the whole list at once, so same-second twins can take ordinals.
+      out.push(rec);
     });
-    return out;
+
+    /*
+     * 2.8.0 · ids are assigned to the WHOLE list, not row by row. An ordinal
+     * only means anything relative to its twins, so it cannot be decided while
+     * looking at one row.
+     */
+    applySyntheticIds(out, ids);
+
+    var keep = [];
+    for (var k = 0; k < out.length; k += 1) {
+      if (out[k].orderId) keep.push(out[k]);
+      else noId.push(out[k]);
+    }
+    return keep;
   }
 
   /**
@@ -408,9 +526,11 @@
     var byId = new Map();
     var noIdRows = [];
     var seen = { rows: 0 };
+    // H-G · ONE ordinal state for the whole scan. See applySyntheticIds.
+    var ids = newIdState();
     function collect() {
       var before = byId.size;
-      readRenderedRows(body, noIdRows, seen).forEach(function (r) {
+      readRenderedRows(body, noIdRows, seen, ids).forEach(function (r) {
         if (!byId.has(r.orderId)) byId.set(r.orderId, r);
       });
       return byId.size - before;      // how many NEW ones this window gave
@@ -423,7 +543,7 @@
       stats.scrollNote = 'grid does not scroll — ' + byId.size + ' order(s) from '
         + seen.rows + ' DOM row(s)'
         + (noIdRows.length ? ' · ' + noIdRows.length + ' READ BUT HAD NO ORDER ID' : '');
-      reportUnmapped(noIdRows, seen);
+      reportUnmapped(noIdRows, seen, byId.size);
       return done([...byId.values()], null);
     }
 
@@ -477,7 +597,42 @@
         }
         // One last read after restoring, in case the restore itself renders a
         // window that was never visited on the way down.
-        setTimeout(function () { collect(); done([...byId.values()], null); }, 150);
+        setTimeout(function () {
+          collect();
+          /*
+           * 2.8.1 · P2 — THE PARSE-FAILURE REPORT RUNS ON THIS PATH TOO.
+           *
+           * reportUnmapped had exactly ONE call site: inside
+           * `if (!targets.length)`, the grid-does-not-scroll branch. The
+           * scrolling path — the NORMAL case, since the grid is virtualised by
+           * design — returned without ever calling it.
+           *
+           * It is the only writer of the strings the post guard tests for:
+           *
+           *   var readNothing = !/NO ORDER ID|none parsed/
+           *     .test(stats.scrollNote + ' ' + stats.msg);
+           *   if (!rows.length && !readNothing) { ...do not post an empty capture }
+           *
+           * whose own comment reads: "A grid full of rows discarded for want of
+           * an id is not an empty grid, and saying so sent us looking at the
+           * wrong thing for a session." On the scrolling path stats.msg never
+           * contained either string, so readNothing was ALWAYS true and the
+           * guard could not tell apart the two cases it exists for. An empty
+           * COMPLETE capture would then be posted for a grid that was full —
+           * and the server judges an order absent by its absence from a
+           * complete capture, so every live resting order reads UNSEEN and
+           * stops protecting its depth slot.
+           *
+           * The /ingest/debug dump of unmapped cell-ids never fired either —
+           * the dump that turned "0 orders" into "the grid used ordNo, a
+           * one-line fix".
+           *
+           * Called AFTER the final collect, so it judges the whole scan rather
+           * than one window.
+           */
+          reportUnmapped(noIdRows, seen, byId.size);
+          done([...byId.values()], null);
+        }, 150);
         return;
       }
 
@@ -505,10 +660,21 @@
    */
   var dumped = false;
   var dumpedAt = 0;
-  function reportUnmapped(noIdRows, seen) {
+  function reportUnmapped(noIdRows, seen, parsed) {
     // Re-arm after ten minutes, so a late login gets its own dump.
     if (dumped && Date.now() - dumpedAt > 600000) dumped = false;
     var ids = Object.keys(unmappedSeen);
+
+    /*
+     * 2.8.1 · `parsed` is how many orders the scan actually produced.
+     *
+     * On the non-scrolling path this function was only ever reached with the
+     * whole grid in view, so "rows existed and none parsed" could be inferred
+     * from noIdRows alone. On the scrolling path it is called once for the
+     * WHOLE scan, and a scan that read 40 rows and parsed 40 orders must not
+     * report a parse failure because none of them happened to lack an id.
+     */
+    if (parsed > 0) return;
 
     // Rows existed in the DOM and none became an order. That is a PARSE
     // failure, and it is invisible if it reports the same "0" as an empty grid.
@@ -707,23 +873,79 @@
         return;
       }
 
-      if (!rows.length) {
+      /*
+       * 2.8.0 · AN EMPTY GRID IS POSTED.
+       *
+       * It used to check in on the heartbeat and return without posting. But
+       * "there are no orders" is a FACT, and under append-only it is the only
+       * way "everything is gone" becomes expressible: the server judges an
+       * order absent by comparing its last sighting against the most recent
+       * COMPLETE capture, and silence is not a capture. Without this, the last
+       * order of the day kept its `Queued` status for ever and went on
+       * protecting its depth slot after it had left the grid.
+       *
+       * Still only when nothing was read AT ALL. A grid full of rows discarded
+       * for want of an id is not an empty grid, and saying so sent us looking
+       * at the wrong thing for a session — so that case still does not post an
+       * empty capture, because it is not one.
+       */
+      /*
+       * 2.8.1 · P2 — CASE-INSENSITIVE, because the two writers disagreed.
+       *
+       * The pattern was case-SENSITIVE. The non-scrolling path's scrollNote
+       * writes "READ BUT HAD NO ORDER ID" and matched; reportUnmapped writes
+       * "row(s) read with NO order id." and did NOT. So even once
+       * reportUnmapped was reachable from the scrolling path, the string it
+       * sets would still have slipped past the guard that reads it.
+       *
+       * Two halves of one mechanism, in one file, differing by capitalisation —
+       * which is exactly the kind of thing a regex should not be asked to
+       * notice.
+       */
+      var readNothing = !/NO ORDER ID|none parsed/i.test(stats.scrollNote + ' ' + stats.msg);
+      if (!rows.length && !readNothing) {
         stats.lastCount = 0;
-        // Only claim "empty" when nothing was read at all. A grid full of rows
-        // that were discarded for want of an id is not an empty grid, and
-        // saying so sent us looking at the wrong thing for a session.
-        if (!/NO ORDER ID|none parsed/.test(stats.scrollNote + ' ' + stats.msg)) {
-          stats.msg = 'Order List tab is active and empty';
-        }
         heartbeat(0, stats.msg);          // check in with the finalised reason
         return;
       }
+      if (!rows.length) {
+        stats.lastCount = 0;
+        stats.msg = 'Order List tab is active and empty';
+      }
 
-      // batchId is created ONCE and kept across retries; regenerating it would
-      // make every retry look like new data and defeat server-side idempotency.
+      /*
+       * 2.7.0 · batchId AND capturedAt are created ONCE and kept across
+       * retries.
+       *
+       * batchId was always so: regenerating it would make every retry look
+       * like new data and defeat server-side idempotency.
+       *
+       * capturedAt now carries the same weight. Since CR-10/11 the server
+       * stores orders APPEND-ONLY, and an observation's identity is
+       * (order_id, capturedAt, source) — so capturedAt is when the grid was
+       * READ, not when the request happened to be sent. A retry stamped with a
+       * fresh clock would be a second, fictitious sighting of the same screen:
+       * it would inflate sighting_count and, because executions_observed
+       * counts filled_quantity rises between consecutive sightings, it could
+       * manufacture an execution that never happened. The settlement fee is
+       * charged per execution, so that is money.
+       */
+      /*
+       * 2.8.0 · `partial` says whether this scan read the WHOLE grid.
+       *
+       * Only the client knows. The server sees fewer rows and cannot tell "the
+       * grid is shorter" from "I did not reach the bottom" — and it judges an
+       * order gone by its absence from a capture, so judging against a short
+       * scan would mark every order below the scroll fold UNSEEN. That turns a
+       * client-side scroll problem into a wrong status on live orders.
+       *
+       * stats.shortBy is set when the grid's own row count exceeds what was
+       * captured (see expectedRowCount).
+       */
       var batch = {
         batchId: uuid(),
         capturedAt: new Date().toISOString(),
+        partial: stats.shortBy > 0,
         orders: rows.map(toPayload),
       };
 

@@ -13,7 +13,7 @@ const srv=app.listen(8802,async()=>{
     .then(async r=>({status:r.status,body:await r.json()}));
 
   await db.query("delete from awsat_stock_depth where ingest_source='awsat_client'");
-  await db.query("delete from awsat_order_list where order_id like 'CL-%'");
+  await db.query("delete from awsat_order_obs where order_id like 'CL-%'");
   await db.query("delete from awsat_market_quotes where ingest_source='awsat_client'");
 
   const capturedAt=new Date().toISOString();
@@ -67,7 +67,7 @@ const srv=app.listen(8802,async()=>{
   ck('401 hints where to look', /AUTH_TOKEN in the userscript/.test(bad.body.hint||''), bad.body.hint);
 
   await db.query("delete from awsat_stock_depth where ingest_source='awsat_client'");
-  await db.query("delete from awsat_order_list where order_id like 'CL-%'");
+  await db.query("delete from awsat_order_obs where order_id like 'CL-%'");
   await db.query("delete from awsat_market_quotes where ingest_source='awsat_client'");
   console.log(`\nclient payloads: ${p}/${n}`);
   srv.close(); await db.close(); process.exit(p===n?0:1);

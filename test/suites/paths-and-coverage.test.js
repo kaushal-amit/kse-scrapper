@@ -84,7 +84,7 @@ const srv=app.listen(8805,async()=>{
   await db.query("delete from awsat_market_quotes where trading_date=$1",[day]);
   await db.query("delete from awsat_market_quotes where ingest_source='awsat_client'");
   await db.query("delete from awsat_stock_depth where ingest_source='awsat_client'");
-  await db.query("delete from awsat_order_list where order_id like 'RC-%'");
+  await db.query("delete from awsat_order_obs where order_id like 'RC-%'");
   console.log(`\npaths + coverage: ${p}/${n}`);
   srv.close(); await db.close(); process.exit(p===n?0:1);
 });

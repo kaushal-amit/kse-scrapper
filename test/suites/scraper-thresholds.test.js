@@ -11,11 +11,26 @@ const NINE=['sig_no_protection_bid','sig_buyers_ratio','sig_big_qty',
   'sig_bait_max_age_secs','sig_tiny_trade_shares','sig_wall_qty',
   'wakeup_pace_min','wakeup_trades_min','close_capture_min_hhmm'];
 // B2 · the movement-test thresholds, in the same file.
+// F-12 added wakeup_upmoves_min: the `>= 1` in wakeup.js's MOVEMENT verdict was
+// the one term there that was a literal, under a header in thresholds.js saying
+// "Every number here, never a literal in wakeup.js."
 const MOVEMENT=['wakeup_pace_mult','wakeup_vol_mult','wakeup_move_open_fils',
-  'wakeup_range_min_fils','wakeup_upmove_fils','wakeup_abs_vol_floor_shares','wakeup_abs_vol_floor_frac'];
+  'wakeup_range_min_fils','wakeup_upmove_fils','wakeup_upmoves_min',
+  'wakeup_abs_vol_floor_shares','wakeup_abs_vol_floor_frac'];
 
-ck('the original nine thresholds plus the seven B2 movement ones',
-   Object.keys(T.all()).length===NINE.length+MOVEMENT.length, Object.keys(T.all()).length);
+/*
+ * F-12 moved sixteen more thresholds in here from six other files, so an exact
+ * count is no longer the useful assertion — it would fail every time a literal
+ * is correctly relocated, which is the opposite of the incentive wanted.
+ *
+ * What matters is that the ORIGINAL keys are all still present and unchanged
+ * (asserted below, individually and by value), and that no threshold literal
+ * survives OUTSIDE this file — which is no-threshold-literals.test.js's job.
+ */
+ck('every original threshold is still here',
+   NINE.concat(MOVEMENT).every((k)=>T.get(k)!==undefined), Object.keys(T.all()).length);
+ck('and the file has grown, not shrunk',
+   Object.keys(T.all()).length>=NINE.length+MOVEMENT.length, Object.keys(T.all()).length);
 for(const k of NINE) ck(k+' present', T.get(k)!==undefined);
 for(const k of MOVEMENT) ck(k+' present', T.get(k)!==undefined);
 

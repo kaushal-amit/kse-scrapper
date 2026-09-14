@@ -1068,14 +1068,33 @@ async function main() {
     // 3 · One symbol, one market. A symbol under two markets at the same
     //     instant is one observation stored twice — a board sweep that failed
     //     to switch and re-read the previous screen.
-    const labels = await repair.repairMarketLabels({ apply: true });
+    /*
+     * F-11 · REPORTED, NEVER APPLIED UNATTENDED.
+     *
+     * This was `{ apply: true }` inside `migrate-all`, so a destructive repair
+     * ran with nobody watching as part of a migration run. It deletes rows from
+     * the trader's own capture record, on the evidence of a same-instant
+     * duplicate, and a wrong call here cannot be undone — the data was paid for
+     * once and cannot be re-read.
+     *
+     * The block immediately above already reached this conclusion for
+     * removeUnwantedMarkets, for the same reason, and left it at
+     * `{ apply: false }`. This is the same decision applied to the same class
+     * of operation.
+     *
+     * The repair is still available, deliberately:
+     *     node scripts/repair-market-labels.js --apply
+     */
+    const labels = await repair.repairMarketLabels({ apply: false });
     if (labels.decided.length) {
-      console.log(`    repaired ${labels.decided.length} mislabelled symbol(s), `
-        + `removed ${fmt(labels.deleted)} row(s):`);
+      console.log(`    ${labels.decided.length} mislabelled symbol(s) found — NOT repaired:`);
       for (const d of labels.decided.slice(0, 10)) {
         console.log(`      ${d.symbol.padEnd(12)} ${d.distribution}  ->  keep ${d.keep}`);
       }
       if (labels.decided.length > 10) console.log(`      … +${labels.decided.length - 10} more`);
+      console.log('      Deleting rows from the capture record is not an unattended');
+      console.log('      operation. To apply, scoped to the colliding days only:');
+      console.log('        node scripts/repair-market-labels.js --apply');
     }
     if (labels.unclear.length) {
       console.log(`    ${labels.unclear.length} symbol(s) too evenly split to judge — LEFT ALONE:`);

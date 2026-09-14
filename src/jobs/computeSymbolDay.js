@@ -29,6 +29,17 @@ const log = require('../logger');
 const M = require('./symbolDayMetrics');
 const T = require('../config/thresholds');
 
+/**
+ * CLOSE_TIERS as an ordered array, for the SQL.
+ *
+ * Derived from the Map rather than restated, so the precedence the close column
+ * uses and the precedence prev_close uses cannot drift apart — which is exactly
+ * what happened when closeRow() moved to tiers and these queries did not.
+ */
+const CLOSE_TIER_ORDER = [...M.CLOSE_TIERS.entries()]
+  .sort((a, b) => a[1] - b[1])
+  .map(([session]) => session);
+
 /** Columns written. Anything absent from here is deliberately left NULL. */
 const COLUMNS = [
   'symbol', 'trading_date',
@@ -167,9 +178,23 @@ async function previousCloses(day) {
       -- 10:14 and 26 August at 12:23. 12:30 falls in the empty gap, so it is
       -- the midpoint of a real discontinuity rather than a number fitted to the
       -- data.
+      --
+      -- H-K · AND THE REACH IS CAPPED, which the docblock above has always
+      -- claimed and nothing enforced. "back = 1" took the most recent session
+      -- that produced a close HOWEVER FAR BACK that was, so a symbol suspended
+      -- for three weeks returned with chg_fils measured against its
+      -- pre-suspension price — and that number went on to down_days, the
+      -- breadth count and the signal scoring as though it were a day's move.
+      --
+      -- The cap is on MARKET sessions, not on the symbol's own: five usable
+      -- sessions before this one. A symbol with no close in that window keeps
+      -- prev_close NULL and is not measured, which is the state
+      -- prev_session_gap_days exists to make visible.
       SELECT trading_date FROM ends
        WHERE (extract(hour FROM (last_capture AT TIME ZONE 'Asia/Kuwait')) * 60
             + extract(minute FROM (last_capture AT TIME ZONE 'Asia/Kuwait'))) >= $2
+       ORDER BY trading_date DESC
+       LIMIT $3
     ),
     candidates AS (
       SELECT symbol, trading_date, close_px,
@@ -181,12 +206,46 @@ async function previousCloses(day) {
             JOIN usable u ON u.trading_date = q.trading_date
            WHERE q.trading_date < $1
              AND q.last_price IS NOT NULL AND q.last_price > 0
-             AND (q.session IS NULL OR q.session = ANY(closing_sessions()))
-           ORDER BY q.symbol, q.trading_date DESC, q.created_at DESC
+             /*
+              * P2 · THE SAME CLOSE RULE THE close_px COLUMN USES.
+              *
+              * This was "session = ANY(closing_sessions())" ordered by
+              * created_at — a session LIST plus "latest capture", which is the
+              * rule symbolDayMetrics abandoned and argues against by name:
+              *
+              *   "A list plus 'latest by created_at' picks whichever session
+              *    happened to be captured last, which is not the same as the
+              *    best available close. CABLE on 2 August has a Close-Of-Day at
+              *    1650 captured at 10:17 and an auction print at 1648 captured
+              *    later in the file — ordering by time reaches the auction and
+              *    never gets to the official close."
+              *
+              * closeRow() was changed to a PRECEDENCE ORDER; previousCloses was
+              * not. So symbol_day contradicted itself: the row for 2 August said
+              * close_px 1650 with close_source CLOSE_OF_DAY, and the row for
+              * 3 August said the previous close was 1648. chg_fils was measured
+              * from a base the table itself denies — and it feeds breadth,
+              * pct_advancing, market_day.regime, down_days and the signal
+              * scoring evidence base. Two fils is enough to flip a symbol
+              * between advancing and declining.
+              *
+              * $4 is CLOSE_TIERS, in order, from symbolDayMetrics — one list,
+              * passed in, so the two rules cannot drift apart again.
+              *
+              * NULL sessions are excluded here as they are there: those are the
+              * 14:13-14:23 Friday reads, after the close on a non-trading day,
+              * whose volume is cumulative rather than new. '' is kept — it is a
+              * July capture defect on continuous-trading rows, not a state.
+              */
+             AND q.session IS NOT NULL
+             AND array_position($4::text[], q.session) IS NOT NULL
+           ORDER BY q.symbol, q.trading_date DESC,
+                    array_position($4::text[], q.session), q.created_at DESC
         ) withClose
     )
     SELECT symbol, trading_date AS prev_day, close_px AS prev_close
-      FROM candidates WHERE back = 1`, [day, cutoffMinutes]);
+      FROM candidates WHERE back = 1`,
+  [day, cutoffMinutes, T.get('sd_prev_close_max_sessions_back'), CLOSE_TIER_ORDER]);
 
   const out = new Map();
   for (const r of rows) {
@@ -209,11 +268,37 @@ async function previousCloses(day) {
  *
  * down_days is a run length, which chg_1d cannot give: it describes one day.
  */
-async function activityBlock(day) {
+/**
+ * days_active and down_days, as at the END of `day`.
+ *
+ * F-14 · COMPUTED FROM THE SESSIONS BEFORE `day`, PLUS TODAY'S OWN ROWS.
+ *
+ * Both CTEs used to read `symbol_day WHERE trading_date <= $1` — including
+ * today — and ran BEFORE today's row was written. So the answer depended on
+ * whether the day had been computed before:
+ *
+ *   ARABREC fell on 8, 9, 10 and 11 September. First run of
+ *   `daily.symbolday --date=2026-09-11`: symbol_day has no row for the 11th,
+ *   so `back = 1` is the 10th and down_days is written as 3. Re-run an hour
+ *   later: today's row now exists, `back = 1` is the 11th, and the SAME COMMAND
+ *   writes 4.
+ *
+ * Same command, same data, two different numbers — in a column the backend
+ * reads as a run length — and the first-run value is yesterday's streak wearing
+ * today's date. The file's own header claims "Idempotent: re-running a day
+ * corrects it rather than duplicating."
+ *
+ * The fix is to stop reading today's row at all and to fold today's OWN measured
+ * values in explicitly. `todayRows` is the map of what this run has just
+ * computed, so the answer is the same whether or not a previous run left a row
+ * behind.
+ */
+async function activityBlock(day, todayRows = new Map()) {
   const { rows } = await query(`
     WITH sessions AS (
+      -- STRICTLY BEFORE today. Today is folded in from this run's own numbers.
       SELECT DISTINCT trading_date FROM symbol_day
-       WHERE trading_date <= $1 ORDER BY trading_date DESC LIMIT 20
+       WHERE trading_date < $1 ORDER BY trading_date DESC LIMIT 19
     ),
     active AS (
       SELECT sd.symbol, count(*)::int AS days_active
@@ -227,7 +312,7 @@ async function activityBlock(day) {
       -- run of three.
       SELECT symbol, trading_date, chg_fils,
              row_number() OVER (PARTITION BY symbol ORDER BY trading_date DESC) AS back
-        FROM symbol_day WHERE trading_date <= $1
+        FROM symbol_day WHERE trading_date < $1
     ),
     streak AS (
       SELECT symbol,
@@ -241,11 +326,38 @@ async function activityBlock(day) {
     SELECT COALESCE(a.symbol, st.symbol) AS symbol,
            a.days_active, st.down_days
       FROM active a FULL OUTER JOIN streak st ON a.symbol = st.symbol`, [day]);
-  const out = new Map();
+  const prior = new Map();
   for (const r of rows) {
-    out.set(r.symbol, {
+    prior.set(r.symbol, {
       days_active: r.days_active === null ? null : Number(r.days_active),
       down_days: r.down_days === null ? null : Number(r.down_days),
+    });
+  }
+
+  /*
+   * Fold in TODAY, from this run's own measurements rather than from the table.
+   *
+   *   days_active — today counts if it traded.
+   *   down_days   — today EXTENDS the run if today fell; if today did not fall
+   *                 the run is 0, whatever yesterday's was. A null chg_fils is
+   *                 direction UNKNOWN, not flat: it can neither extend a run nor
+   *                 honestly end one, so the streak becomes null rather than
+   *                 silently reporting yesterday's.
+   */
+  const out = new Map(prior);
+  for (const [symbol, today] of todayRows) {
+    const base = prior.get(symbol) || { days_active: 0, down_days: 0 };
+    const traded = Number(today.total_volume || 0) > 0;
+    const chg = today.chg_fils;
+
+    let downDays;
+    if (chg === null || chg === undefined) downDays = null;
+    else if (Number(chg) < 0) downDays = (base.down_days === null ? null : base.down_days + 1);
+    else downDays = 0;
+
+    out.set(symbol, {
+      days_active: (base.days_active || 0) + (traded ? 1 : 0),
+      down_days: downDays,
     });
   }
   return out;
@@ -270,9 +382,26 @@ async function closesFiveSessionsBack(day) {
        GROUP BY trading_date
     ),
     usable AS (
+      /*
+       * P2 · CAPPED, like previousCloses.
+       *
+       * H-K capped the chg_1d reach and measured-denominators.test.js asserted
+       * "the chg_5d query is untouched — back = 5 bounds itself". It bounds the
+       * COUNT, not the REACH: "back" counts the SYMBOL's own closes, and H-K's
+       * own comment draws exactly that distinction — "the cap is on MARKET
+       * sessions, not on the symbol's own".
+       *
+       * A symbol that printed on only five of the last forty sessions had its
+       * chg_5d measured against a close two months old, reported in a column
+       * named for five sessions, with no prev_session_gap_days analogue to say
+       * so. The window is the same market sessions previousCloses uses, so the
+       * two columns describe the same span of trading.
+       */
       SELECT trading_date FROM ends
        WHERE (extract(hour FROM (last_capture AT TIME ZONE 'Asia/Kuwait')) * 60
             + extract(minute FROM (last_capture AT TIME ZONE 'Asia/Kuwait'))) >= $2
+       ORDER BY trading_date DESC
+       LIMIT $5
     ),
     candidates AS (
       SELECT symbol, trading_date, close_px,
@@ -284,11 +413,17 @@ async function closesFiveSessionsBack(day) {
             JOIN usable u ON u.trading_date = q.trading_date
            WHERE q.trading_date < $1
              AND q.last_price IS NOT NULL AND q.last_price > 0
-             AND (q.session IS NULL OR q.session = ANY(closing_sessions()))
-           ORDER BY q.symbol, q.trading_date DESC, q.created_at DESC
+             -- P2 · the same precedence rule as above. chg_5d measured its base
+             -- with the superseded "latest capture" rule too.
+             AND q.session IS NOT NULL
+             AND array_position($3::text[], q.session) IS NOT NULL
+           ORDER BY q.symbol, q.trading_date DESC,
+                    array_position($3::text[], q.session), q.created_at DESC
         ) withClose
     )
-    SELECT symbol, close_px AS px FROM candidates WHERE back = 5`, [day, cutoffMinutes]);
+    SELECT symbol, close_px AS px FROM candidates WHERE back = $4`,
+  [day, cutoffMinutes, CLOSE_TIER_ORDER, T.get('sd_chg5d_sessions_back'),
+    T.get('sd_chg5d_max_sessions_back')]);
   const out = new Map();
   for (const r of rows) out.set(r.symbol, Number(r.px));
   return out;
@@ -398,7 +533,6 @@ async function compute(tradingDay, runId) {
   // Two queries for the whole day, not two per symbol.
   const prevCloses = await previousCloses(day);
   const back5 = await closesFiveSessionsBack(day);
-  const activity = await activityBlock(day);
 
   const built = [];
   let crossed = 0;
@@ -413,10 +547,6 @@ async function compute(tradingDay, runId) {
     row.chg_1d = (row.chg_fils !== null && prev.prev_close)
       ? Number(((100 * row.chg_fils) / prev.prev_close).toFixed(4)) : null;
 
-    const act = activity.get(symbol);
-    row.days_active = act ? act.days_active : null;
-    row.down_days = act ? act.down_days : null;
-
     const px5 = back5.get(symbol);
     row.chg_5d = (row.close_px !== null && px5)
       ? Number(((100 * (row.close_px - px5)) / px5).toFixed(4)) : null;
@@ -430,6 +560,22 @@ async function compute(tradingDay, runId) {
       day, count: crossed,
       note: 'two tick regimes in one session — per-fil economics are wrong for part of it',
     });
+  }
+
+  /*
+   * F-14 · the streaks are computed AFTER the rows are built, from the sessions
+   * BEFORE today plus today's own measured values.
+   *
+   * It used to run before the loop and read `trading_date <= day` — including a
+   * row for today that may or may not have been written by an earlier run. The
+   * same command then produced different answers depending on whether it had
+   * been run before. See the note on activityBlock.
+   */
+  const activity = await activityBlock(day, new Map(built.map((r) => [r.symbol, r])));
+  for (const row of built) {
+    const act = activity.get(row.symbol);
+    row.days_active = act ? act.days_active : null;
+    row.down_days = act ? act.down_days : null;
   }
 
   // UPSERT: re-running a day must CORRECT it, not duplicate or skip it.

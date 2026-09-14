@@ -1,2 +1,11 @@
 node_modules
 .env
+
+# S-02 · a live TradingView session (sessionid + sessionid_sign) was committed
+# here. Untracking does NOT un-leak it — the cookie stays valid until revoked,
+# and it is still in the history. See the runbook.
+secrets/
+
+# Scrape artefacts and the login-attempt counter. The client HTML dumps here
+# are pages from the broker terminal — the trader's own order grid among them.
+tmp/

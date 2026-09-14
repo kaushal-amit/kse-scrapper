@@ -39,30 +39,6 @@ const OFFSETS = {
   'awsat.orders': 45,
 };
 
-/**
- * Jobs that run AFTER the session, on their own cron, and are NOT gated by the
- * trading window.
- *
- * The window guard applies to every other job by design, but daily history
- * only exists once the session has closed — so gating it on the window would
- * mean it could never run at all. It has its own schedule and its own check:
- * it must be a trading day, and the window must already have closed.
- *
- * HISTORY_CRON default '0 30 13 * * 0-4' = 13:30 Kuwait, 30 minutes after a
- * 13:00 close, which leaves room for the closing prints to settle.
- */
-function defaultHistoryCron() {
-  // Thirty minutes after END_TIME, so the last captures have landed.
-  //
-  // A hardcoded 13:30 was wrong the moment END_TIME moved: with a window of
-  // 09:00-19:00 the tick fires INSIDE the session, the after-close guard
-  // rejects it, and history never runs at all — silently, because a guard
-  // doing its job looks the same as a job that was never scheduled.
-  const total = config.market.endMinutes + 30;
-  const hour = Math.floor(total / 60) % 24;
-  const minute = total % 60;
-  return `0 ${minute} ${hour} * * ${config.market.tradingDays.join(',')}`;
-}
 
 /**
  * Jobs that run OUTSIDE the trading window, each on its own cron.
@@ -73,26 +49,48 @@ function defaultHistoryCron() {
  * Both are guarded: they refuse to run inside the window, so a mistimed cron
  * cannot analyse a half-finished day and store it as final.
  */
+/**
+ * S8 · THE AFTER-CLOSE TIMES ARE DERIVED FROM END_TIME, NOT WRITTEN DOWN.
+ *
+ * They used to be literal hours — `0 25 13`, `0 30 13`, `0 40 13` — with only
+ * the weekday list taken from config. A hardcoded after-close hour is wrong the
+ * moment END_TIME moves: set END_TIME=14:00 and 13:25, 13:30 and 13:40 all fall
+ * INSIDE the window, the after-close guard rejects them at every tick, and
+ * symbol_day and market_day simply stop being computed — silently, because a
+ * guard doing its job looks exactly like a job that was never scheduled.
+ *
+ * `defaultHistoryCron()` was written to fix this and never called (S13). This
+ * is the fix: an offset in minutes past the close, resolved against
+ * config.market.endMinutes, so the chain follows the window automatically.
+ *
+ *   +1   daily.instruments  the registry, BEFORE symbolday — the day's rows
+ *                           must be computed against a correct registry, not
+ *                           yesterday's.
+ *   +5   daily.symbolday    after Close-Of-Day; earlier would compute a close
+ *                           from a session that has not closed.
+ *   +12  daily.marketday    reads symbol_day, so it must not race it.
+ *
+ * tradingview.history (17:00) and signals.score (17:45) stay on absolute
+ * clocks: they wait for the venue's own settlement and for the +15-minute
+ * forward prices, neither of which moves with our capture window. daily.analysis
+ * runs the NEXT morning. All three are still overridable, and all three are
+ * still checked against the window at startup.
+ */
+function afterClose(minutesPastEnd) {
+  const total = config.market.endMinutes + minutesPastEnd;
+  const h = Math.floor(total / 60) % 24;
+  const m = total % 60;
+  return `0 ${m} ${h} * * ${config.market.tradingDays.join(',')}`;
+}
+
 const AFTER_CLOSE_JOBS = {
   'tradingview.history': process.env.HISTORY_CRON
     || `0 0 17 * * ${config.market.tradingDays.join(',')}`,
   'daily.analysis': process.env.ANALYSIS_CRON
     || `0 15 8 * * ${config.market.tradingDays.join(',')}`,
-  // Scoring runs after the close so the +15 minute prices exist. Running it
-  // during the session would grade signals against data not yet captured and
-  // stamp them scored, which is worse than not grading them.
-  // 13:25 — BEFORE symbolday. The day's rows must be computed against a
-  // correct registry, not yesterday's.
-  'daily.instruments': process.env.INSTRUMENTS_CRON
-    || `0 25 13 * * ${config.market.tradingDays.join(',')}`,
-  // 13:30 Kuwait, after Close-Of-Day. Running earlier would compute a close
-  // from a session that has not closed.
-  'daily.symbolday': process.env.SYMBOLDAY_CRON
-    || `0 30 13 * * ${config.market.tradingDays.join(',')}`,
-  // Ten minutes after daily.symbolday, which it reads. Running them together
-  // would race: market_day would find an empty or half-written symbol_day.
-  'daily.marketday': process.env.MARKETDAY_CRON
-    || `0 40 13 * * ${config.market.tradingDays.join(',')}`,
+  'daily.instruments': process.env.INSTRUMENTS_CRON || afterClose(1),
+  'daily.symbolday': process.env.SYMBOLDAY_CRON || afterClose(5),
+  'daily.marketday': process.env.MARKETDAY_CRON || afterClose(12),
   'signals.score': process.env.SCORE_CRON
     || `0 45 17 * * ${config.market.tradingDays.join(',')}`,
 };
@@ -118,16 +116,29 @@ const tasks = [];
  * the client writing them — re-evaluating the same pair yields no signal but
  * costs a full pass over every slotted symbol.
  */
+/*
+ * S8 · the SIGNAL jobs stop at SIGNALS_END_TIME, not at END_TIME.
+ *
+ * Capture runs to the close because the closing prints are data. These two do
+ * not: they raise alerts a human is expected to act on, and there is no acting
+ * on one raised at 13:29 when continuous trading ends at 13:30. The last half
+ * hour is captured and not alerted on.
+ */
+const SIGNAL_END_HOUR = Math.ceil(config.market.signalsEndMinutes / 60) - 1;
+
 const SUB_MINUTE_JOBS = {
   // Every 15 minutes over all 137, from the quotes grid. It needs no depth, so
   // it never competes for the 8 slots.
   'signals.wakeup': process.env.WAKEUP_CRON
     || `0 */15 ${Math.floor(config.market.startMinutes / 60)}`
-       + `-${Math.ceil(config.market.endMinutes / 60) - 1} * * ${config.market.tradingDays.join(',')}`,
+       + `-${SIGNAL_END_HOUR} * * ${config.market.tradingDays.join(',')}`,
   'signals.fast': process.env.FAST_LOOP_CRON
     || `*/20 * ${Math.floor(config.market.startMinutes / 60)}`
-       + `-${Math.ceil(config.market.endMinutes / 60) - 1} * * ${config.market.tradingDays.join(',')}`,
+       + `-${SIGNAL_END_HOUR} * * ${config.market.tradingDays.join(',')}`,
 };
+
+/** The signal jobs' own window check — the hour range alone is too coarse. */
+const SIGNAL_JOBS = new Set(['signals.wakeup', 'signals.fast']);
 
 function expressionFor(second) {
   const startHour = Math.floor(config.market.startMinutes / 60);
@@ -204,6 +215,14 @@ function start() {
       // The authoritative check. See the note at the top of the file.
       if (!clock.isWithinWindow()) return;
 
+      /*
+       * The cron hour range can only stop at an hour boundary, so with
+       * SIGNALS_END_TIME=13:00 the range ends at hour 12 and this is redundant —
+       * but with 13:15 it would fire until 13:59. The minute check is what
+       * actually holds the rule.
+       */
+      if (SIGNAL_JOBS.has(name) && !clock.isBeforeSignalsEnd()) return;
+
       // Fire and forget: awaiting here would hold the cron callback and delay
       // the next tick behind a slow scrape.
       jobs.run(name).catch((err) => {
@@ -241,4 +260,4 @@ function stop() {
   log.info('scheduler stopped');
 }
 
-module.exports = { start, stop, expressionFor, AFTER_CLOSE_JOBS };
+module.exports = { start, stop, expressionFor, AFTER_CLOSE_JOBS, SUB_MINUTE_JOBS, afterClose };

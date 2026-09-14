@@ -5,6 +5,20 @@
 -- and can be replaced when a CR moves one, without touching the schema.
 --
 --     psql <kse> -1 -f sql/kb_seed.sql
+--
+-- ⚠ NOTHING IN THIS REPO READS public.kb_threshold (F-09, 14 Sep).
+--
+-- The scraper owns its thresholds in src/config/thresholds.js, by a documented
+-- and tested decision: "a capture service must not refuse to boot because a
+-- backend table is missing". src/kb/thresholds.js — a loader that read this
+-- table — was an orphan with no production caller, and its existence was what
+-- failed the policy test in scraper-thresholds.test.js. It has been deleted.
+--
+-- This file and migration 031's tables are kept because the BACKEND reads
+-- public.* across the seam and may depend on them. If it does not, the table
+-- and this seed should go together, in one change, with that established
+-- first — not dropped on the assumption that "nothing here reads it" means
+-- "nothing reads it".
 -- ============================================================
 
 INSERT INTO public.kb_threshold (key, value, unit, source_cr, note) VALUES

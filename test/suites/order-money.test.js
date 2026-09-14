@@ -12,7 +12,7 @@ const srv=app.listen(8810,async()=>{
   const post=(b)=>fetch('http://127.0.0.1:8810/orders',{method:'POST',
     headers:{'Content-Type':'application/json'},body:JSON.stringify(b)})
     .then(async r=>({status:r.status,body:await r.json()}));
-  const clean=()=>db.query("delete from awsat_order_list where order_id like 'OM%'");
+  const clean=()=>db.query("delete from awsat_order_obs where order_id like 'OM%'");
   await clean();
 
   // ── O1 · net_value populated on every filled row ──
@@ -49,39 +49,53 @@ const srv=app.listen(8810,async()=>{
 
   await repo.insertOrders([step(0,0)]);
   let e=async()=>(await db.query("select executions_observed,filled_quantity from awsat_order_list where order_id='OM-PART'")).rows[0];
-  ck('a new order starts at 1 observed execution', (await e()).executions_observed===1, await e());
+  // H-A · each of these four numbers fell by one, and the missing one was
+  // never real. The old derivation added a base `1 +` UNCONDITIONALLY, to
+  // account for a fill that might already have been present at the first
+  // sighting — without ever checking whether it was. Here the first sighting is
+  // UNFILLED, so there was nothing to account for, and the base was a phantom
+  // execution on the most common order shape in the book. The settlement fee is
+  // charged per execution, so the phantom was money.
+  ck('a new UNFILLED order has observed ZERO executions',
+     (await e()).executions_observed===0, await e());
 
   await repo.insertOrders([step(5350,60000)]);
-  ck('first fill -> 2', (await e()).executions_observed===2, await e());
+  ck('the first fill is the first execution', (await e()).executions_observed===1, await e());
   await repo.insertOrders([step(6100,120000)]);
-  ck('O2: partial fill gives executions_observed > 1', (await e()).executions_observed===3, await e());
+  ck('O2: a second partial fill is the second', (await e()).executions_observed===2, await e());
 
   // an unchanged sighting must NOT inflate the fee
   await repo.insertOrders([step(6100,180000)]);
-  ck('a repeat sighting does not increment', (await e()).executions_observed===3, await e());
+  ck('a repeat sighting does not increment', (await e()).executions_observed===2, await e());
 
-  // It is a FLOOR, not a count: two fills inside one 60-second poll are seen
-  // as one. The reference 6,100 sell filling as 5,350 + 750 in the same minute
-  // records 1, and the fee — charged per execution — is understated.
-  await db.query("delete from awsat_order_list where order_id='OM-SAMEMIN'");
+  // THE UNMEASURABLE CASE, which used to be quietly answered as 1.
+  // Two fills inside one 60-second poll: the order is FIRST SIGHTED ALREADY
+  // FILLED. The reference 6,100 sell filled as 5,350 + 750 in the same minute —
+  // and nothing in the capture says whether that was one execution or five.
+  // The old answer was a floor of 1, which understated the fee by exactly as
+  // much as it was wrong. The answer now is NULL: unmeasured.
+  await db.query("delete from awsat_order_obs where order_id='OM-SAMEMIN'");
   await repo.insertOrders([{order_id:'OM-SAMEMIN',symbol:'MRC',side:'SELL',
     order_status:'Filled',price:204,quantity:6100,filled_quantity:6100,
     remaining_qty:0,trading_date:'2026-08-25',ingest_source:'awsat_client',
     created_at:new Date()}]);
   const {rows:sm}=await db.query(
     "select executions_observed from awsat_order_list where order_id='OM-SAMEMIN'");
-  ck('both fills in one interval read as 1 — a known UNDERCOUNT',
-     sm[0].executions_observed===1, sm[0]);
+  ck('an order first sighted ALREADY FILLED is UNMEASURED, not 1',
+     sm[0].executions_observed===null, sm[0]);
 
-  // The fee view is what surfaces it.
-  await db.query(`update awsat_order_list set order_value=1244400, net_value=1244397.7
+  // The fee view is what surfaces it — and it must surface it AS unmeasured
+  // rather than dividing the fee by a 1 nobody observed.
+  await db.query(`update awsat_order_obs set order_value=1244400, net_value=1244397.7
     where order_id='OM-SAMEMIN'`);
   const {rows:fc}=await db.query(
-    "select fee_charged, fee_per_execution from order_fee_check where order_id='OM-SAMEMIN'");
+    "select fee_charged, fee_per_execution, executions_unmeasured from order_fee_check where order_id='OM-SAMEMIN'");
   ck('order_fee_check exposes the charged fee', fc.length===1 && Number(fc[0].fee_charged)>0, fc[0]);
-  ck('and a fee-per-execution to compare',
-     fc[0] && Number(fc[0].fee_per_execution)===Number(fc[0].fee_charged), fc[0]);
-  await db.query("delete from awsat_order_list where order_id='OM-SAMEMIN'");
+  ck('and FLAGS that the execution count is unmeasured',
+     fc[0] && fc[0].executions_unmeasured===true, fc[0]);
+  ck('rather than reporting fee/1 as though one execution had been seen',
+     fc[0] && fc[0].fee_per_execution===null, fc[0]);
+  await db.query("delete from awsat_order_obs where order_id='OM-SAMEMIN'");
   ck('filled_quantity final', Number((await e()).filled_quantity)===6100, await e());
 
   // ── O4 · order_id unique and non-null ──
@@ -92,12 +106,12 @@ const srv=app.listen(8810,async()=>{
   ck('O4: order_id unique', u[0].total===u[0].distinct_ids, u[0]);
   ck('O4: order_id never null', u[0].nulls===0, u[0]);
   let dup=false;
-  try { await db.query(`insert into awsat_order_list(order_id,trading_date,ingest_source,created_at)
+  try { await db.query(`insert into awsat_order_obs(order_id,trading_date,ingest_source,created_at)
     values ('OM-1','2026-08-25','awsat_client',now())`); } catch { dup=true; }
   ck('a duplicate order_id is refused by the database', dup===true);
 
   // ── O5 · buys minus sells equals the position ──
-  await db.query("delete from awsat_order_list where order_id like 'OMP%'");
+  await db.query("delete from awsat_order_obs where order_id like 'OMP%'");
   const pos=[
     {orderId:'OMP-1',symbolRaw:'MRC - 510',side:'Buy',status:'Filled',quantity:'3,500',filled:'3,500',netOrdVal:'658,000'},
     {orderId:'OMP-2',symbolRaw:'MRC - 510',side:'Buy',status:'Filled',quantity:'2,600',filled:'2,600',netOrdVal:'488,800'},
@@ -116,12 +130,12 @@ const srv=app.listen(8810,async()=>{
 
   // executions must never be zero — it multiplies the fee
   let bad=false;
-  try { await db.query("update awsat_order_list set executions_observed=0 where order_id='OM-1'"); }
+  try { await db.query("update awsat_order_obs set executions_observed=0 where order_id='OM-1'"); }
   catch { bad=true; }
   ck('executions_observed cannot be set to 0', bad===true);
 
   await clean();
-  await db.query("delete from awsat_order_list where order_id like 'OMP%'");
+  await db.query("delete from awsat_order_obs where order_id like 'OMP%'");
   console.log(`\norder money: ${p}/${n}`);
   srv.close(); await db.close(); process.exit(p===n?0:1);
 });

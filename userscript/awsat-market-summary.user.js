@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AWSAT / DirectFN — Market Summary Capture
 // @namespace    local.trading.tools
-// @version      1.5.0
+// @version      1.5.1
 // @description  Reads the top-panel market summary (Index, Volume, Turnover, Trades, YTD %, Symbols Traded, UPs, Down, Unchanged) once a minute and submits it to Server 1.
 // @match        *://*.awsatbroker.com/*
 // @match        *://awsatbroker.com/*
@@ -27,7 +27,7 @@
   // ── CONFIG ────────────────────────────────────────────────────────────────
   // The running build, shown on the panel: two scripts both reporting
   // 2.0.0 cost a session diagnosing a bug that was already fixed.
-  var VERSION = '1.5.0';
+  var VERSION = '1.5.1';
 
   var SERVER          = 'https://scrapper.99labs.space';
   var TOKEN           = 'CHANGE-ME';               // must equal INGEST_TOKEN
@@ -180,7 +180,35 @@
     });
   }
 
+
+  /*
+   * P2 · AN UNEDITED TOKEN REFUSES, LOUDLY, INSTEAD OF 401-LOOPING.
+   *
+   * This ships 'CHANGE-ME' while awsat-orders and awsat-depth-all ship the real
+   * default. A tab installed and not edited posts with a token the server
+   * rejects — and 401 is deliberately retryable, so the retry queue fills and
+   * then DROPS THE OLDEST MINUTE, every minute. The heartbeat 401s too, so the
+   * server sees nothing at all: not a broken client, not a silent one. It looks
+   * exactly like a tab that was never opened.
+   *
+   * A configuration that cannot work should say so once, not fail invisibly
+   * four hundred times.
+   */
+  var SCRIPT_NAME = 'awsat-market-summary';
+  var TOKEN_PLACEHOLDER = TOKEN === 'CHANGE-ME' || !TOKEN;
+  if (TOKEN_PLACEHOLDER) {
+    try {
+      console.error('[%s] TOKEN is still "%s" — edit it to match INGEST_TOKEN on '
+        + 'the server. NOTHING will be posted until you do.', SCRIPT_NAME, TOKEN);
+    } catch (e) {}
+  }
+
   function post(body) {
+    if (TOKEN_PLACEHOLDER) {
+      stats.lastResult = 'NOT POSTING — TOKEN is still CHANGE-ME. Edit it to '
+        + 'match INGEST_TOKEN on the server.';
+      return Promise.resolve();
+    }
     var batch = { body: Object.assign({ batchId: uuid() }, body) };
     return submit(batch).then(function (j) {
       stats.lastPost = new Date().toLocaleTimeString();
