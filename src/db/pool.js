@@ -65,10 +65,12 @@ log.info(sslMode.describe(SSL_MODE));
 
 const pool = new Pool({
   connectionString: config.db.url,
-  ssl: sslMode.sslOptions(SSL_MODE),
   max: 10,
   idleTimeoutMillis: 30_000,
   connectionTimeoutMillis: 10_000,
+  ssl: {
+    rejectUnauthorized: false
+  }
 });
 
 // An idle client can be dropped by the server or a network device. Without this
