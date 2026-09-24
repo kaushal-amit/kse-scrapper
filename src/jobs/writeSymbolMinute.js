@@ -169,9 +169,62 @@ function derive(now, prev, ts) {
    */
   const ageOf = (prevPrice, prevAge, price) => {
     if (price === null) return null;
-    if (!prev || prevPrice === null || Number(prevPrice) !== price) return 0;
+
+    /*
+     * P3 · NO PREVIOUS ROW MEANS UNMEASURED, NOT "JUST PLACED".
+     *
+     * This was folded into the reset below as `if (!prev || …) return 0`. But
+     * `!prev` is "we have never seen this symbol today", not "the level changed"
+     * — and zero is the single most signal-triggering value this column can
+     * hold.
+     *
+     * previousRow() is scoped to (symbol, trading_date), so the case is neither
+     * rare nor theoretical: it is EXACTLY what happens when the wake-up scan
+     * promotes a symbol into a depth slot mid-session. That symbol's first
+     * symbol_minute row is written at, say, 11:30 with bid_age_secs = 0 for a
+     * bid that has stood all morning, and for the next bait_max_age_secs every
+     * tick with bid_qty over the big-quantity threshold raises BAIT_BID.
+     *
+     * Those signals are graded into signal_log.was_right, so the corruption
+     * lands specifically on the wake-up population — the setups the strategy is
+     * being evaluated on.
+     *
+     * baitBid already declines to fire on an age it does not have, so NULL is
+     * both the honest answer and a no-op everywhere downstream.
+     */
+    if (!prev) return null;
+
+    // The price MOVED, so this level really is new and really is zero seconds
+    // old. This is the only branch where zero is a measurement.
+    if (prevPrice === null || Number(prevPrice) !== price) return 0;
+
+    /*
+     * P4 · AN UNMEASURED AGE STAYS UNMEASURED WHILE THE LEVEL STANDS.
+     *
+     * The P3 fix made the FIRST row null and stopped there. On the second tick
+     * `prev` exists and the price is unchanged, so the reset above does not
+     * fire and this line used to read `(prevAge ?? 0) + elapsed` — converting
+     * the honest null into 0 and adding the gap. Measured:
+     *
+     *   tick1 bid_age_secs = null
+     *   tick2 bid_age_secs = 20      -> BAIT_BID "bid 150,000 only 20s old"
+     *   tick3 bid_age_secs = 40
+     *
+     * So the NULL survived exactly one tick, and from the second onward the
+     * level reported an age it had never had — for the whole
+     * bait_max_age_secs window, which at a 20-second loop is roughly fifteen
+     * ticks of BAIT_BID on a bid that has stood all morning. The wake-up
+     * promotion case the P3 note describes was fixed for one row and left
+     * broken for the rest of the session.
+     *
+     * A level whose start we never saw has no age until it MOVES. Carrying the
+     * null forward is what "unmeasured" means; adding to it is inventing the
+     * measurement we said we did not have.
+     */
+    if (prevAge === null || prevAge === undefined) return null;
+
     const elapsed = Math.round((new Date(ts) - new Date(prev.ts)) / 1000);
-    return (prevAge === null || prevAge === undefined ? 0 : Number(prevAge)) + Math.max(0, elapsed);
+    return Number(prevAge) + Math.max(0, elapsed);
   };
 
   return {

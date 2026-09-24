@@ -45,7 +45,17 @@ const SOURCE_OF = {
  * Beyond this the worker is assumed hung and is terminated.
  */
 const TIMEOUT_MS = {
-  'tradingview.quotes': 120_000,
+  /*
+   * P6-TV-6 · LONGER THAN THE SCRAPE'S OWN WORST CASE.
+   *
+   * tradingview.quotes budgets goto 60s + settle 2s + waitForSelector 30s +
+   * a 90s scroll deadline (TV_SCRAPE_TIMEOUT_MS) ≈ 185s, against a 120s kill.
+   * On a slow morning the worker was terminated while the page was working:
+   * Chromium died, the run was recorded FAILED, and the next minute paid for a
+   * relaunch. The kill is the LAST resort and must sit above the budget the
+   * job gives itself, not inside it.
+   */
+  'tradingview.quotes': 240_000,
   // One chart page per symbol; this is a long job by nature, not a hung one.
   'tradingview.backfill': 45 * 60_000,
   // Login alone measured ~65s on the live terminal; two market sweeps follow.

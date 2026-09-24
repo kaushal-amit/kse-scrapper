@@ -125,6 +125,21 @@ function validateDepthLevel(d) {
     return { ok: false, reason: 'empty book — no bid, offer or quantity on either side' };
   }
 
+  /*
+   * P6-AWS-9 · A CROSSED TOUCH IS A HALF-RENDERED PANEL, NOT A BOOK.
+   *
+   * At level 1 a bid at or above the offer cannot stand in a live market: it
+   * is what the depth panel shows while one side has repainted and the other
+   * has not. Stored, it reads downstream as a free spread — the one shape the
+   * spread strategy would act on hardest. Deeper levels are left alone: they
+   * are allowed to sit inside level 1 while the panel is mid-update, and the
+   * touch is the level every consumer actually reads.
+   */
+  if (d.level === 1 && d.bid !== null && d.offer !== null
+      && Number(d.bid) >= Number(d.offer) && Number(d.offer) > 0) {
+    return { ok: false, reason: `crossed touch: bid ${d.bid} >= offer ${d.offer}` };
+  }
+
   const row = { ...d };
   for (const f of ['bid_qty', 'offer_qty', 'bid_orders', 'offer_orders']) {
     if (isImpossible(row[f], MAX_QUANTITY)) row[f] = null;

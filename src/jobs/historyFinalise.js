@@ -42,7 +42,7 @@ async function finalise(tradingDay, runId) {
   // aggregates come from the same set. Two queries would let it change between.
   const { rows } = await query(`
     WITH captures AS (
-      SELECT symbol, last_price, volume, created_at
+      SELECT symbol, last_price, volume, change_value, change_pct, created_at
         FROM tradingview_watchlist
        WHERE trading_date = $1 AND last_price IS NOT NULL
     ),
@@ -60,12 +60,28 @@ async function finalise(tradingDay, runId) {
         FROM captures ORDER BY symbol, created_at ASC
     ),
     lasts AS (
-      SELECT DISTINCT ON (symbol) symbol, last_price AS close_price
+      SELECT DISTINCT ON (symbol) symbol, last_price AS close_price,
+             -- P6-TV-5 · the venue's OWN change, which is against the PREVIOUS
+             -- CLOSE. close - open computed here is an intraday move, and the
+             -- backfill path writes the prev-close figure into the same two
+             -- columns from TradingView's Change column: two incompatible
+             -- meanings in tradingview_history.change_value, whichever ran last.
+             change_value, change_pct
         FROM captures ORDER BY symbol, created_at DESC
+    ),
+    prev AS (
+      -- The previous session's CLOSE for this symbol, which is what "change"
+      -- is measured against. Used only when the venue did not give a change.
+      SELECT DISTINCT ON (h.symbol) h.symbol, h.close_price AS prev_close
+        FROM tradingview_history h
+       WHERE h.trade_date < $1 AND h.close_price IS NOT NULL
+       ORDER BY h.symbol, h.trade_date DESC
     )
     SELECT b.symbol, b.captures, b.high_price, b.low_price, b.volume,
-           f.open_price, l.close_price
+           f.open_price, l.close_price, l.change_value, l.change_pct,
+           p.prev_close
       FROM bounds b JOIN firsts f USING (symbol) JOIN lasts l USING (symbol)
+      LEFT JOIN prev p USING (symbol)
      ORDER BY b.symbol`, [day]);
 
   if (!rows.length) {
@@ -90,32 +106,57 @@ async function finalise(tradingDay, runId) {
   // exactly what happens when the first attempt fired before the session ended.
   const values = [];
   const tuples = usable.map((r, i) => {
-    const open = Number(r.open_price);
+    // P6-TV-5 · the last capture's own change, against the previous close —
+    // the same definition the backfill writes. NULL when the venue did not
+    // give one: "not measured", never a computed stand-in.
+    // The venue's own figure first; else derived from the PREVIOUS SESSION'S
+    // CLOSE, which is the same question. Never close - open: that is the
+    // intraday move, and the backfill path fills these columns prev-close
+    // based, so the two would disagree depending on which ran last.
     const close = Number(r.close_price);
+    const prevClose = r.prev_close === null || r.prev_close === undefined
+      ? null : Number(r.prev_close);
+    const changeValue = r.change_value !== null && r.change_value !== undefined
+      ? Number(r.change_value)
+      : (prevClose !== null && Number.isFinite(close) ? close - prevClose : null);
+    const changePct = r.change_pct !== null && r.change_pct !== undefined
+      ? Number(r.change_pct)
+      : (prevClose ? Number((((close - prevClose) / prevClose) * 100).toFixed(4)) : null);
     values.push(r.symbol, day, r.open_price, r.high_price, r.low_price, r.close_price,
-      r.volume, close - open,
-      open > 0 ? Number((((close - open) / open) * 100).toFixed(4)) : null);
-    const b = i * 9;
-    return `($${b + 1}, $${b + 2}, $${b + 3}, $${b + 4}, $${b + 5}, $${b + 6}, $${b + 7}, $${b + 8}, $${b + 9})`;
+      r.volume, changeValue, changePct,
+      // P6-TV-8 · the run that wrote the bar, so it can be traced.
+      runId || null);
+    const b = i * 10;
+    return `($${b + 1}, $${b + 2}, $${b + 3}, $${b + 4}, $${b + 5}, $${b + 6}, $${b + 7}, $${b + 8}, $${b + 9}, $${b + 10})`;
   });
 
   const res = await query(
     `INSERT INTO tradingview_history
        (symbol, trade_date, open_price, high_price, low_price, close_price,
-        volume, change_value, change_pct)
+        volume, change_value, change_pct, run_id)
      VALUES ${tuples.join(', ')}
      ON CONFLICT (symbol, trade_date) DO UPDATE SET
        open_price = EXCLUDED.open_price, high_price = EXCLUDED.high_price,
        low_price = EXCLUDED.low_price,   close_price = EXCLUDED.close_price,
        volume = EXCLUDED.volume,
        change_value = EXCLUDED.change_value, change_pct = EXCLUDED.change_pct,
+       run_id = EXCLUDED.run_id,
        session_finalised_at = now(), updated_at = now()
      RETURNING symbol`, values,
   );
 
+  /*
+   * P6-TV-7 · ONLY THE SYMBOLS THIS RUN ACTUALLY FINALISED.
+   *
+   * The blanket UPDATE stamped session_finalised_at on every row of the day —
+   * including the symbols rejected above as too thin to form a bar, and rows
+   * that came from the backfill. It asserted a finalisation that did not
+   * happen, and nothing downstream could tell the two apart.
+   */
   await query(
     `UPDATE tradingview_history SET session_finalised_at = now()
-      WHERE trade_date = $1 AND session_finalised_at IS NULL`, [day]);
+      WHERE trade_date = $1 AND session_finalised_at IS NULL
+        AND symbol = ANY($2::text[])`, [day, usable.map((r) => r.symbol)]);
 
   log.info('history: session finalised from minute data', {
     day, symbols: res.rowCount, skippedThin: thin.length, runId,

@@ -279,17 +279,77 @@ function tapSource() {
   // Measured against a fixture reproducing that shape: the app's cached reply
   // gave 2 of 9 symbols, and because 2 > 0 the full fetch never ran. Only
   // Premier came through and Main was missing entirely.
+  /*
+   * P4 · NO TRY CAP. It backs OFF instead.
+   *
+   * This was `tap.masterTries >= 8`, and nothing anywhere resets masterTries —
+   * so eight attempts at a 2-second interval is SIXTEEN SECONDS, all of them
+   * immediately after login, in the window where the session is least settled.
+   * One correlated failure there (a non-JSON reply while cookies are still
+   * being established, a 502, a brief socket stall) exhausted the cap for the
+   * ENTIRE LIFE OF THE SHARED PAGE — which awsat.js holds open all day, because
+   * logins are capped at two.
+   *
+   * From that point fullMasterFetched stays false, so waitForData never returns
+   * early and every board cycle pays its whole AWSAT_SOCKET_WAIT_MS (60s) and
+   * then returns whatever partial master the app's own cached VRS=n delta
+   * supplied — the exact shape the comment above measures at "2 of 9 symbols,
+   * only Premier, Main missing entirely". Whole markets absent from
+   * awsat_market_quotes for the session, and a session cannot be re-scraped.
+   *
+   * The sibling userscript was fixed for precisely this and says why
+   * (awsat-capture.user.js): "This loop used to stop after eight attempts —
+   * sixteen seconds… A userscript sits in a tab for hours… So: keep trying, and
+   * back off rather than hammer." The depth userscript says "Never gives up".
+   * This file kept the cap and its comment described a behaviour it did not
+   * have.
+   *
+   * Backing off rather than hammering matters here for the same reason it does
+   * there: the account has a two-login-per-day cap, so a request loop against
+   * the broker is worse than the bug it fixes. Every 2s for the first minute,
+   * then every 30s — which still recovers within one board cycle.
+   */
   setInterval(() => {
-    if (tap.fullMasterFetched || !tap.sampleUrl || tap.masterTries >= 8) return;
+    if (tap.fullMasterFetched || !tap.sampleUrl) return;
+
+    const early = tap.masterTries < 30;                 // the first ~60 seconds
+    if (!early && tap.masterTries % 15 !== 0) { tap.masterTries += 1; return; }
     tap.masterTries += 1;
     try {
+      /*
+       * P5 · DONE MEANS *THIS REPLY* ADDED ROWS, NOT THAT THE MAP IS NON-EMPTY.
+       *
+       * The comment below was right and the code did not implement it.
+       * `tap.master` is ALREADY POPULATED by the passive interceptors from the
+       * app's own `price?` request — the same request sampleUrl is harvested
+       * from — so tap.master.size is non-zero before this explicit VRS=0 fetch
+       * ever resolves. And that partial state is the documented normal case:
+       * the comment above measures it at "2 of 9 symbols, only Premier, Main
+       * missing entirely".
+       *
+       * ingestMaster returns early on anything without HED/DAT, and
+       * registerRows without a SYMBOL column. So ANY json-parseable reply that
+       * is not a master — an error envelope, a session-expired object, an empty
+       * DAT — ingested nothing and still latched the flag on the app's
+       * partial. (A 401 HTML page throws in r.json() and was retried correctly;
+       * a JSON error object was not.)
+       *
+       * waitForData then returns INSTANTLY on `fullMaster` with minRows 1,
+       * never reaching the log.warn that exists to announce a short master —
+       * so awsat_market_quotes takes 2 of 137 symbols for the rest of the
+       * session, and a session cannot be re-scraped.
+       *
+       * Measured against the size BEFORE the call, so only a reply that
+       * actually grew the master counts as one.
+       */
+      const before = tap.master.size;
       nativeFetch(buildMasterUrl(tap.sampleUrl), { credentials: 'include' })
         .then((r) => r.json())
         .then((j) => {
           ingestMaster(j);
           // Only counts as done once it actually yielded rows; a failed or
           // empty reply must be retried.
-          if (tap.master.size) tap.fullMasterFetched = true;
+          if (tap.master.size > before) tap.fullMasterFetched = true;
         })
         .catch(() => {});
     } catch { /* ignore */ }

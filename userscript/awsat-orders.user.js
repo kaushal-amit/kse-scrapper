@@ -523,6 +523,24 @@
             || found.widget.querySelector('.ember-table-tables-container')
             || found.widget;
 
+    /*
+     * P6-CLI-1/2 · THE PER-SCAN FIELDS ARE RESET AT THE START OF THE SCAN.
+     *
+     * `stats.shortBy` was assigned only on the scrolling path's completion
+     * branch, and `stats.msg` only when reportUnmapped had something to say.
+     * Both therefore LATCHED: one short capture made `partial: true` on every
+     * later batch for the life of the tab (so complete_capture never advanced,
+     * 041's UNSEEN never fired and slotGuards would not release the slot), and
+     * one "no order id" message made `readNothing` false forever, so a grid
+     * that genuinely emptied could never post its empty, complete capture.
+     *
+     * They describe THIS scan, so they start empty on every scan.
+     */
+    stats.shortBy = 0;
+    stats.msg = null;
+    stats.expected = null;
+    stats.scrollNote = '';
+
     var byId = new Map();
     var noIdRows = [];
     var seen = { rows: 0 };
@@ -540,6 +558,11 @@
 
     var targets = scrollTargets(body);
     if (!targets.length) {
+      stats.expected = expectedRowCount(body);
+      // P6-CLI-1 · a non-scrolling grid can still be short of what it reports.
+      if (stats.expected != null && byId.size < stats.expected) {
+        stats.shortBy = stats.expected - byId.size;
+      }
       stats.scrollNote = 'grid does not scroll — ' + byId.size + ' order(s) from '
         + seen.rows + ' DOM row(s)'
         + (noIdRows.length ? ' · ' + noIdRows.length + ' READ BUT HAD NO ORDER ID' : '');
@@ -725,6 +748,12 @@
       ordVal: num(rec.orderValue),
       netOrdVal: num(rec.netValue),
       statusReason: rec.statusReason || null,
+      // P6-CLI-4 · the grid's placement stamp (adjustedCrdDte) was captured and
+      // then dropped here, so order_time was NULL on every client-path row while
+      // the server path filled it — queue-position and time-in-book analysis is
+      // dead on the live path without it. Sent as the broker prints it; the
+      // server parses it Kuwait-local.
+      stamp: rec.stamp || null,
       orderType: rec.orderType || null,
       exchange: rec.exchange || null,
       // C1 · true when the grid had no id column and this id was derived from
@@ -760,7 +789,40 @@
     });
   }
 
+  /*
+   * P6-CLI-3 · THE QUEUE IS NO DEEPER THAN THE SERVER'S ACCEPT WINDOW.
+   *
+   * The queue held 30 minutes of batches; the server refuses any capture older
+   * than 15 minutes with a 400, and a 400 is classified PERMANENT, so every
+   * batch past the window was shifted off and discarded with nothing said. A
+   * 25-minute outage therefore guaranteed ten minutes of invisible data loss.
+   * Stale batches are now dropped HERE, before the post, and counted where the
+   * panel can show them.
+   */
+  var SERVER_ACCEPT_MS = 15 * 60 * 1000;
+  function dropStale(queue, statsObj) {
+    var cut = Date.now() - SERVER_ACCEPT_MS;
+    var kept = [];
+    for (var i = 0; i < queue.length; i++) {
+      var b = queue[i];
+      var at = b && (b.capturedAt || (b.body && b.body.capturedAt));
+      var t = at ? new Date(at).getTime() : NaN;
+      if (!isNaN(t) && t < cut) { statsObj.dropped = (statsObj.dropped || 0) + 1; continue; }
+      kept.push(b);
+    }
+    if (kept.length !== queue.length) {
+      queue.length = 0;
+      for (var j = 0; j < kept.length; j++) queue.push(kept[j]);
+      statsObj.queued = queue.length;
+      try {
+        console.warn('[ingest] dropped ' + statsObj.dropped + ' batch(es) older than '
+          + (SERVER_ACCEPT_MS / 60000) + ' minutes — the server refuses them');
+      } catch (e) {}
+    }
+  }
+
   function flush() {
+    dropStale(retryQueue, stats);
     if (!retryQueue.length) return Promise.resolve();
     return submit(retryQueue[0]).then(function () {
       retryQueue.shift(); stats.queued = retryQueue.length; return flush();
@@ -957,7 +1019,7 @@
           + (j.rejected ? ', rejected ' + j.rejected : '');
       }).catch(function (e) {
         if (!e.permanent) {
-          if (retryQueue.length >= MAX_RETRY_QUEUE) retryQueue.shift();
+          if (retryQueue.length >= MAX_RETRY_QUEUE) { retryQueue.shift(); stats.dropped = (stats.dropped || 0) + 1; }   // P6-CLI-3 · counted, not silent
           retryQueue.push(batch); stats.queued = retryQueue.length;
           stats.msg = 'failed: ' + e.message + ' — queued';
         } else {

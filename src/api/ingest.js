@@ -59,6 +59,38 @@ function tokenMatches(provided, expected) {
 }
 
 /**
+ * P6-CLI-4 · a broker grid stamp -> a real instant, in Kuwait.
+ *
+ * The cell carries either a full date-time ('25-08-2026 13:14:10', or ISO) or a
+ * bare clock. A bare clock is taken on the batch's own trading day; a date in
+ * the text wins over it, because a carried order was placed in an earlier
+ * session. Anything unparseable is NULL: the column means "when the broker says
+ * it was placed", and a guess there is worse than an absence.
+ *
+ * Kuwait does not observe DST, so +03:00 is a constant — the same reasoning
+ * src/scrapers/awsat.js:toKuwaitInstant is written on.
+ */
+function clientOrderTime(raw, tradingDate) {
+  if (raw === null || raw === undefined) return null;
+  const t = String(raw).trim();
+  if (!t) return null;
+
+  const clock = /(\d{1,2}):(\d{2})(?::(\d{2}))?/.exec(t);
+  if (!clock) return null;
+  const hhmmss = `${String(clock[1]).padStart(2, '0')}:${clock[2]}:${clock[3] || '00'}`;
+
+  let day = tradingDate;
+  const iso = /(\d{4})-(\d{2})-(\d{2})/.exec(t);
+  const dmy = /\b(\d{1,2})[-/](\d{1,2})[-/](\d{4})\b/.exec(t);
+  if (iso) day = `${iso[1]}-${iso[2]}-${iso[3]}`;
+  else if (dmy) day = `${dmy[3]}-${String(dmy[2]).padStart(2, '0')}-${String(dmy[1]).padStart(2, '0')}`;
+  if (!day) return null;
+
+  const d = new Date(`${day}T${hhmmss}+03:00`);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+/**
  * Reject a capture timestamp that is not plausibly now.
  *
  * A batch stamped hours ago is either a client that sat in a background tab or
@@ -279,7 +311,34 @@ function toQuoteRow(r, meta) {
     open_price: n(r.open),
     high_price: n(r.high),
     low_price: n(r.low),
-    session: r.session || null,
+    /*
+     * P5 · AN EMPTY SESSION CELL IS NOT AN ABSENT ONE, AND `|| null` ERASED
+     * THE DIFFERENCE.
+     *
+     * symbolDayMetrics states the rule and depends on it: "'' sits with
+     * Trading: it is a JULY CAPTURE DEFECT, not an exchange state — those rows
+     * are 09:00-12:59 continuous trading whose label was not captured. NULL is
+     * excluded entirely: those are 14:13-14:23 Friday reads, after the close on
+     * a non-trading day, and their volume is cumulative rather than new."
+     *
+     * `'' || null` is null. So every continuous-trading row whose session cell
+     * failed to render was stored as the Friday shape — and closeRow,
+     * priceBlock, rangeSource, previousCloses and (since P3/P4) ownSession all
+     * discard it.
+     *
+     * That was survivable while only volumeBlock filtered. It stopped being
+     * survivable when P4 moved the filter into volumeSteps: a symbol whose
+     * label drops for a stretch of the morning now loses those steps from
+     * up_moves, down_moves, peak_hour and every flow column — and if the label
+     * never renders all session, close_px, open_px, total_volume and the whole
+     * flow block go NULL for a symbol that traded normally, indistinguishable
+     * from one that did not trade at all.
+     *
+     * A capture defect and a non-trading day are different facts. The client
+     * sending an empty string is saying "the cell was there and was blank";
+     * sending nothing is saying "there was no cell". Both are preserved.
+     */
+    session: r.session === undefined || r.session === null ? null : String(r.session),
     nms: n(r.nms),
     trading_date: meta.tradingDate,
     source: 'awsat',
@@ -849,8 +908,11 @@ function createRouter() {
                 inet_server_port() AS port,
                 (SELECT count(*) FROM client_submissions
                   WHERE received_at > now() - interval '24 hours')::int AS submissions_24h,
+                -- P6-CLI-8 · the KUWAIT day. trading_date is Kuwait-derived and
+                -- CURRENT_DATE is the database server's; on a UTC host this
+                -- read 0 between 00:00 and 03:00 Kuwait while the feed ran.
                 (SELECT count(*) FROM awsat_market_quotes
-                  WHERE trading_date = CURRENT_DATE)::int AS quotes_today`);
+                  WHERE trading_date = (now() AT TIME ZONE 'Asia/Kuwait')::date)::int AS quotes_today`);
       db = { reachable: true, ...rows[0] };
     } catch (err) {
       db = { reachable: false, error: err.message };
@@ -990,7 +1052,25 @@ function createRouter() {
            FROM cap`, [when.capturedAt]);
 
       const captured = new Date(when.capturedAt);
-      const isSessionDay = sess.length ? sess[0].is_session_day : false;
+      /*
+       * P6-CLI-6 · A HOLIDAY IS NOT A SESSION, WHATEVER THE QUOTES SAY.
+       *
+       * The SQL above asks "did any quote row land on this day?" — and on an
+       * Eid weekday the capture userscript is still open and still posting the
+       * previous close's board, which CREATES those very rows. The summary was
+       * then stored LIVE/CLOSE and broker_seen_at stamped on a day that never
+       * traded. The calendar (market/holidays, migration 040) is the authority
+       * the rest of the scheduler already uses; it is consulted here too.
+       */
+      const isSessionDay = sess.length
+        ? sess[0].is_session_day && clock.isTradingDay(captured)
+        : false;
+      if (sess.length && sess[0].is_session_day && !isSessionDay) {
+        log.warn('market summary captured on a non-session day (holiday calendar) — '
+          + 'filed against the last day that traded', {
+          captureDay: sess[0].capture_day, lastTraded: sess[0].last_traded,
+        });
+      }
       const tradingDate = isSessionDay
         ? sess[0].capture_day
         : (sess[0] && sess[0].last_traded) || clock.tradingDay();
@@ -1077,7 +1157,8 @@ function createRouter() {
       await query(
         `UPDATE instruments
             SET broker_status = $2,
-                broker_status_on = CURRENT_DATE,
+                -- P6-CLI-8 · the Kuwait day, like every other date in this schema.
+                broker_status_on = (now() AT TIME ZONE 'Asia/Kuwait')::date,
                 updated_at = now()
           WHERE symbol = ANY($1)
             -- Only on a CHANGE, so broker_status_on is the date it changed
@@ -1337,9 +1418,21 @@ function createRouter() {
        * ingest — a freshness check that can fail the capture it observes has
        * the priority backwards.
        */
-      const freshness = await boardFreshness.recordAndCheck({
-        rows: checked.rows, capturedAt: when.capturedAt, tradingDate: meta.tradingDate, source,
-      });
+      /*
+       * P6-CLI-5 · ONLY INSIDE THE TRADING WINDOW.
+       *
+       * No userscript stops posting at the close, so from 13:30 until the tab
+       * is shut the same board is posted every 60 s — byte-identical, because
+       * the market is shut. Three of those tripped `frozen`, logged QUOTES FEED
+       * DEGRADED and left /health DEGRADED for the rest of the day, EVERY day.
+       * A frozen board only means something while the market is open, and a
+       * detector that cries wolf daily is one nobody reads.
+       */
+      const freshness = clock.isWithinWindow(new Date(when.capturedAt))
+        ? await boardFreshness.recordAndCheck({
+          rows: checked.rows, capturedAt: when.capturedAt, tradingDate: meta.tradingDate, source,
+        })
+        : { frozen: false, checked: false, reason: 'outside the trading window' };
 
       await recordSubmission(batchId, 'quotes', source, when.capturedAt, counts);
       // The quotes handler derives a per-row trading_date from each record's
@@ -1570,7 +1663,10 @@ function createRouter() {
           remaining_qty: parse.toNumber(o.remaining ?? o.pendQty)
             ?? ((quantity !== null && filled !== null && filled <= quantity)
               ? quantity - filled : null),
-          order_time: null,
+          // P6-CLI-4 · the placement stamp the grid shows, read Kuwait-local
+          // exactly as the server-side scraper reads it (awsat.toKuwaitInstant).
+          // Absent or unparseable stays NULL — "not captured", never a guess.
+          order_time: clientOrderTime(o.stamp ?? o.orderTime ?? o.order_time, tradingDate),
           trading_date: tradingDate,
           ingest_source: 'awsat_client',
           avg_price: money('avgPrice', 'avg_price'),
@@ -1624,5 +1720,5 @@ function createRouter() {
   return router;
 }
 
-module.exports = { createRouter, toQuoteRow, checkCapturedAt, tokenMatches, PRECEDENCE,
+module.exports = { createRouter, toQuoteRow, checkCapturedAt, clientOrderTime, tokenMatches, PRECEDENCE,
   recordHeartbeat, staleScripts, scriptRoster, EXPECTED_SCRIPTS };

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AWSAT / DirectFN — Market Summary Capture
 // @namespace    local.trading.tools
-// @version      1.5.1
+// @version      1.5.2
 // @description  Reads the top-panel market summary (Index, Volume, Turnover, Trades, YTD %, Symbols Traded, UPs, Down, Unchanged) once a minute and submits it to Server 1.
 // @match        *://*.awsatbroker.com/*
 // @match        *://awsatbroker.com/*
@@ -27,7 +27,7 @@
   // ── CONFIG ────────────────────────────────────────────────────────────────
   // The running build, shown on the panel: two scripts both reporting
   // 2.0.0 cost a session diagnosing a bug that was already fixed.
-  var VERSION = '1.5.1';
+  var VERSION = '1.5.2';
 
   var SERVER          = 'https://scrapper.99labs.space';
   var TOKEN           = 'CHANGE-ME';               // must equal INGEST_TOKEN
@@ -56,11 +56,28 @@
     return 'b-' + Date.now() + '-' + Math.random().toString(16).slice(2);
   }
 
+  /*
+   * P6-CLI-7 · THE PANEL ABBREVIATES, AND parseFloat DOES NOT.
+   *
+   * Turnover and volume render as "845.96M" / "1.24B". parseFloat stopped at
+   * the suffix and sent 845.96 — understating the figure by a factor of a
+   * million, with nothing to show it happened, because the server's
+   * parse.toNumber (which handles exactly this) only ever saw the bare number
+   * this function had already produced. A currency code can follow the
+   * multiplier ("MKWF"), so it comes off first.
+   */
   function parseNum(text) {
     if (text == null) return null;
     var cleaned = String(text).replace(/\u2212/g, '-').replace(/[,%\s]/g, '');
+    cleaned = cleaned.replace(/(KWF|KWD|USD|SAR|AED|EUR|GBP)$/i, '');
+    var mult = 1;
+    var suffix = /([KMB])$/i.exec(cleaned);
+    if (suffix) {
+      mult = { K: 1e3, M: 1e6, B: 1e9 }[suffix[1].toUpperCase()];
+      cleaned = cleaned.slice(0, -1);
+    }
     var n = parseFloat(cleaned);
-    return isNaN(n) ? null : n;
+    return isNaN(n) ? null : n * mult;
   }
 
   function collectDocs(doc, acc) {
@@ -168,7 +185,35 @@
     });
   }
 
+  /*
+   * P6-CLI-3 · the queue is no deeper than the server's 15-minute accept
+   * window: a batch past it is refused with a 400, classified PERMANENT and
+   * discarded silently. Stale batches are dropped here instead, and counted.
+   */
+  var SERVER_ACCEPT_MS = 15 * 60 * 1000;
+  function dropStale(queue, statsObj) {
+    var cut = Date.now() - SERVER_ACCEPT_MS;
+    var kept = [];
+    for (var i = 0; i < queue.length; i++) {
+      var b = queue[i];
+      var at = b && (b.capturedAt || (b.body && b.body.capturedAt));
+      var t = at ? new Date(at).getTime() : NaN;
+      if (!isNaN(t) && t < cut) { statsObj.dropped = (statsObj.dropped || 0) + 1; continue; }
+      kept.push(b);
+    }
+    if (kept.length !== queue.length) {
+      queue.length = 0;
+      for (var j = 0; j < kept.length; j++) queue.push(kept[j]);
+      statsObj.queued = queue.length;
+      try {
+        console.warn('[ingest] dropped ' + statsObj.dropped + ' batch(es) older than '
+          + (SERVER_ACCEPT_MS / 60000) + ' minutes — the server refuses them');
+      } catch (e) {}
+    }
+  }
+
   function flushQueue() {
+    dropStale(retryQueue, stats);
     if (!retryQueue.length) return Promise.resolve();
     var batch = retryQueue[0];
     return submit(batch).then(function () {
@@ -217,7 +262,7 @@
       refresh();
     }).catch(function (e) {
       if (!e.permanent) {
-        if (retryQueue.length >= MAX_RETRY_QUEUE) retryQueue.shift();
+        if (retryQueue.length >= MAX_RETRY_QUEUE) { retryQueue.shift(); stats.dropped = (stats.dropped || 0) + 1; }   // P6-CLI-3 · counted, not silent
         retryQueue.push(batch);
         stats.queued = retryQueue.length;
       }
@@ -229,6 +274,16 @@
   // Per-cycle check-in (see /ingest/heartbeat) — every cycle, captured or not,
   // so a stopped or blind market-summary script is visible, not silently absent.
   function heartbeat(rowsSeen, problem) {
+    /*
+     * P4 · THE HEARTBEAT WAS NOT GATED, AND THE P2 COMMENT NAMED IT.
+     *
+     * post() refuses under the placeholder token; heartbeat() did not, so it
+     * went on 401-ing every cycle — which is the second half of the failure the
+     * P2 note describes in as many words: "The heartbeat 401s too, so the
+     * server sees nothing at all." Gating half a mechanism leaves the half that
+     * was quoted as the reason.
+     */
+    if (TOKEN_PLACEHOLDER) return;
     fetch(SERVER + '/ingest/heartbeat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + TOKEN },

@@ -365,30 +365,83 @@ async function persistQuotes(quotes, symbols, extractedCount) {
   };
 }
 
+/*
+ * P6-TV-3 / P6-AWS-8 · A TRUNCATED BOARD IS PARTIAL, NOT SUCCESS.
+ *
+ * Neither board job compared what it captured against the universe it is
+ * supposed to cover, so a scroll that stopped at 60 of 137 symbols — an early
+ * `unchanged >= 3` exit, a scrape deadline, a render pause — was written
+ * SUCCESS. On the TradingView side that is worse than a gap: the watchlist is
+ * the REFERENCE the AWSAT reconciliation measures itself against, so a short
+ * TradingView sweep silently lowers the bar for everything downstream.
+ *
+ * The floor is a fraction of the reference universe, configurable, and the
+ * run is PARTIAL below it — which finishRun already stores and logs as a
+ * degraded run (F-04).
+ */
+const COVERAGE_MIN_PCT = require('./config/thresholds').get('board_coverage_min_pct');
+
+async function coverageStatus(symbolSet, source) {
+  const r = await require('./reconcileSymbols')
+    .check(symbolSet, { source })
+    .catch((err) => { log.warn('symbol reconciliation failed', { err: err.message }); return null; });
+  if (!r || r.checked === false) return null;   // nothing to compare against yet
+  if (r.coveragePct < COVERAGE_MIN_PCT) {
+    log.error('board coverage is below the floor — recording PARTIAL', {
+      source, ...r, floorPct: COVERAGE_MIN_PCT, missingSymbols: undefined,
+    });
+    return 'PARTIAL';
+  }
+  return null;
+}
+
 async function tradingviewQuotes(runId) {
   const { quotes, symbols } = await workerHost.runScrape('tradingview.quotes', runId);
   if (!quotes.length) return { extracted: 0, inserted: 0, rejected: 0 };
-  return persistQuotes(quotes, symbols, quotes.length);
+  const result = await persistQuotes(quotes, symbols, quotes.length);
+  const status = await coverageStatus(new Set(quotes.map((q) => q.symbol)), 'tradingview');
+  return status ? { ...result, status } : result;
 }
 
 async function awsatBoard(runId) {
-  const { quotes, symbols } = await workerHost.runScrape('awsat.board', runId);
+  const { quotes, symbols, truncated } = await workerHost.runScrape('awsat.board', runId);
   if (!quotes.length) return { extracted: 0, inserted: 0, rejected: 0 };
 
   const result = await persistQuotes(quotes, symbols, quotes.length);
 
   // Same check the client path runs, so coverage is reported whichever
-  // collector is active.
-  await require('./reconcileSymbols')
-    .check(new Set(quotes.map((q) => q.symbol)), { source: 'awsat_server' })
-    .catch((err) => log.warn('symbol reconciliation failed', { err: err.message }));
+  // collector is active — and P6-AWS-8: below the floor the run is PARTIAL,
+  // not a SUCCESS with two thirds of the market missing.
+  const status = await coverageStatus(new Set(quotes.map((q) => q.symbol)), 'awsat_server');
 
-  return result;
+  // P6-AWS-4 · a sweep that stalled before the bottom of the list is partial
+  // whatever the coverage check says (the reference itself can be short).
+  const finalStatus = truncated ? 'PARTIAL' : status;
+
+  return finalStatus ? { ...result, status: finalStatus } : result;
 }
 
 async function awsatDepth(runId) {
-  const { levels, symbols } = await workerHost.runScrape('awsat.depth', runId);
-  if (!levels.length) return { extracted: 0, inserted: 0, rejected: 0 };
+  const { levels, symbols, wanted } = await workerHost.runScrape('awsat.depth', runId);
+  /*
+   * P6-AWS-3 · DEPTH WITH NO ROWS IS NOT A SUCCESS.
+   *
+   * Every per-symbol failure inside scrapeDepth is a `continue` — an overlay
+   * back on screen, a moved search box, a renamed panel — so a sweep in which
+   * EVERY slot failed returned `{levels: []}` and was recorded SUCCESS with
+   * zero rows. "There is no book" and "we could not read the book" then look
+   * identical in scrape_runs, which is the one thing this repository's own
+   * header says must never be true.
+   */
+  if (!levels.length) {
+    const asked = Array.isArray(wanted) ? wanted.length : 0;
+    if (asked > 0) {
+      log.error('depth swept every slot and produced NO levels — recording PARTIAL',
+        { slots: asked });
+      return { extracted: 0, inserted: 0, rejected: 0, status: 'PARTIAL', skipped: asked };
+    }
+    return { extracted: 0, inserted: 0, rejected: 0 };
+  }
 
   const checked = validate.validateAll(levels, validate.validateDepthLevel, 'awsat_stock_depth');
   if (symbols && symbols.length) await repo.upsertSymbols(symbols);
@@ -704,14 +757,38 @@ async function tradingviewBackfill(runId) {
   }
   const endDay = clock.tradingDay();
   const days = Number(process.env.HISTORY_DAYS) || 30;
-  const startDay = new Date(Date.now() - days * 86400_000).toISOString().slice(0, 10);
+  // P6-TV-9 · both ends in the SAME timezone. endDay is the Kuwait trading day
+  // and startDay was a UTC slice, so near UTC midnight the window was a day
+  // wider at one end than at the other.
+  const startDay = clock.tradingDay(new Date(Date.now() - days * 86400_000));
 
-  const { rows } = await workerHost.runScrape('tradingview.backfill', runId, {
+  const { rows, failures, skipped } = await workerHost.runScrape('tradingview.backfill', runId, {
     symbols, startDay, endDay,
   });
-  if (!rows.length) return { extracted: 0, inserted: 0, rejected: 0 };
+  /*
+   * P6-TV-1 · A BACKFILL THAT FAILED MOST OF ITS SYMBOLS IS NOT A SUCCESS.
+   *
+   * scrape() only throws when EVERY symbol produced nothing; the per-symbol
+   * failure list came back and was thrown away, so 130 of 137 symbols failing
+   * their context menu was recorded SUCCESS with rejected: 0 and seven symbols
+   * of history. The failures are counted as rejected and the run is PARTIAL.
+   */
+  const failed = Array.isArray(failures) ? failures.length : 0;
+  if (failed) {
+    log.error('backfill: symbols that produced no history', {
+      count: failed, of: symbols.length, symbols: (failures || []).slice(0, 20),
+    });
+  }
+  if (!rows.length) {
+    return { extracted: 0, inserted: 0, rejected: failed, ...(failed ? { status: 'PARTIAL' } : {}) };
+  }
   const res = await repo.upsertDailyPrices(rows);
-  return { extracted: rows.length, inserted: res.inserted, rejected: res.rejected };
+  return {
+    extracted: rows.length,
+    inserted: res.inserted,
+    rejected: res.rejected + failed,
+    ...(failed ? { status: 'PARTIAL', skipped: skipped || failed } : {}),
+  };
 }
 
 const JOBS = {

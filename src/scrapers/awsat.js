@@ -231,7 +231,22 @@ const NUMERIC = new Set([
 const TRANSIENT = /(جاري|جارٍ|authenticat|logging|loading|please\s*wait|connecting|\.\.\.\s*$)/i;
 
 let loggedIn = false;
-let loginFailed = false;
+/*
+ * P6-AWS-1 · THE LOGIN LATCH IS A COOLDOWN, NOT A DAY-LONG DISABLE.
+ *
+ * `loginFailed = true` was set on ANY login failure and never cleared anywhere
+ * in the process. One slow morning — a 60s page.goto timeout at 09:00 — and
+ * every AWSAT job for the rest of the session threw with `skipped = true`,
+ * which jobs.js records as SKIPPED and deliberately excludes from
+ * consecutive_failures: no rows, no alarm, until the worker was restarted.
+ *
+ * The broker's attempt cap is enforced by loginGuard (persistently, across
+ * restarts), so a retry after the cooldown cannot spend more than the budget
+ * allows — the guard refuses it. The latch's only job is to stop a hot loop
+ * of logins inside one minute.
+ */
+const LOGIN_RETRY_COOLDOWN_MS = require('../config/thresholds').get('awsat_login_retry_cooldown_ms');
+let loginFailedAt = 0;
 
 /**
  * ONE page, shared by every AWSAT job in this worker.
@@ -407,10 +422,18 @@ async function ensureLogin(page) {
   if (!config.awsat.user || !config.awsat.pass) {
     throw new Error('AWSAT_USER and AWSAT_PASS are not set');
   }
-  if (loginFailed) {
-    const err = new Error('AWSAT login already failed in this worker; not retried here');
-    err.skipped = true;
-    throw err;
+  if (loginFailedAt) {
+    const sinceMs = Date.now() - loginFailedAt;
+    if (sinceMs < LOGIN_RETRY_COOLDOWN_MS) {
+      const err = new Error(`AWSAT login failed ${Math.round(sinceMs / 1000)}s ago; `
+        + `not retried for another ${Math.round((LOGIN_RETRY_COOLDOWN_MS - sinceMs) / 1000)}s`);
+      err.skipped = true;
+      throw err;
+    }
+    // P6-AWS-1 · the cooldown has passed: try again. loginGuard still owns the
+    // broker's daily attempt budget and will refuse if it is spent.
+    loginFailedAt = 0;
+    log.info('awsat: login cooldown elapsed — retrying login', guard.summary());
   }
 
   /*
@@ -534,7 +557,7 @@ async function ensureLogin(page) {
     guard.recordSuccess();
     log.info('awsat: logged in', guard.summary());
   } catch (err) {
-    loginFailed = true;
+    loginFailedAt = Date.now();
     const shown = await page.textContent(SEL.errorMsg).catch(() => '');
     const detail = `${err.message} ${shown || ''}`;
     // WHAT COUNTS AS A LOCKOUT, precisely.
@@ -798,6 +821,28 @@ async function scrapeBoardFromSocket({ runId, createdAt, tradingDate, batchId })
     );
   }
 
+  /*
+   * P6-AWS-2 · A DEAD SOCKET IS NOT A LIVE BOARD.
+   *
+   * The tap's row map is never expired, and waitForData returns the moment it
+   * holds enough rows. So when the terminal's wsqs socket drops, the last
+   * frames stay in the map and every cycle afterwards writes byte-identical
+   * prices stamped created_at = now(): a frozen board stored as current market
+   * data, which nothing downstream can tell from a market standing still. The
+   * age of the LAST FRAME (not of a symbol's price) is the evidence, and past
+   * the limit the capture refuses rather than inventing a live board.
+   */
+  const maxFrameAgeMs = require('../config/thresholds').get('awsat_socket_max_frame_age_ms');
+  if (maxFrameAgeMs > 0 && data.lastFrameAgeMs != null && data.lastFrameAgeMs > maxFrameAgeMs) {
+    throw new Error(
+      `the price socket has delivered no frame for ${Math.round(data.lastFrameAgeMs / 1000)}s `
+      + `(limit ${Math.round(maxFrameAgeMs / 1000)}s) — the rows still in the tap are the last `
+      + 'ones it received, and storing them now would record a dead feed as a live board.\n'
+      + '  Reload the terminal tab, or raise AWSAT_SOCKET_MAX_FRAME_AGE_MS if the market is '
+      + 'genuinely this quiet.',
+    );
+  }
+
   if (data.unmatchedCount) {
     // A rising unmatched count means the master is stale — which looks exactly
     // like symbols disappearing from the board.
@@ -963,6 +1008,7 @@ async function scrapeBoard({ runId }) {
     const box = el ? await el.boundingBox().catch(() => null) : null;
 
     const quotes = [];
+    let truncated = false;          // P6-AWS-4 · a sweep that stopped short
     const symbols = [];
     const seenAcrossMarkets = new Set();
 
@@ -1014,6 +1060,7 @@ async function scrapeBoard({ runId }) {
 
       const collected = new Map();
       let stalls = 0;
+      let atBottom = null;          // P6-AWS-4 · what the container says
 
       for (let n = 0; n < HARD_SCROLL_CAP; n += 1) {
         const before = collected.size;
@@ -1031,6 +1078,11 @@ async function scrapeBoard({ runId }) {
             const raw = rec[cellId];
             if (raw === undefined || TRANSIENT.test(raw || '')) continue;
             if (col === 'last_trade_date') row[col] = toDate(raw);
+            // P6-AWS-5 · last_trade_time is a `time` column (migration 014) and
+            // the cell can carry a whole date-time. parse.clean() passed the raw
+            // text straight into the cast, which failed the chunk and rejected
+            // every quote in it row by row. The socket path already does this.
+            else if (col === 'last_trade_time') row[col] = parse.toTime(raw);
             else if (NUMERIC.has(col)) row[col] = num(raw, SIGNED.has(col));
             else row[col] = parse.clean(raw);
           }
@@ -1046,7 +1098,29 @@ async function scrapeBoard({ runId }) {
 
         if (collected.size === before) {
           stalls += 1;
-          if (stalls >= MAX_STALLS) break;
+          if (stalls >= MAX_STALLS) {
+            /*
+             * P6-AWS-4 · A STALL IS NOT THE BOTTOM.
+             *
+             * The sweep ended after MAX_STALLS windows with no new symbol and
+             * stored whatever it had as the market — but a render pause of a
+             * few seconds produces exactly that, mid-board. The container
+             * knows where it is; ask it, and say so when the sweep stopped
+             * short, so a truncated board is visible instead of looking like
+             * a market with sixty symbols in it.
+             */
+            atBottom = await boardPage.evaluate((sel) => {
+              const el = document.querySelector(sel);
+              if (!el) return null;
+              return el.scrollTop + el.clientHeight >= el.scrollHeight - 2;
+            }, SEL.bodyContainer).catch(() => null);
+            if (atBottom === false) {
+              log.error('awsat: the board sweep stalled BEFORE the bottom — the rows '
+                + 'collected are not the whole market', { market, symbols: collected.size });
+              truncated = true;
+            }
+            break;
+          }
         } else stalls = 0;
 
         await wheelStep(boardPage, box);
@@ -1078,6 +1152,12 @@ async function scrapeBoard({ runId }) {
       });
     }
 
+    if (truncated) {
+      // P6-AWS-4 · the caller decides what to do; the capture says what it is.
+      log.error('awsat: at least one market was swept only partially — the DOM '
+        + 'board is NOT the whole market this cycle');
+    }
+
     if (BOARD_MODE === 'both' && socketOut) {
       log.info('awsat: SOCKET vs DOM comparison',
         compareBoards(socketOut.quotes, quotes));
@@ -1090,7 +1170,9 @@ async function scrapeBoard({ runId }) {
         `AWSAT board produced no rows across: ${MARKETS.join(', ')}.`,
       );
     }
-    return { quotes, symbols };
+    // P6-AWS-4 · carried out so the job can record PARTIAL rather than storing
+    // a short board as the market.
+    return { quotes, symbols, truncated };
   });
 }
 
@@ -1100,8 +1182,21 @@ async function scrapeDepth({ runId }) {
   const wanted = config.awsat.depthSymbols;
   if (!wanted.length) {
     log.info('awsat: DEPTH_SYMBOLS is empty — skipping depth');
-    return { levels: [], symbols: [] };
+    return { levels: [], symbols: [], wanted: [] };
   }
+
+  /*
+   * P6-AWS-7 · THE SWEEP FINISHES INSIDE ITS OWN TIMEOUT, WITH WHAT IT HAS.
+   *
+   * The worst case per symbol is a 10s click plus a 15s waitForFunction plus
+   * an 8s panel search — eight slots of that, on top of a login, exceeds the
+   * 300s the worker host allows. The worker is then TERMINATED, and every
+   * level gathered so far (they only leave this function at the end) is lost
+   * along with one of the two daily logins. The sweep now stops itself just
+   * short of that and returns the books it did read.
+   */
+  const sweepBudgetMs = require('../config/thresholds').get('awsat_depth_sweep_ms');
+  const deadline = Date.now() + sweepBudgetMs;
 
   const tradingDate = clock.tradingDay();
 
@@ -1132,6 +1227,12 @@ async function scrapeDepth({ runId }) {
     }
 
     for (const raw of wanted) {
+      if (Date.now() > deadline) {
+        log.error('awsat: depth sweep hit its time budget — returning the books '
+          + 'read so far rather than losing them to the worker timeout',
+        { budgetMs: sweepBudgetMs, read: levels.length });
+        break;
+      }
       const symbol = parse.toSymbol(raw);
       if (!symbol) continue;
       const createdAt = new Date();   // one stamp per book, so it reassembles
@@ -1369,7 +1470,7 @@ async function scrapeDepth({ runId }) {
       }
     }
 
-    return { levels, symbols: [] };
+    return { levels, symbols: [], wanted };
   });
 }
 

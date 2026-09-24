@@ -70,9 +70,34 @@ function tradingDayOf(at) {
 
 const MIN_MOVE_FILS = require('../config/thresholds').get('score_min_move_fils');
 
-/** Grade one horizon's price against the signal's claim. null = not gradable. */
+/**
+ * Grade one horizon's price against the signal's claim. null = not gradable.
+ *
+ * P5 · ZERO IS NOT A PRICE ON EITHER SIDE OF THE SUBTRACTION.
+ *
+ * P4 guarded the FORWARD price — both branches of priceAfter now require
+ * `last_price > 0` — and left the other operand of the same subtraction
+ * unguarded. signal_log.price comes from jobs.js writing now.last_price with no
+ * floor into a bare numeric column with no CHECK, and validate.js rejects only
+ * a NEGATIVE price, so a zero is storable.
+ *
+ * Two signals reach here without reading last_price at all: WALL_PULLED and
+ * NO_PROTECTION are computed from the depth ladder, which latestObservation
+ * takes from the depth capture while the price comes from the quotes capture.
+ * So a row whose quote grid had gone empty — last_price 0 — still fires them.
+ *
+ * grade(0, 204, 'up') was TRUE: a 204-fil rise recorded for a stock that did
+ * not move, on WALL_PULLED, BUYERS_8_5 and HALT_RESUME. The exact mirror of the
+ * defect P4 fixed for the four 'down' families, in the same column, in the same
+ * evidence base. mirrorHalts inserts resume_price_fils as `price` with no floor
+ * either, so HALT_RESUME — the one setup the strategy is built on — takes the
+ * same route from the backend's side.
+ *
+ * Guarding one operand of a difference is not guarding the difference.
+ */
 function grade(base, px, mode) {
   if (base == null || px == null || !mode || mode === 'none') return null;
+  if (Number(base) <= 0 || Number(px) <= 0) return null;
   const move = Number(px) - Number(base);
   if (mode === 'up') return move >= MIN_MOVE_FILS;
   if (mode === 'down') return -move >= MIN_MOVE_FILS;
@@ -123,7 +148,25 @@ async function priceAfter(symbol, from, minutes) {
         AND ts >= $2::timestamptz + ($3 || ' minutes')::interval
         AND ts <  $2::timestamptz + (($3::int + $5::int) || ' minutes')::interval
         AND trading_date = $4::date
-        AND last_price IS NOT NULL
+        -- P4 · "> 0", which the quotes fallback below has always had and this
+        -- branch did not — and this branch is consulted FIRST and returns on
+        -- any non-null row, so the guarded fallback never ran.
+        --
+        -- Zero is stored as a measurement on purpose: validate.js rejects only
+        -- a NEGATIVE price, and negative-prices.test.js asserts "zero is a
+        -- measurement and survives". latestObservation copies last_price
+        -- through num() with no floor, so a zero reaches symbol_minute whenever
+        -- a slotted symbol's book goes empty — the 398-row shape
+        -- empty-books.test.js documents.
+        --
+        -- A zero five minutes after a signal made px_5min = 0 and graded a
+        -- 200-fil FALL that never happened, so the four 'down' families —
+        -- NO_PROTECTION, BID_EMPTY, BAIT_BID, WALL_PLACED — were recorded as
+        -- RIGHT in the evidence base the strategy is judged on, precisely when
+        -- the book they warn about had emptied.
+        --
+        -- Same class as the zero book in symbolDayMetrics: zero is not a price.
+        AND last_price IS NOT NULL AND last_price > 0
       ORDER BY ts ASC LIMIT 1`, [symbol, from, minutes, tradingDayOf(from), FORWARD_TOLERANCE_MIN],
   );
   if (rows.length) return Number(rows[0].last_price);

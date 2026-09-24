@@ -91,6 +91,38 @@ function ordered(rows) {
 }
 
 /**
+ * The rows that belong to THIS session.
+ *
+ * P4 · ONE FILTER, AT THE ONE PLACE EVERY BLOCK PASSES THROUGH.
+ *
+ * P3 gave volumeBlock a session filter and stopped there. movementBlock,
+ * flowBlock, spreadBlock and peakHour each still called volumeSteps(rows) on
+ * the raw array — and every number those blocks produce is a multiple of a
+ * volume DELTA, so the rows the filter exists to exclude poisoned them all.
+ *
+ * On the mixed fixture pass3-fixes.test.js already builds — a real session plus
+ * one stray unlabelled read — volumeBlock correctly said 9,000 shares while
+ * flowBlock said turnover_kd 20,199,793 and peakHour said hour 14, which is
+ * after END_TIME. One symbol_day row contradicting itself about one session:
+ * the exact defect the P3 fix was written for, surviving in four of the five
+ * places it lives.
+ *
+ * Fixing it five times would leave a sixth for the next reader. volumeSteps is
+ * the choke point — every step-derived number in this file comes through it —
+ * so the filter goes here, and the blocks inherit it without knowing.
+ *
+ * WHAT THIS EXCLUDES, precisely: a row with NO session. Those are the
+ * 14:13-14:23 Friday reads described at the top of this file, whose volume is
+ * the PREVIOUS session's cumulative total. An empty-string session is KEPT — it
+ * is a July capture defect on continuous-trading rows, not an exchange state —
+ * and so is every labelled session, including the auctions, because they are
+ * real trading even where they are excluded from the RANGE.
+ */
+function ownSession(rows) {
+  return rows.filter((r) => r.session !== null && r.session !== undefined);
+}
+
+/**
  * Consecutive pairs where volume ROSE — the only rows that represent trading.
  *
  * Returns { prev, now, traded } so each caller sees both sides of the step and
@@ -98,7 +130,9 @@ function ordered(rows) {
  */
 function volumeSteps(rows) {
   const out = [];
-  const sorted = ordered(rows);
+  // P4 · the session filter lives HERE, so movementBlock, flowBlock,
+  // spreadBlock and peakHour inherit it. See ownSession.
+  const sorted = ordered(ownSession(rows));
   for (let i = 1; i < sorted.length; i += 1) {
     const prev = sorted[i - 1];
     const now = sorted[i];
@@ -180,11 +214,50 @@ function hasCloseOfDay(rows) {
   return rows.some((r) => String(r.session || '').trim() === 'Close-Of-Day');
 }
 
-/** Cumulative totals, read with max() rather than summed. */
+/**
+ * Cumulative totals, read with max() rather than summed.
+ *
+ * P3 · AND FROM THIS SESSION'S ROWS ONLY.
+ *
+ * priceBlock filters to RANGE_SESSIONS, closeRow drops `session IS NULL`,
+ * rangeSource filters — and this read EVERY row. The docblock at the top of
+ * this file says what the NULL-session rows are: "the 14:13-14:23 Friday reads,
+ * after the close on a non-trading day, and their volume is CUMULATIVE RATHER
+ * THAN NEW" — that is, they carry the PREVIOUS session's running totals.
+ *
+ * compute() has no trading-day guard and scripts/backfill-symbol-day.js
+ * enumerates every trading_date that has any row at all, Fridays included. So a
+ * Friday holding nothing but those two reads produced:
+ *
+ *   priceBlock  {open_px: null, high_px: null, low_px: null}
+ *   closePrice  null · closeSource null · rangeSource null
+ *   volumeBlock {total_volume: 10876132, trades: 412, avg_trade_size: 26398.38}
+ *
+ * A symbol_day row asserting 10.9 million shares and 412 trades on a day with
+ * no measurable price — a day nothing traded. That row then counts as an active
+ * session in activityBlock's days_active (which tests total_volume > 0), is
+ * summed into market_day.total_volume and so into volume_vs_20d, and enters the
+ * 5-session trailingTrades baseline behind symbols_over_3x_daily.
+ *
+ * The loud answer is NULL, which is what every price column on that row already
+ * gives. Filtered by the same rule priceBlock uses: a row whose session is NULL
+ * is not this session's.
+ */
 function volumeBlock(rows) {
-  const vols = rows.map((r) => n(r.volume)).filter((v) => v !== null);
-  const trades = rows.map((r) => n(r.trades)).filter((v) => v !== null);
-  const steps = volumeSteps(rows);
+  /*
+   * P4 · the SHARED filter, not a second definition of one.
+   *
+   * P3 wrote a bespoke RANGE_SESSIONS-or-CLOSE_TIERS test here. That is a
+   * narrower rule than the one volumeSteps now applies, and two filters for one
+   * concept is how the close rule came to have two definitions (P2-CLOSE). A
+   * labelled session we do not recognise is still a session; a row with no
+   * label at all is the Friday read.
+   */
+  const own = ownSession(rows);
+
+  const vols = own.map((r) => n(r.volume)).filter((v) => v !== null);
+  const trades = own.map((r) => n(r.trades)).filter((v) => v !== null);
+  const steps = volumeSteps(own);
 
   const total = vols.length ? Math.max(...vols) : null;
   const tradeCount = trades.length ? Math.max(...trades) : null;
@@ -243,10 +316,42 @@ function movementBlock(rows) {
     // against a slightly later bid and offer. Every finding this month used
     // exactly this method, so it is kept unchanged — a more accurate method
     // would make the historical results non-comparable.
-    if (after !== null && offer !== null && after >= offer) {
+    /*
+     * P3 · ZERO IS NOT A PRICE, AND IT USED TO READ AS ONE.
+     *
+     * `offer = 0` is not null, so `after >= offer` was true for every positive
+     * price — and the terminal emits bid/offer/bid_qty/offer_qty = 0 for a
+     * symbol with NO LIVE BOOK. test/suites/empty-books.test.js documents that
+     * exact row shape and counts 398 of them; validate.js applies isEmptyBook
+     * on the DEPTH path only, so validateQuote lets bid: 0 / offer: 0 through.
+     *
+     * spreadBlock in this same file has always guarded `bid <= 0 || offer <= 0`.
+     * movementBlock did not, so one row could carry avg_spread_fils NULL beside
+     * pct_at_offer 100 — the file contradicting itself about the same book.
+     *
+     * A stock that FELL on every step, with a zero book, reported:
+     *
+     *   pct_at_offer 100 · trades_at_offer 2 · bought_at_offer 2000
+     *   unbooked_steps 0  · priced_steps 2   · down_moves 2
+     *
+     * — the whole day's volume recorded as buying at the offer, on a day it
+     * fell, and migration 013's symbol_day_ratio_invalid_at_offer CHECK passing
+     * on the fabricated 100 because that is the number it checks.
+     *
+     * AND IT DEFEATED THE P2 FIX DIRECTLY BELOW. The insideSpreadSteps /
+     * unbookedSteps split exists so that a step whose book we could not read
+     * stays out of the pct_at_offer denominator. A zero book never reached that
+     * branch at all: it was classified at the offer two lines earlier, counted
+     * as measured, and counted in the numerator. The split was right about the
+     * case it saw and blind to the case beside it.
+     */
+    const bidReal = bid !== null && bid > 0;
+    const offerReal = offer !== null && offer > 0;
+
+    if (after !== null && offerReal && after >= offer) {
       atOffer += 1;
       boughtAtOffer += traded;
-    } else if (after !== null && bid !== null && after <= bid) {
+    } else if (after !== null && bidReal && after <= bid) {
       atBid += 1;
       soldAtBid += traded;
     } else {
@@ -256,12 +361,12 @@ function movementBlock(rows) {
        * SPREAD.
        *
        * This branch catches both: a print genuinely between the bid and the
-       * offer, and a step where bid/offer (or the price itself) did not render
-       * at all — a halt, pre-open, a limit, a short capture. They are counted
-       * apart now, because one belongs in the pct_at_offer denominator and the
-       * other cannot.
+       * offer, and a step where the book (or the price itself) did not render
+       * at all — a halt, pre-open, a limit, a short capture, or the zero book
+       * above. They are counted apart, because one belongs in the pct_at_offer
+       * denominator and the other cannot.
        */
-      if (after !== null && bid !== null && offer !== null) insideSpreadSteps += 1;
+      if (after !== null && bidReal && offerReal) insideSpreadSteps += 1;
       else unbookedSteps += 1;
     }
 
@@ -566,6 +671,7 @@ function tickBandCrossed(closePx, highPx) {
 
 module.exports = {
   ordered,
+  ownSession,
   volumeSteps,
   flowBlock,
   spreadBlock,

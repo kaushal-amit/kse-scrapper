@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         awsat / DirectFN — Depth for ALL symbols
 // @namespace    local.trading.tools
-// @version      2.4.1
+// @version      2.4.2
 // @description  Level-1 depth for every symbol from the price socket each cycle (no switching, meets the 1-1.5 min ceiling), plus a round-robin full-ladder sweep of the open symbol. Posts to Server 1.
 // @match        *://*.awsatbroker.com/*
 // @match        *://awsatbroker.com/*
@@ -48,7 +48,7 @@
   // ── CONFIG ────────────────────────────────────────────────────────────────
   // The running build, shown on the panel: two scripts both reporting
   // 2.0.0 cost a session diagnosing a bug that was already fixed.
-  var VERSION = '2.4.1';
+  var VERSION = '2.4.2';
 
   var SERVER          = 'https://socket.99labs.space';
   var TOKEN           = 'trading';
@@ -361,7 +361,35 @@
       throw e;
     });
   }
+  /*
+   * P6-CLI-3 · the queue is no deeper than the server's 15-minute accept
+   * window: a batch past it is refused with a 400, classified PERMANENT and
+   * discarded silently. Stale batches are dropped here instead, and counted.
+   */
+  var SERVER_ACCEPT_MS = 15 * 60 * 1000;
+  function dropStale(queue, statsObj) {
+    var cut = Date.now() - SERVER_ACCEPT_MS;
+    var kept = [];
+    for (var i = 0; i < queue.length; i++) {
+      var b = queue[i];
+      var at = b && (b.capturedAt || (b.body && b.body.capturedAt));
+      var t = at ? new Date(at).getTime() : NaN;
+      if (!isNaN(t) && t < cut) { statsObj.dropped = (statsObj.dropped || 0) + 1; continue; }
+      kept.push(b);
+    }
+    if (kept.length !== queue.length) {
+      queue.length = 0;
+      for (var j = 0; j < kept.length; j++) queue.push(kept[j]);
+      statsObj.queued = queue.length;
+      try {
+        console.warn('[ingest] dropped ' + statsObj.dropped + ' batch(es) older than '
+          + (SERVER_ACCEPT_MS / 60000) + ' minutes — the server refuses them');
+      } catch (e) {}
+    }
+  }
+
   function flush() {
+    dropStale(retryQueue, stats);
     if (!retryQueue.length) return Promise.resolve();
     return submit(retryQueue[0]).then(function () {
       retryQueue.shift(); stats.queued = retryQueue.length; return flush();
@@ -374,7 +402,7 @@
     // make every retry look like new data and defeat the server's idempotency.
     return submit(batch).catch(function (e) {
       if (!e.permanent) {
-        if (retryQueue.length >= MAX_RETRY_QUEUE) retryQueue.shift();
+        if (retryQueue.length >= MAX_RETRY_QUEUE) { retryQueue.shift(); stats.dropped = (stats.dropped || 0) + 1; }   // P6-CLI-3 · counted, not silent
         retryQueue.push(batch);
         stats.queued = retryQueue.length;
       }
@@ -975,7 +1003,35 @@
         return;
       }
 
-      var i = 0;
+      /*
+       * 2.4.2 · P3 — THE ROTATION CURSOR NOW EXISTS.
+       *
+       * This file's header has always promised: "The rotation is a strict
+       * cursor, so across a full sweep every symbol is visited exactly once: no
+       * symbol is skipped and none is captured twice in the same rotation."
+       *
+       * There was no cursor. `cursor`, `rotationStarted` and `rotationSeen`
+       * were declared at the top of the file and never read or written
+       * anywhere. Every sweep started at index 0.
+       *
+       * That matters because of how a short sweep ends. The budget is checked
+       * BETWEEN symbols, so what it cuts off is always the TAIL of the list —
+       * and the next sweep, starting at 0 again, cuts off the same tail. This
+       * file's own measurement is 4.34s average and 22.84s p90 per symbol
+       * switch against a 23s budget, so one habitually slow symbol in slot 1
+       * starves slots 2-5 for the entire session. Their ladders are simply
+       * never captured, and a session's book cannot be re-read.
+       *
+       * It was invisible too: `ok` was 1, so `problem` stayed null and the
+       * heartbeat reported a healthy script.
+       *
+       * The cursor persists ACROSS sweeps and wraps. A sweep that manages two
+       * symbols leaves the next one starting at the third. rotationSeen tracks
+       * one full pass so a completed rotation can be reported, and is cleared
+       * when it wraps.
+       */
+      if (cursor >= targets.length) cursor = 0;
+      var visited = 0;     // how many we attempted THIS sweep
       var ok = 0;          // 2.4.0 · H9 · the SERVER accepted it
       var read = 0;        //           the ladder was read locally
       var skipped = 0;
@@ -984,7 +1040,7 @@
         // Stop at the budget rather than run into the next sweep: a sweep that
         // overlaps its successor reads a book the other one just switched away
         // from, and files it under the wrong symbol.
-        if (i >= targets.length || Date.now() - started > LADDER_BUDGET_MS) {
+        if (visited >= targets.length || Date.now() - started > LADDER_BUDGET_MS) {
           sweeping = false;
           stats.sweeps = (stats.sweeps || 0) + 1;
           /*
@@ -999,6 +1055,18 @@
            * carries the accepted one, because that is the one that means data
            * exists.
            */
+          /*
+           * 2.4.2 · P3 — THE PANEL COUNTERS ARE WRITTEN.
+           *
+           * ladderPosts, ladderSkips and rotationMs are initialised at the top
+           * of the file and rendered by refresh(), and NOTHING assigned to any
+           * of them. The panel permanently read "posts: 0  skipped: 0  last
+           * sweep: —" however many ladders the sweep actually posted — a
+           * monitoring surface that reads like a dead script on a healthy one.
+           */
+          stats.ladderPosts = (stats.ladderPosts || 0) + ok;
+          stats.ladderSkips = (stats.ladderSkips || 0) + skipped;
+
           stats.msg = 'swept ' + ok + '/' + targets.length
             + (read !== ok ? ' (read ' + read + ', ' + (read - ok) + ' not accepted)' : '')
             + (skipped ? ' · ' + skipped + ' skipped' : '')
@@ -1021,10 +1089,20 @@
           refresh();
           return;
         }
-        var target = targets[i++];
+        var target = targets[cursor];
+        // Advance BEFORE the capture, so a symbol that throws or stalls does
+        // not become the one the next sweep starts on as well.
+        cursor = (cursor + 1) % targets.length;
+        visited += 1;
         captureLadder(target, function (good, accepted) {
           if (good) read += 1; else skipped += 1;
           if (accepted) ok += 1;
+          rotationSeen.add(target.symbol);
+          if (rotationSeen.size >= targets.length) {
+            stats.rotationMs = Date.now() - rotationStarted;
+            rotationStarted = Date.now();
+            rotationSeen = new Set();
+          }
           next();
         });
       }

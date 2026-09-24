@@ -128,6 +128,23 @@ function parseNumeric(value) {
 
   if (s === '' || s === '—' || s === '–' || s === '-' || s === 'N/A') return null;
 
+  /*
+   * P6-TV-4 · TradingView ABBREVIATES: 1.24M, 845.96K, 2.1B.
+   *
+   * extractRows falls back to the cell's textContent whenever data-copy-value
+   * is absent, and the Volume column is rendered abbreviated. parseFloat
+   * stopped at the suffix, so a 1,240,000-share day was stored as 1 — a
+   * plausible-looking number a million times too small, which every volume
+   * ratio downstream then reads as a collapse in liquidity. parse.toNumber has
+   * handled this since the beginning; this function did not.
+   */
+  const mult = /^(-?[0-9]*\.?[0-9]+)\s*([KMB])$/i.exec(s);
+  if (mult) {
+    const base = parseFloat(mult[1]);
+    const scale = { K: 1e3, M: 1e6, B: 1e9 }[mult[2].toUpperCase()];
+    return Number.isFinite(base) ? base * scale : null;
+  }
+
   const n = parseFloat(s);
   return Number.isFinite(n) ? n : null;
 }

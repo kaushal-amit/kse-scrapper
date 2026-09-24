@@ -203,8 +203,32 @@ async function scrapeSymbol(page, symbol, { startDay, endDay, runId, maxScrolls 
   const collected = new Map();          // ts -> row
   let reachedStart = false;
   let flat = 0;
+  /*
+   * P6-TV-2 · THE LOOP ENDS WHEN THE TABLE IS EXHAUSTED, NOT ONLY WHEN IT
+   * REACHES BEFORE startDay.
+   *
+   * A symbol whose whole history is inside the window never produces a row
+   * older than startDay, so `reachedStart` never became true and the loop ran
+   * every one of its maxScrolls iterations (≈300ms each, plus an evaluate) for
+   * that one symbol — long enough for the 45-minute worker kill to terminate
+   * the run and discard every row collected for every symbol before it.
+   *
+   * Two exits are added: a run of flat reads AFTER a full jump has already
+   * been tried (the list is not stuck, it is finished), and a per-symbol wall
+   * clock.
+   */
+  const symbolBudgetMs = require('../config/thresholds').get('history_symbol_ms');
+  const symbolDeadline = Date.now() + symbolBudgetMs;
+  let jumped = false;
+  let exhausted = false;
 
-  for (let i = 0; i < maxScrolls && !reachedStart; i += 1) {
+  for (let i = 0; i < maxScrolls && !reachedStart && !exhausted; i += 1) {
+    if (Date.now() > symbolDeadline) {
+      log.warn('history: symbol hit its time budget — keeping what was read', {
+        symbol, rows: collected.size, budgetMs: symbolBudgetMs,
+      });
+      break;
+    }
     const batch = await extractRows(page);
     const before = collected.size;
 
@@ -222,10 +246,21 @@ async function scrapeSymbol(page, symbol, { startDay, endDay, runId, maxScrolls 
       flat += 1;
       // Several flat reads in a row can mean the virtual list is stuck rather
       // than exhausted, so jump further before concluding it is done.
-      if (flat >= 8) { await scrollTable(page, 3_000); flat = 0; }
-      else await scrollTable(page, 300);
+      if (flat >= 8) {
+        // P6-TV-2 · one full jump is the test for "stuck". A second run of
+        // flat reads after it means the table has no more rows to give.
+        if (jumped) {
+          exhausted = true;
+          log.info('history: table exhausted', { symbol, rows: collected.size });
+        } else {
+          await scrollTable(page, 3_000);
+          jumped = true;
+          flat = 0;
+        }
+      } else await scrollTable(page, 300);
     } else {
       flat = 0;
+      jumped = false;
       await scrollTable(page, 600);
     }
 

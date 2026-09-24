@@ -202,6 +202,36 @@ const THRESHOLDS = {
    * FALLBACK, announced at the point of use — see currentBudgetKd.
    */
   wakeup_budget_fallback_kd: num('WAKEUP_BUDGET_KD', 2000),
+
+  // ── P6 · the capture-honesty numbers ─────────────────────────────────────
+  /**
+   * A board below this percentage of the reference universe is a PARTIAL run,
+   * not a SUCCESS: a scroll that stopped at 60 of 137 symbols used to be
+   * recorded as a complete market. P6-TV-3 / P6-AWS-8.
+   */
+  board_coverage_min_pct: num('BOARD_COVERAGE_MIN_PCT', 80),
+  /**
+   * How long a failed AWSAT login stops further attempts in this worker. The
+   * broker's daily attempt budget is loginGuard's job; this only prevents a
+   * hot loop. It used to be "for the rest of the process". P6-AWS-1.
+   */
+  awsat_login_retry_cooldown_ms: num('AWSAT_LOGIN_RETRY_COOLDOWN_MS', 600_000),
+  /**
+   * No frame on the price socket for this long means the feed is dead, and the
+   * rows still in the tap are its last ones — storing them would record a dead
+   * feed as a live board. P6-AWS-2.
+   */
+  awsat_socket_max_frame_age_ms: num('AWSAT_SOCKET_MAX_FRAME_AGE_MS', 180_000),
+  /**
+   * The depth sweep returns what it has at this point rather than being killed
+   * by the worker timeout with every book still in memory. P6-AWS-7.
+   */
+  awsat_depth_sweep_ms: num('AWSAT_DEPTH_SWEEP_MS', 240_000),
+  /**
+   * One symbol's history scroll, before it gives up its remaining scrolls so
+   * the rest of the run survives. P6-TV-2.
+   */
+  history_symbol_ms: num('HISTORY_SYMBOL_MS', 90_000),
 };
 
 /** Throws rather than returning undefined: a gate comparing against undefined

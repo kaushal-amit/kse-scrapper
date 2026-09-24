@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AWSAT / DirectFN — Server 1 Capture
 // @namespace    local.trading.tools
-// @version      2.4.0
+// @version      2.4.1
 // @description  Reads the price socket in the page's own context and submits quotes, depth and orders to Server 1. No second login, no refresh, no scrolling. Credentials never leave the browser.
 // @match        *://*.awsatbroker.com/*
 // @match        *://awsatbroker.com/*
@@ -30,7 +30,7 @@
   // ── CONFIG ────────────────────────────────────────────────────────────────
   // The running build, shown on the panel: two scripts both reporting
   // 2.0.0 cost a session diagnosing a bug that was already fixed.
-  var VERSION = '2.4.0';
+  var VERSION = '2.4.1';
 
   var SERVER      = 'https://scrapper.99labs.space'; // Server 1 base URL
   var TOKEN       = 'CHANGE-ME';                    // must equal INGEST_TOKEN
@@ -398,7 +398,40 @@
     });
   }
 
+  /*
+   * P6-CLI-3 · THE QUEUE IS NO DEEPER THAN THE SERVER'S ACCEPT WINDOW.
+   *
+   * The queue held 30 minutes of batches; the server refuses any capture older
+   * than 15 minutes with a 400, and a 400 is classified PERMANENT, so every
+   * batch past the window was shifted off and discarded with nothing said. A
+   * 25-minute outage therefore guaranteed ten minutes of invisible data loss.
+   * Stale batches are now dropped HERE, before the post, and counted where the
+   * panel can show them.
+   */
+  var SERVER_ACCEPT_MS = 15 * 60 * 1000;
+  function dropStale(queue, statsObj) {
+    var cut = Date.now() - SERVER_ACCEPT_MS;
+    var kept = [];
+    for (var i = 0; i < queue.length; i++) {
+      var b = queue[i];
+      var at = b && (b.capturedAt || (b.body && b.body.capturedAt));
+      var t = at ? new Date(at).getTime() : NaN;
+      if (!isNaN(t) && t < cut) { statsObj.dropped = (statsObj.dropped || 0) + 1; continue; }
+      kept.push(b);
+    }
+    if (kept.length !== queue.length) {
+      queue.length = 0;
+      for (var j = 0; j < kept.length; j++) queue.push(kept[j]);
+      statsObj.queued = queue.length;
+      try {
+        console.warn('[ingest] dropped ' + statsObj.dropped + ' batch(es) older than '
+          + (SERVER_ACCEPT_MS / 60000) + ' minutes — the server refuses them');
+      } catch (e) {}
+    }
+  }
+
   function flushQueue() {
+    dropStale(retryQueue, stats);
     if (!retryQueue.length) return Promise.resolve();
     var batch = retryQueue[0];
     return submit(batch).then(function () {
@@ -453,7 +486,7 @@
       refresh();
     }).catch(function (e) {
       if (!e.permanent) {
-        if (retryQueue.length >= MAX_RETRY_QUEUE) retryQueue.shift();   // drop oldest
+        if (retryQueue.length >= MAX_RETRY_QUEUE) { retryQueue.shift(); stats.dropped = (stats.dropped || 0) + 1; }   // P6-CLI-3 · counted, not silent
         retryQueue.push(batch);
         stats.queued = retryQueue.length;
       }
@@ -466,6 +499,16 @@
   // so a quotes script that stops (or sees an empty board) is visible instead of
   // silently absent. rowsSeen = symbols built this cycle.
   function heartbeat(rowsSeen, problem) {
+    /*
+     * P4 · THE HEARTBEAT WAS NOT GATED, AND THE P2 COMMENT NAMED IT.
+     *
+     * post() refuses under the placeholder token; heartbeat() did not, so it
+     * went on 401-ing every cycle — which is the second half of the failure the
+     * P2 note describes in as many words: "The heartbeat 401s too, so the
+     * server sees nothing at all." Gating half a mechanism leaves the half that
+     * was quoted as the reason.
+     */
+    if (TOKEN_PLACEHOLDER) return;
     nativeFetch(SERVER + '/ingest/heartbeat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + TOKEN },
