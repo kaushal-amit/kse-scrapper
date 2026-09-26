@@ -169,6 +169,165 @@ function priceBlock(rows) {
 }
 
 /**
+ * ============================================================================
+ *  D3 · THE EXCHANGE'S OWN REFERENCE PRICE
+ * ============================================================================
+ * The board carries `chg` beside `last_price`, and the exchange computes it
+ * against its own reference — the previous official close. So
+ *
+ *     last_price - chg
+ *
+ * IS that close, published by the exchange, constant through the whole day,
+ * for every symbol, with no reconstruction at all.
+ *
+ * We were not using it. prev_close was rebuilt by reaching back through
+ * previousCloses(): find the last session whose capture ran late enough to be
+ * usable, take its best close by precedence tier, cap the reach at five
+ * sessions. Every one of those rules is careful and several were hard-won,
+ * and the whole apparatus is answering a question the feed answers directly.
+ *
+ * It disagrees with the exchange on 1,138 of 6,082 symbol-days: by more than
+ * 1% on 389 and more than 5% on 41. The failures cluster exactly where a
+ * reconstruction would be expected to fail — July, when closes came from the
+ * Trading session; the days after the 19-23 August gap; and 15 September,
+ * where 108 of 134 symbols are wrong because the 14 September capture stopped
+ * at 11:59 and a mid-session price was carried forward as a close.
+ *
+ * chg_1d, every gap, and everything built on a previous close is wrong on
+ * those days.
+ *
+ * ─── WHY min() AND NOT max() OR first() ────────────────────────────────────
+ * The value is constant through the session by construction, so any picker
+ * returns the same number on a clean day. min() is chosen because it is
+ * order-independent and cheap, and because on a dirty day — a mislabelled row,
+ * a capture straddling a corporate action — the disagreement is reported
+ * separately rather than being silently resolved by whichever row sorted
+ * first. `spread` below is that report: non-zero means the feed contradicted
+ * itself and the value should be treated as suspect.
+ *
+ * ─── AND IT IS NOT UNCONDITIONAL ───────────────────────────────────────────
+ * A zero last_price is not a price (P4/P5, twice over in this file). A NULL
+ * chg gives no reference at all. Both are excluded rather than defaulted, so
+ * a symbol that never traded returns null and keeps prev_close NULL, which is
+ * the honest state and the one prev_session_gap_days exists to expose.
+ */
+function referenceClose(rows) {
+  const refs = [];
+  for (const r of ordered(rows)) {
+    if (r.session === null || r.session === undefined) continue;
+    const sess = String(r.session).trim();
+    // Continuous trading only. An auction row's chg is computed against the
+    // same reference, but auction labelling is where the feed is least
+    // reliable and there is no reason to widen the set for a constant.
+    if (sess !== 'Trading' && sess !== '') continue;
+    const px = n(r.last_price);
+    const chg = n(r.chg);
+    if (px === null || px <= 0 || chg === null) continue;
+    const ref = px - chg;
+    if (ref <= 0) continue;              // a reference of zero is not a close
+    refs.push(ref);
+  }
+  if (!refs.length) return { ref: null, spread: null, samples: 0 };
+  const lo = Math.min(...refs);
+  const hi = Math.max(...refs);
+  return { ref: lo, spread: Number((hi - lo).toFixed(6)), samples: refs.length };
+}
+
+/**
+ * ============================================================================
+ *  D6 · THE HIGH AND LOW THE FEED ALREADY PUBLISHES
+ * ============================================================================
+ * high_px was the maximum of the last prices WE captured, and the grid is
+ * ~60 seconds. A stock that spiked and came back inside one minute never
+ * appeared in it.
+ *
+ * Measured: symbol_day.high_px is below the feed's own day high on 974 of
+ * 6,351 symbol-days, and low_px above the feed's day low on 1,100 — and NEVER
+ * the other way, which is the signature of a sampling floor rather than a
+ * disagreement. A sampled extreme can only ever be inside the true one.
+ *
+ * `high_price` and `low_price` arrive on every quote row, are the exchange's
+ * running session extremes, and are 100% populated across all 49 captured
+ * days (14 Jul - 24 Sep, zero nulls). Taking them is not an improvement to
+ * the estimate; it removes the estimate.
+ *
+ * ─── WHAT THIS DOES NOT TOUCH ──────────────────────────────────────────────
+ * open_px. The feed publishes `open_price` and our open_px has the identical
+ * defect — on 20 September, where capture began at 10:11, "the first price we
+ * saw" is not the open by any reading. But open_px is read by a LIVE TRADING
+ * GATE ("at or above open, and high > open"), so changing it changes which
+ * stocks the desk buys. That is a trading decision, not a data fix, and it is
+ * flagged for Amit rather than taken here.
+ */
+function feedRange(rows) {
+  const highs = [];
+  const lows = [];
+  for (const r of rows) {
+    const h = n(r.high_price);
+    const l = n(r.low_price);
+    if (h !== null && h > 0) highs.push(h);
+    if (l !== null && l > 0) lows.push(l);
+  }
+  return {
+    feed_high: highs.length ? Math.max(...highs) : null,
+    feed_low: lows.length ? Math.min(...lows) : null,
+  };
+}
+
+/**
+ * ============================================================================
+ *  D4 · CIRCUIT-BREAKER AUCTIONS, COUNTED AS EVENTS
+ * ============================================================================
+ * The dropped cb_events counted CB Auction CAPTURE ROWS. A ten-minute halt
+ * makes ten of them and a thirty-minute halt makes thirty, so the column
+ * reported halt DURATION in units of the capture grid while being named and
+ * read as a count of events. It agreed with the real auction count on 17 of
+ * 338 breaker symbol-days.
+ *
+ * ─── WHAT SEPARATES TWO AUCTIONS ───────────────────────────────────────────
+ * Not a gap in the label. FUTUREKID went into 8 auctions on 3 September
+ * inside an unbroken run of CB Auction rows. What moved between them was
+ * VOLUME: the auction cleared, printed, and the stock went straight into
+ * another one.
+ *
+ * So a new auction starts when EITHER
+ *     the previous capture was not a CB Auction   (entering a halt), OR
+ *     volume moved since the previous capture     (the last one printed).
+ *
+ * Both halves are load-bearing. Without the volume clause FUTUREKID counts 1
+ * that day. Without the session clause a stock that never halts counts an
+ * auction on every trade.
+ *
+ * ─── AND IT IS 0, NOT NULL, WHEN A DAY HAS ROWS AND NO HALTS ───────────────
+ * NULL means not computed. Zero means measured, and there were none. Those
+ * are different facts and this month has cost enough to keep them apart.
+ */
+function cbAuctions(rows) {
+  const sorted = ordered(rows);
+  if (!sorted.length) return null;
+  let count = 0;
+  let prevSession = null;
+  let prevVolume = null;
+  for (const r of sorted) {
+    const sess = r.session === null || r.session === undefined
+      ? null : String(r.session).trim();
+    const vol = n(r.volume);
+    if (sess === 'CB Auction') {
+      const entering = prevSession !== 'CB Auction';
+      // `is distinct from`: a NULL volume on either side is a CHANGE, not a
+      // match. Treating unknown as unchanged would merge two auctions across
+      // a capture that failed to read the column.
+      const printed = !entering
+        && (vol === null || prevVolume === null || vol !== prevVolume);
+      if (entering || printed) count += 1;
+    }
+    prevSession = sess;
+    prevVolume = vol;
+  }
+  return count;
+}
+
+/**
  * The close, from all four closing sessions.
  *
  * Filtering to 'Trading' alone reads the last CONTINUOUS trade as the close and
@@ -525,34 +684,25 @@ function flowBlock(rows) {
   };
 }
 
-/**
- * FULL, SHORT or CB_ONLY.
+/*
+ * ─── C3 · rangeSource IS GONE ──────────────────────────────────────────────
  *
- * Fourteen of 29 captured days ended at 12:59 or earlier, so their ranges are
- * as truncated as their closes and nothing said so. Range drives rangeOverCost
- * and several gates, which makes an unmarked short range a wrong gate.
+ * It marked a range FULL when continuous trading reached 13:10, against a
+ * session that ends at 13:00 — so it could never fire. 050 moved the
+ * threshold to 13:00, which was still wrong: captures are 60 seconds apart,
+ * so a COMPLETE session's last capture lands at 12:59. Of the 48 stored days,
+ * 43 end at 12:59, 2 at 13:00 and 3 earlier, so even the corrected threshold
+ * marked two days in forty-eight as FULL.
+ *
+ * The third threshold was not the fix. D6 now takes high and low from the
+ * feed's own extremes, so the range is not sampled at all and capture length
+ * has stopped bearing on it. Completeness is close_source's question, and D3
+ * makes that column truthful.
+ *
+ * Retired in 055 (stopped writing, rows nulled), dropped in 056 after backend
+ * 079 stops the view projecting it.
  */
-function rangeSource(rows) {
-  const usable = rows.filter((r) => {
-    if (r.session === null || r.session === undefined) return false;
-    return RANGE_SESSIONS.has(String(r.session).trim());
-  });
-  if (!usable.length) return null;
 
-  const onlyCb = usable.every((r) => String(r.session).trim() === 'CB Auction');
-  if (onlyCb) return 'CB_ONLY';
-
-  // Did continuous trading reach 13:10? Kuwait is UTC+3.
-  const latest = Math.max(...usable.map((r) => {
-    const k = new Date(new Date(r.created_at).getTime() + 3 * 3600_000);
-    return k.getUTCHours() * 60 + k.getUTCMinutes();
-  }));
-  const fullAt = (() => {
-    const hhmm = T.get('sd_range_full_hhmm');
-    return Math.floor(hhmm / 100) * 60 + (hhmm % 100);
-  })();
-  return latest >= fullAt ? 'FULL' : 'SHORT';
-}
 
 /**
  * The touch spread, in fils and as a percentage.
@@ -769,11 +919,13 @@ module.exports = {
   flowBlock,
   spreadBlock,
   peakHour,
-  rangeSource,
   closeRow,
   RANGE_SESSIONS,
   CLOSE_TIERS,
   priceBlock,
+  referenceClose,
+  cbAuctions,
+  feedRange,
   closePrice,
   closeSource,
   hasCloseOfDay,

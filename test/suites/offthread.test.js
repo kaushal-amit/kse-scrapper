@@ -19,7 +19,11 @@ const jobs=require('../../src/jobs');
 // daily.minutesample joins public.quotes_clean to the depth captures — both
 // already in the database — so like the others here it drives no browser and
 // has nothing to keep off the main thread.
-const BROWSERLESS = new Set(['tradingview.history', 'daily.analysis', 'signals.fast', 'signals.wakeup', 'signals.score', 'daily.symbolday', 'daily.minutesample', 'daily.marketday', 'daily.instruments']);
+// session.gapwatch (D2) reads one max(created_at) from awsat_market_quotes
+// and, at most, writes one data_alarm row. No browser, and deliberately no
+// worker: a watchdog whose job is to notice that the capture workers have
+// stopped must not be queued behind them.
+const BROWSERLESS = new Set(['tradingview.history', 'daily.analysis', 'signals.fast', 'signals.wakeup', 'signals.score', 'daily.symbolday', 'daily.minutesample', 'daily.marketday', 'daily.instruments', 'session.gapwatch']);
 for(const name of jobs.jobNames){
   if (BROWSERLESS.has(name)) {
     ck(`${name} runs in-process (no browser)`, !wh.SOURCE_OF[name], wh.SOURCE_OF[name]);

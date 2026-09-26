@@ -167,7 +167,7 @@ const at = (m) => new Date(`2026-09-10T${String(9 + Math.floor(m / 60)).padStart
   const src = read('src/jobs/scoreSignals.js');
   const live = liveOf(src);
   const guards = (live.match(/last_price IS NOT NULL AND last_price > 0/g) || []).length;
-  ck('BOTH branches of priceAfter guard against zero', guards === 2, guards);
+  ck('BOTH branches of priceInForceAt guard against zero', guards === 2, guards);
   ck('and neither settles for a bare NOT NULL',
     !/AND last_price IS NOT NULL\n\s+ORDER BY/.test(live));
 }
@@ -190,7 +190,7 @@ const at = (m) => new Date(`2026-09-10T${String(9 + Math.floor(m / 60)).padStart
          VALUES ($1, $2, $3, 0, 'BACKFILL')`,
         [SYM, new Date(`${DAY}T10:05:00+03:00`), DAY]);
 
-      const px = await score.priceAfter(SYM, from, 5);
+      const px = await score.priceInForceAt(SYM, from, 5);
       ck('a zero in symbol_minute is NOT returned as the forward price',
         px !== 0, px);
       ck('and with nothing else to read, the answer is NOT COMPUTED',
@@ -201,8 +201,8 @@ const at = (m) => new Date(`2026-09-10T${String(9 + Math.floor(m / 60)).padStart
       await query(
         `INSERT INTO awsat_market_quotes (symbol, market, created_at, trading_date, ingest_source, last_price)
          VALUES ($1, 'Main Market', $2, $3, 'awsat_client', 205)`,
-        [SYM, new Date(`${DAY}T10:06:00+03:00`), DAY]);
-      const px2 = await score.priceAfter(SYM, from, 5);
+        [SYM, new Date(`${DAY}T10:04:00+03:00`), DAY]);
+      const px2 = await score.priceInForceAt(SYM, from, 5);
       ck('THE FALLBACK IS REACHABLE NOW and finds the real print',
         px2 === 205, px2);
 
@@ -210,9 +210,9 @@ const at = (m) => new Date(`2026-09-10T${String(9 + Math.floor(m / 60)).padStart
       await query(
         `INSERT INTO symbol_minute (symbol, ts, trading_date, last_price, source)
          VALUES ($1, $2, $3, 204, 'BACKFILL')`,
-        [SYM, new Date(`${DAY}T10:05:30+03:00`), DAY]);
+        [SYM, new Date(`${DAY}T10:04:30+03:00`), DAY]);
       ck('a real symbol_minute price is still preferred',
-        await score.priceAfter(SYM, from, 5) === 204);
+        await score.priceInForceAt(SYM, from, 5) === 204);
 
       await query('DELETE FROM symbol_minute WHERE symbol = $1', [SYM]);
       await query('DELETE FROM awsat_market_quotes WHERE symbol = $1', [SYM]);

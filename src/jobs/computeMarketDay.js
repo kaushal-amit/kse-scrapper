@@ -20,6 +20,7 @@ const { query } = require('../db/pool');
 const clock = require('../market/clock');
 const log = require('../logger');
 const M = require('./marketDayMetrics');
+const { captureShape } = require('./captureShape');
 const THRESHOLDS = require('../config/thresholds');
 const { config } = require('../config');
 
@@ -37,6 +38,11 @@ const COLUMNS = [
   'regime', 'computed_at',
   // Broker-sourced, from the last non-STALE capture of the session.
   'turnover_kd', 'index_close', 'index_ytd_pct', 'broker_seen_at',
+  // D2 · the session's own capture shape. close_of_day_rows = 0 is what tells
+  // D3 that a day has no official close, so these are inputs to a rule and
+  // not a diagnostic panel.
+  'first_capture_at', 'last_trading_capture_at', 'largest_gap_secs',
+  'largest_gap_at', 'close_of_day_rows', 'session_minutes_captured',
 ];
 
 /**
@@ -250,10 +256,31 @@ async function compute(tradingDay, runId) {
     // Needs instruments.code and the old symbol's last session. KPPC->PHC is
     // the only case and it is historical; left NULL until a rename happens.
     renamed_symbols: null,
-    // symbol_day.cb_events is NULL — no circuit-breaker detection exists yet.
-    cb_events_total: null,
+    /*
+     * D4 · SUMMED FROM symbol_day.cb_auctions, never counted independently.
+     *
+     * This was NULL on all 48 stored days because nothing wrote it. Summing
+     * the per-symbol column rather than recounting from the quotes means the
+     * market figure cannot disagree with the rows beneath it — 049's lesson
+     * from thin_symbols, where 16 of 48 stored values contradicted the
+     * symbol_day rows they claimed to count.
+     *
+     * NULL when no symbol has a computed value: not computed is not zero.
+     */
+    cb_events_total: (() => {
+      const vals = rows.map((r) => r.cb_auctions)
+        .filter((v) => v !== null && v !== undefined)
+        .map(Number).filter(Number.isFinite);
+      return vals.length ? vals.reduce((a, b) => a + b, 0) : null;
+    })(),
     regime: M.regimeOf(b.pct_advancing),
     computed_at: new Date(),
+    /*
+     * D2 · the session's own capture shape, read from the raw quotes rather
+     * than from anything derived. close_of_day_rows = 0 is what tells D3 the
+     * day has no official close — see captureShape.js.
+     */
+    ...(await captureShape(day)),
   };
   /*
    * 049 · no_prev_close is STORED now. breadth() has always computed it and

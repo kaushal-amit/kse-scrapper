@@ -199,7 +199,13 @@ const THRESHOLDS = {
    * false. A gate that can never pass is the same defect as a check that can
    * never fail.
    */
-  sd_range_full_hhmm: num('SD_RANGE_FULL_HHMM', 1300),
+  /*
+   * sd_range_full_hhmm IS GONE (C3). It asked whether capture reached 13:10,
+   * then 13:00, against a session that ends at 13:00 on a 60-second grid — so
+   * a complete day, last capture 12:59, read SHORT. 43 of 48 stored days end
+   * at 12:59. The answer was not a third number: D6 takes the range from the
+   * feed's own extremes, so capture length no longer bears on it at all.
+   */
   /**
    * symbol_day: how many usable sessions back previousCloses may reach for a
    * prev_close. H-K.
@@ -263,8 +269,44 @@ const THRESHOLDS = {
    * signal scoring: how far past the target a capture may be and still answer
    * "the price N minutes later". Beyond it the answer is NOT COMPUTED — a
    * capture 40 minutes late is not a late answer, it is a different question.
+   *
+   * C1 · RETAINED FOR THE FALLBACK ONLY. Scoring no longer reaches forward
+   * past the mark for its answer (priceInForceAt), so this bounds nothing on
+   * the primary path. It still bounds scoringReport's historical reads.
    */
   score_forward_tolerance_min: num('SCORE_FORWARD_TOLERANCE_MIN', 10),
+
+  /*
+   * C1 · HOW STALE THE CAPTURE IN FORCE AT THE MARK MAY BE.
+   *
+   * Scoring takes the last capture AT OR BEFORE fired_at + N. On the ~60 s
+   * grid that capture is at most a minute old — the price a desk could
+   * actually have acted on at the mark. But "the last one before the mark" is
+   * unbounded on its own: across a capture gap it answers the 5-minute
+   * question with a print from 08:47, and a stale price grades as no move —
+   * so every signal scored through an outage comes back WRONG for the four
+   * 'down' families and RIGHT for FROZEN. That is a measurement of the
+   * outage, not of the market, and it lands in the evidence base the strategy
+   * is judged on.
+   *
+   * 3 minutes is three grid intervals: it absorbs a couple of missed captures
+   * and refuses an outage. Past it the horizon is NOT COMPUTED, which is the
+   * honest answer — the question could not be asked.
+   */
+  score_stale_tolerance_min: num('SCORE_STALE_TOLERANCE_MIN', 3),
+
+  /*
+   * D2 · HOW LONG CONTINUOUS TRADING MAY GO WITHOUT A CAPTURE BEFORE IT IS
+   * AN INCIDENT.
+   *
+   * The grid is ~60 s, so five intervals is a real stop rather than a slow
+   * page. Shorter and the alarm fires on ordinary jitter and stops being
+   * read; longer and 14 September's 11:59 stop would still have had an hour
+   * to become permanent before anyone heard about it.
+   *
+   * Five minutes is also the number the KB team asked for by name.
+   */
+  capture_gap_alarm_secs: num('CAPTURE_GAP_ALARM_SECS', 300),
 
   /** wake-up: how many SESSIONS of baseline the volume comparison reads. */
   wakeup_baseline_sessions: num('WAKEUP_BASELINE_DAYS', 10),

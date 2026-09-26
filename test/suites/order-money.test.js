@@ -6,6 +6,34 @@ const db=require('../../src/db/pool');
 const repo=require('../../src/db/repositories');
 let p=0,n=0;const ck=(t,c,x)=>{n++;if(c)p++;else console.log('  FAIL:',t,JSON.stringify(x))};
 
+/*
+ * ─── A CAPTURE TIME THAT DOES NOT DEPEND ON WHEN THE SUITE IS RUN ──────────
+ *
+ * Both posts used `new Date()`. The ingest door admits a capture only inside
+ * the window, with a Close-Of-Day backstop at 15:00 Kuwait (051), so this
+ * suite passed in the morning and failed every afternoon — and its failure
+ * said "captured at 17:29 Kuwait, after the backstop", which reads like a
+ * defect in the code under test rather than in the fixture.
+ *
+ * Same class as the market-summary suite, which was green on Sundays and red
+ * on Thursdays. A test whose verdict depends on the clock is not testing what
+ * it claims to test; it is sampling it.
+ *
+ * Mid-session on a known trading day, so the door is open whenever this runs.
+ */
+const clock = require('../../src/market/clock');
+const FIXED_NOW = new Date(`${clock.tradingDay()}T11:00:00+03:00`);
+const CAPTURED_AT = FIXED_NOW.toISOString();
+
+/*
+ * The door checks TWO things against the clock — the capture window and the
+ * skew from now — so pinning capturedAt alone just swaps one clock failure
+ * for the other ("capturedAt is 23366s old"). clock.now() exists as the one
+ * named source of "now" for exactly this: stub it, and both checks see the
+ * same moment the fixture claims to have been captured at.
+ */
+clock.now = () => FIXED_NOW;
+
 const app=express(); app.use(express.json({limit:'8mb'}));
 app.use('/', require('../../src/api/ingest').createRouter());
 const srv=app.listen(8810,async()=>{
@@ -24,17 +52,28 @@ const srv=app.listen(8810,async()=>{
      quantity:'1,000',filled:'1,000',remaining:'0',
      avgPrice:'188',ordVal:'188,000',netOrdVal:'188,075.2'},
   ];
-  const r=await post({token:'trading',capturedAt:new Date().toISOString(),records:filled});
+  const r=await post({token:'trading',capturedAt:CAPTURED_AT,records:filled});
   ck('filled orders accepted', r.body.inserted===2, r.body);
 
   const {rows:nv}=await db.query(
-    "select order_id,net_value,order_value,avg_price from awsat_order_list where order_id like 'OM-%' order by order_id");
+    "select order_id,net_value,order_value,avg_price,avg_price_reported from awsat_order_list where order_id like 'OM-%' order by order_id");
   ck('O1: net_value on 100% of filled rows',
      nv.length===2 && nv.every(x=>x.net_value!==null), nv);
   ck('O1: net_value is the netOrdVal number, not ordVal',
      Number(nv[0].net_value)===713712.5, nv[0].net_value);
   ck('order_value mapped separately', Number(nv[0].order_value)===714000, nv[0].order_value);
-  ck('avg_price mapped', Number(nv[0].avg_price)===204, nv[0].avg_price);
+  /*
+   * D5 · avg_price IS NULL ON THE VIEW, DELIBERATELY.
+   *
+   * The broker's figure equals the ORDER price on all 55 orders that carry
+   * it, including one entered into a breaker auction that cleared 13 fils
+   * away — so it is a copy of the limit price, not an execution price, and
+   * anything reading `avg_price` was reading what it believed was a fill.
+   * The raw value is kept under a name that does not claim to be one.
+   */
+  ck('avg_price is NOT COMPUTED on the view', nv[0].avg_price === null, nv[0].avg_price);
+  ck('  and the broker\'s figure is still carried, under avg_price_reported',
+    Number(nv[0].avg_price_reported) === 204, nv[0].avg_price_reported);
   ck('raw JSON kept whole',
      (await db.query("select raw from awsat_order_list where order_id='OM-1'")).rows[0].raw!==null);
 
@@ -118,7 +157,7 @@ const srv=app.listen(8810,async()=>{
     {orderId:'OMP-3',symbolRaw:'MRC - 510',side:'Sell',status:'Filled',quantity:'3,500',filled:'3,500',netOrdVal:'713,712.5'},
     {orderId:'OMP-4',symbolRaw:'MRC - 510',side:'Buy',status:'Cancelled',quantity:'1,000',filled:'0',netOrdVal:null},
   ];
-  await post({token:'trading',capturedAt:new Date().toISOString(),records:pos});
+  await post({token:'trading',capturedAt:CAPTURED_AT,records:pos});
   const {rows:net}=await db.query(`
     select sum(case when side='BUY' then filled_quantity else -filled_quantity end)::int AS position
       from awsat_order_list where order_id like 'OMP-%'`);

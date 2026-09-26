@@ -70,11 +70,32 @@ async function finalise(tradingDay, runId) {
         FROM captures ORDER BY symbol, created_at DESC
     ),
     prev AS (
-      -- The previous session's CLOSE for this symbol, which is what "change"
-      -- is measured against. Used only when the venue did not give a change.
+      /*
+       * The previous session's CLOSE for this symbol, which is what "change"
+       * is measured against. Used only when the venue did not give a change.
+       *
+       * ─── D8 · NOT FROM A MINUTE BAR ──────────────────────────────────────
+       *
+       * Measured against the official closes: CHART bars match 2,493 of
+       * 2,493, UNKNOWN 393 of 400, and MINUTES 300 of 781 — thirty-eight
+       * percent. A minute bar's close is the last print our grid happened to
+       * catch, which is not the closing auction, so using one here computes
+       * a change against a price the exchange never published.
+       *
+       * bar_source arrived in 050. Excluding MINUTES is a one-line filter
+       * that was impossible to write before the column existed, which is
+       * most of why this went unnoticed: there was nothing to filter ON.
+       *
+       * UNKNOWN is KEPT. 14,191 rows carry it because run_id is null on
+       * them and the source cannot be derived — but they agree with the
+       * official close 98% of the time, so treating "we cannot prove where
+       * this came from" as "this is wrong" would throw away the bulk of the
+       * history to avoid a 2% error, and leave prev_close NULL instead.
+       */
       SELECT DISTINCT ON (h.symbol) h.symbol, h.close_price AS prev_close
         FROM tradingview_history h
        WHERE h.trade_date < $1 AND h.close_price IS NOT NULL
+         AND COALESCE(h.bar_source, 'UNKNOWN') <> 'MINUTES'
        ORDER BY h.symbol, h.trade_date DESC
     )
     SELECT b.symbol, b.captures, b.high_price, b.low_price, b.volume,

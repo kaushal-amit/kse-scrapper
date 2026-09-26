@@ -72,7 +72,21 @@ ck('p10 reported', d.pct_change_p10===0.5, d.pct_change_p10);
 const withThin=[sym(1,2,{data_quality:'THIN'}),sym(2,2),sym(3,-1)];
 const bt=m.breadth(withThin);
 ck('THIN symbols still count toward breadth', bt.advancing===2, bt.advancing);
-ck('and are counted separately', bt.thin_symbols===1, bt.thin_symbols);
+/*
+ * D7 · thin_symbols is RETIRED and always NULL now.
+ *
+ * It had no semantic reader — two SELECT * accidents and a log line — while
+ * spread-backend's review/index.js recomputed the same THIN count from
+ * public.symbol_day, which is the number the frontend shows. Two
+ * implementations of one definition, and 16 of 48 stored values disagreed
+ * with the symbol_day rows they claimed to count.
+ *
+ * The line above still matters and is the reason this block exists: THIN
+ * symbols are INCLUDED in breadth. Excluding them would make breadth jump on
+ * days with patchy capture, which is worse than a slightly noisy figure. It
+ * is the SEPARATE COUNT that has gone, not the inclusion.
+ */
+ck('the separate count is retired, not merely missing', bt.thin_symbols===null, bt.thin_symbols);
 
 // ── activity ──
 const act=m.activity([sym(1,1,{total_volume:1000,trades:10}),sym(2,1,{total_volume:2000,trades:20})]);

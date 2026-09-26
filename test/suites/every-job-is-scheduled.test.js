@@ -75,6 +75,12 @@ const MANUAL_ONLY = {
 const INTRADAY = new Set([
   'tradingview.quotes', 'awsat.board', 'awsat.depth', 'awsat.orders',
   'signals.fast', 'signals.wakeup',
+  // D2 · the capture-gap watchdog. Once a minute inside the window is the
+  // default cadence for an enabled job with no AFTER_CLOSE entry, and for
+  // this one the default is the right answer rather than an oversight: a
+  // watchdog that checks after the close reports a hole instead of saving a
+  // session. It is listed here so that is a decision on the record.
+  'session.gapwatch',
 ]);
 
 (async () => {

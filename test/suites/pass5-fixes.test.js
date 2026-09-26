@@ -5,7 +5,7 @@
  * The pattern is now the finding, so it is written down here rather than only
  * in a report:
  *
- *   P4 guarded the FORWARD price in priceAfter and left the BASE price — the
+ *   P4 guarded the FORWARD price in priceInForceAt and left the BASE price — the
  *   other operand of the same subtraction — unguarded. Guarding one operand of
  *   a difference is not guarding the difference.
  *

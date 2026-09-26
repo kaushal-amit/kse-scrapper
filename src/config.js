@@ -271,6 +271,9 @@ function buildConfig() {
       // expected. That has now happened twice.
       'signals.fast', 'signals.wakeup', 'signals.score',
       'daily.instruments', 'daily.symbolday', 'daily.minutesample', 'daily.marketday',
+      // D2 · the watchdog. It runs DURING the session, which is the only time
+      // a capture stop can still be fixed rather than recorded.
+      'session.gapwatch',
     ]),
   },
 

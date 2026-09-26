@@ -96,7 +96,28 @@ function breadth(rows) {
     /** Stored for comparison only. regime is decided by pct_advancing. */
     pct_advancing_ratio: (enough && directional)
       ? Number(((100 * advancing) / directional).toFixed(4)) : null,
-    thin_symbols: rows.filter((r) => r.data_quality === 'THIN').length,
+    /*
+     * ─── D7 · thin_symbols IS RETIRED, AND NOT DROPPED TODAY ───────────────
+     *
+     * Zero semantic readers. Its only exits were two `SELECT *` accidents
+     * (/diag/coverage and the AI market_day tool) and a log line. Meanwhile
+     * spread-backend's review/index.js RECOMPUTES the same count from
+     * public.symbol_day, and THAT is the number the frontend shows — so
+     * there were two implementations of one definition and the stored one
+     * was the unused copy. 16 of 48 stored values disagreed with the
+     * symbol_day rows they claimed to count, which is what happens to a
+     * figure nobody reads.
+     *
+     * NULL rather than dropped, deliberately: spread.market_day projects
+     * this column, so dropping it needs a backend view rebuild first — and
+     * this deploy already carries one such ordering constraint (backend 079
+     * before scraper 056). A second one on the same day buys a tidier schema
+     * with a larger chance of a half-applied deploy, which is a bad trade on
+     * the morning of the first observed session.
+     *
+     * The drop is the follow-up. The column comment carries the condition.
+     */
+    thin_symbols: null,
     /*
      * 049 · PARTIAL has its own column. It is not folded into thin_symbols:
      * a short SESSION and a symbol that fell behind its own MARKET are

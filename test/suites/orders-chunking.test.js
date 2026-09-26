@@ -67,7 +67,7 @@ const order = (over = {}) => ({
         order_id: 'P1', filled_quantity: 4000, remaining_qty: 0,
         order_status: 'Filled', net_value: -94.738, avg_price: 176, order_value: 704,
       })]);
-      const before = await query("SELECT net_value, avg_price, order_value FROM awsat_order_list WHERE order_id = 'P1'");
+      const before = await query("SELECT net_value, avg_price, avg_price_reported, order_value FROM awsat_order_list WHERE order_id = 'P1'");
       ck('the P&L was captured', Number(before.rows[0].net_value) === -94.738, before.rows[0]);
 
       /*
@@ -83,10 +83,15 @@ const order = (over = {}) => ({
       ck('the bad row is rejected', res.rejected === 1, res);
       ck('and the good row still lands', res.inserted === 1, res);
 
-      const after = await query("SELECT net_value, avg_price, order_value, sighting_count FROM awsat_order_list WHERE order_id = 'P1'");
+      const after = await query("SELECT net_value, avg_price, avg_price_reported, order_value, sighting_count FROM awsat_order_list WHERE order_id = 'P1'");
       ck('THE FALLBACK UPDATED net_value — the P&L is not left stale',
         Number(after.rows[0].net_value) === -95.5, after.rows[0]);
-      ck('and avg_price', Number(after.rows[0].avg_price) === 177, after.rows[0]);
+      // D5 · avg_price is NULL on the view now; the broker's figure moved to
+      // avg_price_reported because it is a copy of the ORDER price, not a
+      // fill price. The round-trip being tested here is still the round-trip.
+      ck('and avg_price_reported', Number(after.rows[0].avg_price_reported) === 177, after.rows[0]);
+      ck('  while avg_price itself stays NOT COMPUTED',
+        after.rows[0].avg_price === null, after.rows[0]);
       ck('and order_value', Number(after.rows[0].order_value) === 708, after.rows[0]);
       ck('and the sighting was counted', Number(after.rows[0].sighting_count) >= 2, after.rows[0]);
     }

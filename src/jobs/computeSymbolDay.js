@@ -42,6 +42,7 @@ const { query } = require('../db/pool');
 const clock = require('../market/clock');
 const log = require('../logger');
 const M = require('./symbolDayMetrics');
+const { repairAwaitingCloses } = require('./repairAwaitingCloses');
 const T = require('../config/thresholds');
 const { config } = require('../config');
 
@@ -59,7 +60,11 @@ const CLOSE_TIER_ORDER = [...M.CLOSE_TIERS.entries()]
 /** Columns written. Anything absent from here is deliberately left NULL. */
 const COLUMNS = [
   'symbol', 'trading_date',
+  'cb_auctions',
   'open_px', 'high_px', 'low_px', 'close_px', 'prev_close', 'chg_fils',
+  // D3 · which rule supplied prev_close, and whether the feed agreed with
+  // itself about the reference. Both are NOT optional: see 055.
+  'prev_close_source', 'prev_close_ref_spread',
   'chg_1d', 'chg_5d', 'day_range', 'prev_session_used', 'prev_session_gap_days',
   'total_volume', 'trades', 'avg_trade_size', 'highest_minute_volume',
   'moves', 'up_moves', 'down_moves', 'up_moves_2plus', 'up_moves_3plus',
@@ -69,7 +74,6 @@ const COLUMNS = [
   'trades_at_offer', 'trades_at_bid', 'pct_at_offer', 'buy_sell_ratio',
   'minutes_captured', 'coverage_pct', 'data_quality', 'quality_rule_version',
   'source', 'close_source',
-  'range_source',
   // The shape of the session's trading, not its totals. Logged, never gated.
   'avg_uptick_shares', 'avg_downtick_shares', 'uptick_ratio',
   'n_upticks', 'n_downticks', 'turnover_kd',
@@ -632,14 +636,60 @@ function buildRow(symbol, day, rows, marketMedian, scheduledMinutes = null, boun
     symbol,
     trading_date: day,
     ...price,
+    /*
+     * D6 · THE HIGH AND LOW COME FROM THE FEED, NOT FROM WHAT WE SAMPLED.
+     *
+     * priceBlock still supplies open_px (see feedRange's docblock for why
+     * open is deliberately left alone — it is read by a live trading gate).
+     * high_px and low_px are overwritten by the exchange's own running
+     * extremes, which arrive on every quote row and are 100% populated across
+     * all 49 captured days.
+     *
+     * Our sampled version was below the feed high on 974 of 6,351 symbol-days
+     * and above the feed low on 1,100, and NEVER the other way — the
+     * signature of a sampling floor, not a disagreement. A 60-second grid
+     * cannot see a spike that came back inside the minute.
+     *
+     * The feed value is used only when it exists; a day with no high_price at
+     * all falls back to the sampled one rather than losing the range.
+     */
+    ...(() => {
+      const f = M.feedRange(rows);
+      return {
+        high_px: f.feed_high !== null ? f.feed_high : price.high_px,
+        low_px: f.feed_low !== null ? f.feed_low : price.low_px,
+      };
+    })(),
+    cb_auctions: M.cbAuctions(rows),
     close_px: close,
-    close_source: M.closeSource(rows),
-    range_source: M.rangeSource(rows),
+    /*
+     * D3 · A DAY WITH NO CLOSE-OF-DAY CAPTURE DOES NOT GET A CLOSE'S LABEL.
+     *
+     * On 14 September capture stopped at 11:59 and the table recorded those
+     * 11:59 prices as the day's closes under a closing-session name, for a
+     * session that was never captured. 15 September's prev_close is wrong on
+     * 108 of 134 symbols because of it.
+     *
+     * close_px still holds the best available price — throwing it away helps
+     * nobody — but the label says what it is: provisional, and waiting for
+     * the following session to publish the real close as its reference.
+     * repairAwaitingCloses() then replaces both.
+     */
+    close_source: closeOfDay ? M.closeSource(rows)
+      : (close === null ? null : 'AWAITING_NEXT_SESSION'),
     ...M.flowBlock(rows),
     ...M.spreadBlock(rows, close),
     peak_hour: M.peakHour(rows),
-    day_range: (price.high_px !== null && price.low_px !== null)
-      ? price.high_px - price.low_px : null,
+    // day_range follows the SAME extremes as high_px/low_px above. Leaving it
+    // on `price` would have the stored range disagree with the stored high
+    // minus the stored low, which is the kind of quiet contradiction 049's
+    // fingerprint exists to catch.
+    day_range: (() => {
+      const f = M.feedRange(rows);
+      const hi = f.feed_high !== null ? f.feed_high : price.high_px;
+      const lo = f.feed_low !== null ? f.feed_low : price.low_px;
+      return (hi !== null && lo !== null) ? hi - lo : null;
+    })(),
     total_volume: volume.total_volume,
     trades: volume.trades,
     avg_trade_size: volume.avg_trade_size,
@@ -744,13 +794,47 @@ async function compute(tradingDay, runId) {
   for (const [symbol, rows] of bySymbol) {
     const row = buildRow(symbol, day, rows, marketMedian, sched.minutes, bounds);
 
-    const prev = prevCloses.get(symbol)
+    /*
+     * ─── D3 · THE EXCHANGE'S REFERENCE FIRST, THE RECONSTRUCTION SECOND ────
+     *
+     * `last_price - chg` on this day's own quotes IS the previous official
+     * close, published by the exchange and constant through the session. It
+     * needs no reach-back, no usable-session rule and no five-session cap,
+     * and it disagreed with our reconstruction on 1,138 of 6,082 symbol-days
+     * — 41 of them by more than 5%.
+     *
+     * previousCloses() is kept as the fallback, for a symbol with no usable
+     * chg on the day (it never traded, or the board carried no change
+     * column). prev_close_source records which one answered, because a
+     * fallback nothing can distinguish from the primary is how four defects
+     * survived this month.
+     *
+     * prev_session_used / prev_session_gap_days describe the RECONSTRUCTION,
+     * so they are carried only when the reconstruction is what was used.
+     * Leaving them populated beside an exchange-sourced prev_close would
+     * describe a reach-back that did not happen.
+     */
+    const carried = prevCloses.get(symbol)
       || { prev_close: null, prev_session_used: null, prev_session_gap_days: null };
-    Object.assign(row, prev);
-    row.chg_fils = (row.close_px !== null && prev.prev_close !== null)
-      ? row.close_px - prev.prev_close : null;
-    row.chg_1d = (row.chg_fils !== null && prev.prev_close)
-      ? Number(((100 * row.chg_fils) / prev.prev_close).toFixed(4)) : null;
+    const ref = M.referenceClose(rows);
+
+    if (ref.ref !== null) {
+      row.prev_close = ref.ref;
+      row.prev_close_source = 'EXCHANGE_REFERENCE';
+      row.prev_close_ref_spread = ref.spread;
+      row.prev_session_used = null;
+      row.prev_session_gap_days = null;
+    } else {
+      Object.assign(row, carried);
+      row.prev_close_source = carried.prev_close === null ? null : 'CARRIED_FORWARD';
+      row.prev_close_ref_spread = null;
+    }
+
+    const prevClose = row.prev_close;
+    row.chg_fils = (row.close_px !== null && prevClose !== null)
+      ? row.close_px - prevClose : null;
+    row.chg_1d = (row.chg_fils !== null && prevClose)
+      ? Number(((100 * row.chg_fils) / prevClose).toFixed(4)) : null;
 
     const px5 = back5.get(symbol);
     row.chg_5d = (row.close_px !== null && px5)
@@ -816,7 +900,32 @@ async function compute(tradingDay, runId) {
     day, symbols: built.length, inserted, thin, crossed, runId,
   });
 
-  return { extracted: bySymbol.size, inserted, rejected: 0, thin };
+  /*
+   * D3 · NOW THAT THIS SESSION EXISTS, EARLIER DAYS CAN BE REPAIRED.
+   *
+   * A day whose capture missed the closing auction has no close of its own,
+   * and the exchange publishes it the next morning as that session's
+   * reference price. This session is that morning for whatever came before
+   * it. It only ever touches rows already labelled AWAITING_NEXT_SESSION.
+   *
+   * Failing here must not fail the night's compute — the rows for TODAY are
+   * already written and correct, and a repair of a fortnight-old close is
+   * not worth losing them over. It is logged and left for tomorrow's run,
+   * which will find the same rows still awaiting.
+   */
+  let repair = { repaired: 0, stillAwaiting: null };
+  try {
+    repair = await repairAwaitingCloses(day);
+  } catch (e) {
+    log.error('symbol_day: the awaiting-close repair failed; today\'s rows are '
+      + 'unaffected and the repair will be retried on the next session',
+    { day, error: e.message });
+  }
+
+  return {
+    extracted: bySymbol.size, inserted, rejected: 0, thin,
+    closesRepaired: repair.repaired, stillAwaiting: repair.stillAwaiting,
+  };
 }
 
 module.exports = {

@@ -61,6 +61,7 @@ const MODE = {
  * capture 40 minutes late is not "the price 5 minutes later" by any reading,
  * and treating it as one is how a quiet hour becomes a measured move.
  */
+const STALE_TOLERANCE_MIN = require('../config/thresholds').get('score_stale_tolerance_min');
 const FORWARD_TOLERANCE_MIN = require('../config/thresholds').get('score_forward_tolerance_min');
 
 /** The Kuwait trading day a signal's timestamp belongs to. */
@@ -75,7 +76,7 @@ const MIN_MOVE_FILS = require('../config/thresholds').get('score_min_move_fils')
  *
  * P5 · ZERO IS NOT A PRICE ON EITHER SIDE OF THE SUBTRACTION.
  *
- * P4 guarded the FORWARD price — both branches of priceAfter now require
+ * P4 guarded the FORWARD price — both branches of priceInForceAt now require
  * `last_price > 0` — and left the other operand of the same subtraction
  * unguarded. signal_log.price comes from jobs.js writing now.last_price with no
  * floor into a bare numeric column with no CHECK, and validate.js rejects only
@@ -106,11 +107,50 @@ function grade(base, px, mode) {
 }
 
 /**
- * The price a given number of minutes after a moment, WITHIN THE SAME SESSION.
+ * The price IN FORCE at a given number of minutes after a moment, within the
+ * same session: the LAST capture at or before the mark.
  *
- * The FIRST capture at or after the target, not the nearest — "the price five
- * minutes later" must not be satisfied by a print from four minutes later
- * because it happens to be closer.
+ * ─── C1 · THIS USED TO REACH PAST THE MARK, AND THAT IS LOOKAHEAD ──────────
+ *
+ * The rule here was "the FIRST capture at or after the target, not the
+ * nearest", defended on the grounds that a print from four minutes later must
+ * not answer the five-minute question. The defence is wrong, and it is wrong
+ * in the one direction that biases everything downstream.
+ *
+ * Signals fire within seconds of a capture — they are computed FROM one — and
+ * the grid is ~60 s. So the capture five minutes after a signal lands just
+ * BEFORE fired_at + 5 min, and "the first at or after the mark" is the one
+ * after that: systematically about a minute late. Measured by the KB team over
+ * the last 400 signals (14-24 Sep 2026):
+ *
+ *   · 232 of 400 — the first capture at or after the mark is more than 50 s
+ *     past it;
+ *   · of the 139 where the captures either side of the mark differ in price,
+ *     px_5min held the LATER one in 93 and the earlier one in 46.
+ *
+ * The decisive objection is not the lateness; it is what the lateness is made
+ * of. Grading against a print that had not happened at the mark uses
+ * information unavailable at the moment being graded. That is LOOKAHEAD, in
+ * the evidence base the strategy is judged on, and it does not average out,
+ * because it is one-sided: every horizon is answered with a price from the
+ * future relative to that horizon.
+ *
+ * The price in force at the mark is what a desk could have transacted at. It
+ * may be up to one grid interval old, and that is not an approximation of the
+ * right answer — it IS the right answer. A price observed after the mark is
+ * not a better version of it; it is the answer to a different question.
+ *
+ * Bounded on BOTH sides, and the lower bound is new:
+ *
+ *   · STRICTLY AFTER fired_at. If no capture arrived between the signal and
+ *     the mark, the last one at or before the mark predates the signal — and
+ *     grading forward movement against a pre-signal price measures nothing at
+ *     all. It is also the exact price in signal_log.price, so every such row
+ *     would grade as "no move": FROZEN right, the four 'down' families wrong,
+ *     uniformly and invisibly. NOT COMPUTED.
+ *   · NOT STALER than score_stale_tolerance_min before the mark, so a capture
+ *     gap cannot answer the 5-minute question with a print from hours
+ *     earlier.
  *
  * F-15 · BOUNDED TO THE SIGNAL'S OWN TRADING DAY, AND TO A WINDOW.
  *
@@ -131,7 +171,7 @@ function grade(base, px, mode) {
  * cross-session price is not a late answer to it — it is an answer to a
  * different question.
  */
-async function priceAfter(symbol, from, minutes) {
+async function priceInForceAt(symbol, from, minutes) {
   // symbol_minute FIRST — it is the finest grid, but it exists only for the 8–17
   // depth-slot symbols (signals.fast writes it). A WAKEUP fires on any of ~137
   // symbols, so for all but the slotted few symbol_minute has no row and the
@@ -139,14 +179,16 @@ async function priceAfter(symbol, from, minutes) {
   // board-wide awsat_market_quotes (~60 s, every symbol) so every signal gets a
   // forward price.
   //
-  // Both are bounded the same way: at or after the target, on the SAME trading
-  // day, and within a tolerance of the target so a long capture gap does not
-  // silently answer with a much later print.
+  // Both are bounded the same way: the LAST capture at or before the mark, on
+  // the SAME trading day, strictly after the signal fired, and no staler than
+  // the tolerance. ORDER BY ... DESC is the whole change from the old rule;
+  // the two bounds around it are what stop DESC finding something absurd.
   const { rows } = await query(
     `SELECT last_price FROM symbol_minute
       WHERE symbol = $1
-        AND ts >= $2::timestamptz + ($3 || ' minutes')::interval
-        AND ts <  $2::timestamptz + (($3::int + $5::int) || ' minutes')::interval
+        AND ts <= $2::timestamptz + ($3 || ' minutes')::interval
+        AND ts >  $2::timestamptz
+        AND ts >= $2::timestamptz + (($3::int - $5::int) || ' minutes')::interval
         AND trading_date = $4::date
         -- P4 · "> 0", which the quotes fallback below has always had and this
         -- branch did not — and this branch is consulted FIRST and returns on
@@ -167,17 +209,18 @@ async function priceAfter(symbol, from, minutes) {
         --
         -- Same class as the zero book in symbolDayMetrics: zero is not a price.
         AND last_price IS NOT NULL AND last_price > 0
-      ORDER BY ts ASC LIMIT 1`, [symbol, from, minutes, tradingDayOf(from), FORWARD_TOLERANCE_MIN],
+      ORDER BY ts DESC LIMIT 1`, [symbol, from, minutes, tradingDayOf(from), STALE_TOLERANCE_MIN],
   );
   if (rows.length) return Number(rows[0].last_price);
   const { rows: q } = await query(
     `SELECT last_price FROM awsat_market_quotes
       WHERE symbol = $1
-        AND created_at >= $2::timestamptz + ($3 || ' minutes')::interval
-        AND created_at <  $2::timestamptz + (($3::int + $5::int) || ' minutes')::interval
+        AND created_at <= $2::timestamptz + ($3 || ' minutes')::interval
+        AND created_at >  $2::timestamptz
+        AND created_at >= $2::timestamptz + (($3::int - $5::int) || ' minutes')::interval
         AND trading_date = $4::date
         AND last_price IS NOT NULL AND last_price > 0
-      ORDER BY created_at ASC LIMIT 1`, [symbol, from, minutes, tradingDayOf(from), FORWARD_TOLERANCE_MIN],
+      ORDER BY created_at DESC LIMIT 1`, [symbol, from, minutes, tradingDayOf(from), STALE_TOLERANCE_MIN],
   );
   return q.length ? Number(q[0].last_price) : null;
 }
@@ -201,11 +244,11 @@ async function score(tradingDay, runId) {
   let unscorable = 0;
 
   for (const s of pending) {
-    const px5 = await priceAfter(s.symbol, s.fired_at, 5);
-    const px15 = await priceAfter(s.symbol, s.fired_at, 15);
+    const px5 = await priceInForceAt(s.symbol, s.fired_at, 5);
+    const px15 = await priceInForceAt(s.symbol, s.fired_at, 15);
     // px_60min is in the spec: a signal can be right at 5 minutes and wrong an
     // hour later, and only keeping both shows which.
-    const px60 = await priceAfter(s.symbol, s.fired_at, 60);
+    const px60 = await priceInForceAt(s.symbol, s.fired_at, 60);
     const base = s.price === null ? null : Number(s.price);
 
     // was_right is the 5-minute grade on the signal's own claim (see MODE).
@@ -246,6 +289,42 @@ async function score(tradingDay, runId) {
  * ever: 4,507 accumulated. This backfills them. Idempotent — a scored row is
  * never revisited (scored_at IS NOT NULL).
  */
+/**
+ * ─── C1 · RE-SCORING WHAT THE OLD RULE ALREADY GRADED ───────────────────────
+ *
+ * Changing priceInForceAt fixes signals scored from here on. It does nothing
+ * for the rows already in signal_log: `score()` only looks at `scored_at IS
+ * NULL`, so every existing grade keeps the lookahead price that produced it —
+ * and those rows ARE the evidence base the strategy is judged on.
+ *
+ * This is the gap Amit named on 26 September from the other direction: a
+ * threshold moved in code while every stored row kept the old verdict,
+ * because nothing recomputes on an edit. "The code says X" and "the rows say
+ * X" are different claims, and only the second one is the fix. So the rule
+ * change ships WITH the re-score, not ahead of it.
+ *
+ * It CLEARS scored_at rather than recomputing in place, so the work goes
+ * through exactly the path a nightly run takes — no second implementation of
+ * the scoring rule that can drift from the first.
+ *
+ * Expect the totals to move, and expect some of them to move to NULL: a row
+ * whose horizon is now NOT COMPUTED loses its was_right, because part of what
+ * the log currently calls a graded outcome was never measurable. A smaller
+ * denominator that means something beats a larger one that does not.
+ */
+async function rescoreAll(runId, { from = null } = {}) {
+  const { rowCount } = await query(
+    `UPDATE signal_log
+        SET scored_at = NULL, was_right = NULL,
+            px_5min = NULL, px_15min = NULL, px_60min = NULL
+      WHERE ($1::date IS NULL OR trading_date >= $1::date)`, [from]);
+  log.warn('scoring: RE-SCORE — clearing grades made under the pre-C1 rule, which '
+    + 'read the first capture AFTER the mark and so graded against a price the '
+    + 'mark could not have known', { rows: rowCount, from: from || 'all history' });
+  const out = await scoreBackfill(runId);
+  return { cleared: rowCount, ...out };
+}
+
 async function scoreBackfill(runId) {
   const { rows: days } = await query(
     `SELECT DISTINCT trading_date FROM signal_log
@@ -289,4 +368,7 @@ async function scoringReport(day) {
   })).sort((x, y) => x.signal.localeCompare(y.signal));
 }
 
-module.exports = { score, scoreBackfill, scoringReport, priceAfter, grade, MODE, MIN_MOVE_FILS };
+module.exports = {
+  score, scoreBackfill, rescoreAll, scoringReport,
+  priceInForceAt, grade, MODE, MIN_MOVE_FILS, STALE_TOLERANCE_MIN,
+};

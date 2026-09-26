@@ -877,6 +877,8 @@ async function tradingviewBackfill(runId, args) {
   };
 }
 
+const { captureGapWatch } = require('./jobs/captureGapWatch');
+
 const JOBS = {
   'tradingview.quotes': tradingviewQuotes,
   'tradingview.history': tradingviewHistory,
@@ -889,6 +891,7 @@ const JOBS = {
   'signals.fast': fastLoop,
   'signals.wakeup': wakeupScan,
   'signals.score': scoreSignals,
+  'session.gapwatch': captureGapWatch,
   'awsat.board': awsatBoard,
   'awsat.depth': awsatDepth,
   'awsat.orders': awsatOrders,

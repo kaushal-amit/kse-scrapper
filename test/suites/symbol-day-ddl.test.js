@@ -44,12 +44,41 @@ let p=0,n=0;const ck=(t,c,x)=>{n++;if(c)p++;else console.log('  FAIL:',t,JSON.st
   // -45 from 053: declared, never written, and read by nothing. The count is
   // asserted rather than described because this suite is the schema's snapshot
   // — if a column comes back, or another goes, it says so here first.
-  ck('68 columns after migration 053', sd.length===68, sd.length);
+  // 68 after 053, +2 from 055 (prev_close_source, prev_close_ref_spread),
+  // -1 from 056 (range_source, retired by C3), +1 from 057 (cb_auctions).
+  ck('70 columns after migration 057', sd.length===70, sd.length);
+  /*
+   * D4 · cb_auctions replaces the dropped cb_events, which counted CB
+   * Auction CAPTURE ROWS — halt duration in grid units, under a name that
+   * says "count of events". It agreed with the real figure on 17 of 338
+   * breaker symbol-days.
+   */
+  ck('cb_auctions present', !!name('cb_auctions'));
+  ck('  and cb_events did NOT come back', !name('cb_events'));
   for (const c of ['avg_spread_fils','avg_spread_pct','days_active','down_days','peak_hour']) {
     ck(c + ' present', !!name(c));
   }
-  ck('range_source present — an unmarked short range is a wrong gate',
-     !!name('range_source'));
+  /*
+   * C3 · range_source is GONE, and the reverse assertion is the point.
+   *
+   * This suite used to require it present, because an unmarked short range is
+   * a wrong gate. That worry was real; the column was not the answer to it.
+   * It marked a range FULL when capture reached 13:10, against a session that
+   * ends at 13:00 — it could never fire — and 050's correction to 13:00 was
+   * still wrong, because a complete session's last capture lands at 12:59 on
+   * a 60-second grid. 43 of 48 stored days end at 12:59.
+   *
+   * D6 removed the question instead of answering it a third time: high and
+   * low now come from the feed's own extremes, so the range is not sampled
+   * and capture length does not bear on it. Completeness is close_source's
+   * job, and D3 made that column truthful.
+   */
+  ck('range_source is GONE, not repaired a third time', !name('range_source'));
+  for (const c of ['prev_close_source', 'prev_close_ref_spread']) {
+    ck(c + ' present — D3 says which rule supplied prev_close, because a '
+      + 'fallback nothing can distinguish from the primary is how four '
+      + 'defects survived this month', !!name(c));
+  }
   for (const c of ['avg_uptick_shares','avg_downtick_shares','uptick_ratio',
     'n_upticks','n_downticks','turnover_kd',
     'first_half_shares_per_min','second_half_shares_per_min']) {
@@ -175,7 +204,15 @@ let p=0,n=0;const ck=(t,c,x)=>{n++;if(c)p++;else console.log('  FAIL:',t,JSON.st
   // counts only 'THIN'), no_prev_close (breadth computed it and the compute
   // deleted it before the write), and the two fingerprint columns that make a
   // market_day row refuse when the symbol_day beneath it has moved.
-  ck('34 columns after migration 049', md.length===34, md.length);
+  // 34 after 049, +6 from 054: the session's own capture shape (D2).
+  // close_of_day_rows = 0 is what tells D3 a day has no official close.
+  ck('40 columns after migration 054', md.length===40, md.length);
+  for (const c of ['first_capture_at', 'last_trading_capture_at', 'largest_gap_secs',
+    'largest_gap_at', 'close_of_day_rows', 'session_minutes_captured']) {
+    ck(c + ' present — D2, so a stopped session is a stored fact rather than '
+      + 'something found weeks later by counting rows',
+    md.some((x) => x.column_name === c));
+  }
   ck('broker_seen_at present — what stops a backfill overwriting the exchange count',
      md.some(c=>c.column_name==='broker_seen_at'));
   ck('computed_* kept so "do we disagree often" is a query, not a grep',
