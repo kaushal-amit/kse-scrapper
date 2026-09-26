@@ -98,19 +98,160 @@ function clientOrderTime(raw, tradingDate) {
  * quote stored under a fresh minute is worse than a gap, because nothing
  * downstream can tell it is stale.
  */
-function checkCapturedAt(raw, maxSkewMs = 15 * 60_000) {
+function checkCapturedAt(raw, maxSkewMs = 15 * 60_000, { allowLateCloseOfDay = false } = {}) {
   if (!raw) return { ok: true, capturedAt: new Date() };   // absent is tolerated
   const t = new Date(raw);
   if (Number.isNaN(t.getTime())) return { ok: false, reason: 'capturedAt is not a valid timestamp' };
 
-  const skew = Date.now() - t.getTime();
+  // clock.now(), not Date.now(): ONE named source for "now", so a suite can
+  // place itself inside a real session rather than only passing on weekdays.
+  const skew = clock.now().getTime() - t.getTime();
   if (skew > maxSkewMs) {
     return { ok: false, reason: `capturedAt is ${Math.round(skew / 1000)}s old (limit ${maxSkewMs / 1000}s)` };
   }
   if (skew < -60_000) {
     return { ok: false, reason: 'capturedAt is in the future' };
   }
-  return { ok: true, capturedAt: t };
+  /*
+   * ─── THE CAPTURE WINDOW · 08:40 to 13:20 KUWAIT ──────────────────────────
+   *
+   * No userscript stops posting when the market shuts. P6-CLI-5 already knew
+   * this — it skips the frozen-board check out of hours because "from 13:30
+   * until the tab is shut the same board is posted every 60 s" — and it
+   * skipped the DETECTOR while still storing the rows. On 24 September the
+   * client was still saving at 16:22: 17,640 price rows and 16,086 depth rows
+   * after 13:20, every one of them the same shut board.
+   *
+   * The other end is worse. On 20 September 1,022 rows arrived before 08:00
+   * with NO session label at all, carrying 17 SEPTEMBER's cumulative trades
+   * and volume — the terminal was serving Thursday's figures after an outage.
+   * 79 of 140 symbols still have identical day totals for the two dates.
+   * Those rows are not early data; they are last session's data wearing
+   * today's date.
+   *
+   * So the window is enforced HERE, at the one door every capture comes
+   * through, rather than in four userscripts that can be stale in somebody's
+   * browser. Close-Of-Day starts at 13:15, so by 13:20 the final print is in
+   * and everything after it is a tab left open.
+   *
+   * REFUSED, not silently dropped: the client sees the reason, the panel can
+   * show it, and the run is recorded. A window that discards data quietly is
+   * the same class of defect as the data it is discarding.
+   */
+  const w = captureWindow(t);
+  if (!w.inside) return { ok: false, reason: w.reason, outsideWindow: true };
+  /*
+   * 051 · only the QUOTES endpoint can act on this, because only it can tell a
+   * closing print from the shut board. Every other caller gets the old
+   * behaviour: a late batch is refused outright, which is right — a late depth
+   * snapshot or order list is a page left open, with no closing print in it.
+   */
+  if (w.lateCloseOfDayOnly && !allowLateCloseOfDay) {
+    return { ok: false, outsideWindow: true,
+      reason: `captured at ${clock.localTime(t)} Kuwait, after the capture window closes at `
+        + `${config.market.captureEndTime} — the Close-Of-Day exemption applies to quotes only` };
+  }
+  return { ok: true, capturedAt: t, lateCloseOfDayOnly: !!w.lateCloseOfDayOnly };
+}
+
+/*
+ * The capture window, in Kuwait minutes. Its own setting rather than
+ * START_TIME/END_TIME: those drive the SCHEDULER, and the after-close jobs are
+ * derived from END_TIME at +1/+5/+12 — moving it to 13:20 would move
+ * daily.symbolday and daily.marketday with it, which is the exact trap the
+ * scheduler's own header warns about and the reason they did not run on 24
+ * September.
+ */
+function captureWindow(at) {
+  const start = config.market.captureStartMinutes;
+  const end = config.market.captureEndMinutes;
+  const backstop = config.market.codBackstopMinutes;
+  const k = clock.parts(at);
+  const m = k.minutesOfDay;
+  const hhmm = `${String(k.hour).padStart(2, '0')}:${String(k.minute).padStart(2, '0')}`;
+  if (m < start) {
+    return { inside: false,
+      reason: `captured at ${hhmm} Kuwait, before the capture window opens at `
+        + `${config.market.captureStartTime} — a pre-open capture with no session label carries `
+        + 'the PREVIOUS session\'s totals, which is how 20 September stored 17 September\'s numbers' };
+  }
+  if (m >= end) {
+    /*
+     * ─── 051 · THE ONE ROW THAT MAY BE LATE ──────────────────────────────
+     *
+     * The reason this door used to give — "Close-Of-Day starts 13:15, so the
+     * final print is already in" — is disproved. Measured first Close-Of-Day
+     * row: 13:15 on 23 September (captured continuously), 13:25 on 13 August,
+     * 14:43 on 24 September. The last two sit on the far side of a 15- and a
+     * 92-minute gap in our own capture, so they are when WE LOOKED, not when
+     * the venue published.
+     *
+     * No fixed clock can be right: any number drawn from those three is wrong
+     * on two of them. So the door still shuts at 13:20 for the board, and
+     * opens for the closing print alone, up to a backstop — because "whenever
+     * it arrives" would accept a stuck page at 22:00. The caller filters the
+     * batch to the first Close-Of-Day row per symbol; this only says the
+     * batch may be considered.
+     */
+    if (m < backstop) {
+      return { inside: true, reason: null, lateCloseOfDayOnly: true };
+    }
+    return { inside: false,
+      reason: `captured at ${hhmm} Kuwait, after the Close-Of-Day backstop at `
+        + `${config.market.codBackstopTime} — the board shuts at `
+        + `${config.market.captureEndTime} and the closing print is admitted after it, but a `
+        + 'capture this late is a page left open, not a late publication' };
+  }
+  return { inside: true, reason: null };
+}
+
+
+/*
+ * Drop rows identical to the last stored row for the same symbol today.
+ *
+ * ONE query for the whole batch — the latest row per symbol — rather than one
+ * per row: the batch is the whole board, 140 symbols, every capture.
+ *
+ * A read that FAILS keeps every row. The dedupe is an optimisation on top of
+ * the data; losing a capture because a lookup broke would be the priority
+ * backwards, and it says so in the log rather than passing silently.
+ */
+const DEDUPE_FIELDS = ['session', 'last_price', 'last_qty', 'volume', 'trades',
+  'bid', 'bid_qty', 'offer', 'offer_qty', 'open_price', 'high_price', 'low_price'];
+
+function sameRow(a, b) {
+  for (const f of DEDUPE_FIELDS) {
+    const x = a[f] == null ? null : String(a[f]);
+    const y = b[f] == null ? null : String(b[f]);
+    if (x !== y) return false;
+  }
+  return true;
+}
+
+async function dropUnchanged(rows, tradingDate, source) {
+  if (!rows || !rows.length) return { rows: rows || [], skipped: 0 };
+  let latest = new Map();
+  try {
+    const { rows: prev } = await query(
+      `SELECT DISTINCT ON (symbol) symbol, session, last_price, last_qty, volume, trades,
+              bid, bid_qty, offer, offer_qty, open_price, high_price, low_price
+         FROM awsat_market_quotes
+        WHERE trading_date = $1 AND ingest_source = $2
+        ORDER BY symbol, created_at DESC, id DESC`, [tradingDate, source]);
+    latest = new Map(prev.map((r) => [r.symbol, r]));
+  } catch (err) {
+    log.warn('the repeat check could not read the previous capture — every row kept',
+      { err: err.message, note: 'a dedupe that fails must not lose a capture' });
+    return { rows, skipped: 0 };
+  }
+  const kept = [];
+  let skipped = 0;
+  for (const r of rows) {
+    const prev = latest.get(r.symbol);
+    if (prev && sameRow(r, prev)) { skipped += 1; continue; }
+    kept.push(r);
+  }
+  return { rows: kept, skipped };
 }
 
 /** Already-processed batch? Replay its result rather than inserting again. */
@@ -1333,7 +1474,7 @@ function createRouter() {
       });
     }
 
-    const when = checkCapturedAt(body.capturedAt);
+    const when = checkCapturedAt(body.capturedAt, undefined, { allowLateCloseOfDay: true });
     if (!when.ok) return res.status(400).json({ ok: false, error: when.reason });
 
     try {
@@ -1354,6 +1495,50 @@ function createRouter() {
         if (row) mapped.push(row); else malformed += 1;
       }
 
+      /*
+       * ─── 051 · THE CLOSING PRINT IS THE ONLY THING THAT CROSSES THE DOOR ──
+       *
+       * `when.lateCloseOfDayOnly` means this batch arrived after 13:20 and was
+       * admitted ONLY because the closing print may not be in yet. Measured:
+       * the venue published Close-Of-Day at 13:15 on the one day we captured
+       * continuously through the transition, at 13:25 on 13 August, and at
+       * 14:43 on 24 September — the last two both on the far side of a gap in
+       * OUR capture, so they are looking times, not publication times.
+       *
+       * Everything else in a late batch is the shut board: 17,640 price rows
+       * after 13:20 on 24 September, the same values re-posted every minute
+       * until 16:22. So the rows are filtered to Close-Of-Day, and a symbol
+       * that already has one today is dropped — the FIRST one per symbol per
+       * day, at the door, which is where "first" is cheap to enforce.
+       *
+       * Refusing the whole batch here would be the old behaviour; storing all
+       * of it would be the defect the door was built for. Neither.
+       */
+      let lateKept = 0;
+      let lateDropped = 0;
+      if (when.lateCloseOfDayOnly) {
+        const before = mapped.length;
+        const cod = mapped.filter((r) => String(r.session || '').trim() === 'Close-Of-Day');
+        const already = cod.length
+          ? new Set((await repo.symbolsWithCloseOfDay(meta.tradingDate,
+            cod.map((r) => r.symbol))).map((s) => String(s).toUpperCase()))
+          : new Set();
+        const keep = cod.filter((r) => !already.has(String(r.symbol).toUpperCase()));
+        lateKept = keep.length;
+        lateDropped = before - keep.length;
+        mapped.length = 0;
+        mapped.push(...keep);
+        log.info('ingest: late batch admitted for the closing print only', {
+          batchId, tradingDate: meta.tradingDate, kept: lateKept, dropped: lateDropped,
+          note: 'rows kept are marked cod_late in quotes_clean — their time is when WE '
+              + 'saw them, not when the venue published',
+        });
+        if (!mapped.length) {
+          return res.json({ ok: true, offered: before, inserted: 0, rejected: 0,
+            note: 'late batch: every symbol already has its closing print' });
+        }
+      }
+
       const checked = validate.validateAll(mapped, validate.validateQuote, 'ingest/quotes');
 
       // Register instruments first, exactly as the server-side path does.
@@ -1361,11 +1546,38 @@ function createRouter() {
         market: r.market, symbol: r.symbol, code: r.code, description: r.description,
       })));
 
-      const result = await repo.insertQuotes(checked.rows);
+      /*
+       * ─── THE REPEAT CHECK · AN IDENTICAL CAPTURE IS NOT A SECOND READING ──
+       *
+       * On 24 September 2,520 extra rows landed — one per symbol per minute
+       * from 13:04 onward, every one byte-identical to the row before it,
+       * because the cadence moved to 30 seconds at the deploy and the market
+       * was in Close Auction Acceptance with nothing moving.
+       *
+       * quote_fingerprint does NOT stop this. It is the FROZEN-BOARD detector
+       * — it records a hash of the whole batch and warns when the board stops
+       * changing — and it deliberately runs only inside the window, which is
+       * why it had four rows today and none after 13:11. It never dropped a
+       * row and was never meant to.
+       *
+       * This is the missing check, and it is content, not time: a row is
+       * skipped only when every field that can move is IDENTICAL to the last
+       * stored row for that symbol today. Two genuine captures a minute are
+       * kept — the historical cadence is roughly that, and the coverage
+       * measures count them — while a repeat of a board that has not moved is
+       * not a second reading of anything.
+       *
+       * Counted and returned, never silent: `duplicate` on the response and in
+       * the run row. A dedupe nobody can see is indistinguishable from a feed
+       * that stopped.
+       */
+      const deduped = await dropUnchanged(checked.rows, meta.tradingDate, source);
+      const result = await repo.insertQuotes(deduped.rows);
       const counts = {
         offered: body.records.length,
         inserted: result.inserted,
         rejected: malformed + checked.rejected + result.rejected,
+        duplicate: deduped.skipped,
       };
 
       /**

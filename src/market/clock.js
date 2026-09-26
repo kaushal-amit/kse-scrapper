@@ -162,8 +162,29 @@ function minuteBucket(date = new Date()) {
   return d;
 }
 
+/**
+ * NOW, as one named thing.
+ *
+ * Everything else in this module already answers "what time is it for the
+ * market"; a bare `Date.now()` in a caller is the same question asked where
+ * nothing can see it. It lives here so a test can replace it —
+ * `require('.../clock').now = () => new Date(...)` — with no environment
+ * variable that could be set in production by accident, and with no caller
+ * inventing its own seam.
+ *
+ * Written for market-summary.test.js, which needs a capture that is BOTH
+ * inside the 15-minute freshness limit AND on a day Boursa actually opens.
+ * Those two coincide only during a live session, so on a Friday or a Saturday
+ * that suite could not pass at all — 9/23, every weekend, reading as a product
+ * failure. A test that can only pass five days a week is not a test.
+ */
+function now() {
+  return new Date();
+}
+
 module.exports = {
   parts,
+  now,
   tradingDay,
   isBeforeSignalsEnd,
   localTime,

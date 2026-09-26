@@ -20,6 +20,8 @@ const { query } = require('../db/pool');
 const clock = require('../market/clock');
 const log = require('../logger');
 const M = require('./marketDayMetrics');
+const THRESHOLDS = require('../config/thresholds');
+const { config } = require('../config');
 
 const COLUMNS = [
   'trading_date',
@@ -27,6 +29,8 @@ const COLUMNS = [
   // What OUR rule produced, written every run whatever the source.
   'computed_advancing', 'computed_declining', 'computed_symbols',
   'pct_advancing', 'pct_advancing_ratio', 'breadth_5d_avg', 'thin_symbols',
+  'partial_symbols', 'no_prev_close',
+  'symbol_day_max_computed_at', 'symbol_day_rows',
   'avg_pct_change', 'median_pct_change', 'pct_change_p10', 'pct_change_p90',
   'total_volume', 'total_trades', 'volume_vs_20d', 'symbols_over_3x_daily',
   'new_symbols', 'suspended_symbols', 'renamed_symbols', 'cb_events_total',
@@ -60,7 +64,7 @@ const COLUMNS = [
 async function loadDay(day) {
   const { rows } = await query(
     `SELECT sd.symbol, sd.chg_fils, sd.chg_1d, sd.trades, sd.total_volume,
-            sd.data_quality
+            sd.data_quality, sd.computed_at, sd.minutes_captured
        FROM symbol_day sd
       WHERE sd.trading_date = $1
         AND NOT EXISTS (
@@ -251,8 +255,14 @@ async function compute(tradingDay, runId) {
     regime: M.regimeOf(b.pct_advancing),
     computed_at: new Date(),
   };
-  // breadth() returns no_prev_close for reporting; market_day has no column.
-  delete row.no_prev_close;
+  /*
+   * 049 · no_prev_close is STORED now. breadth() has always computed it and
+   * this line used to `delete` it because the table had no column — a refusal
+   * computed and then thrown away before the write is not a refusal. It is the
+   * reason 15 September computed 73 up / 49 down against the broker's 60/64:
+   * the 14 September capture stopped at 11:59, so a quarter of the board had
+   * no previous close and the direction of those symbols was never measured.
+   */
 
   // The broker's six stand. pct_advancing and regime are RECOMPUTED from them,
   // not from ours — the regime must follow the authoritative count.
@@ -275,6 +285,65 @@ async function compute(tradingDay, runId) {
     row.regime = M.regimeOf(row.pct_advancing);
   }
 
+  /*
+   * ─── THE FINGERPRINT (049) ───────────────────────────────────────────────
+   *
+   * Every derived column above came from the symbol_day rows loaded at the top
+   * of this function. Sixteen of forty-eight stored days hold a thin_symbols
+   * that disagrees with the symbol_day it claims to count, and nothing
+   * detected it in a month.
+   *
+   * A computed_at comparison would NOT have caught it: market_day and
+   * symbol_day both carried 31 August for those days, written by the same
+   * backfill, and the ordering inside that backfill is invisible in the data.
+   * So the row records WHAT IT READ — the newest input timestamp and the row
+   * count — and the check recomputes both and compares exactly. Two values,
+   * not a race.
+   */
+  const fingerprint = rows.reduce((acc, r) => ({
+    max: (r.computed_at && (!acc.max || r.computed_at > acc.max)) ? r.computed_at : acc.max,
+    n: acc.n + 1,
+  }), { max: null, n: 0 });
+  row.symbol_day_max_computed_at = fingerprint.max;
+  row.symbol_day_rows = fingerprint.n;
+
+  /*
+   * ─── AND THE MISSING-PARTIAL ALARM ───────────────────────────────────────
+   *
+   * partial_symbols reading 0 is only useful if somebody looks at the column.
+   * A day whose capture was materially short and which produced NO partial
+   * label at all is the signature of rule 1's collapsed denominator — 20
+   * September, 188 minutes, every symbol FULL — so it announces itself rather
+   * than waiting to be noticed.
+   */
+  const shortest = rows.reduce((m, r) => (
+    Number.isFinite(Number(r.minutes_captured))
+      ? Math.min(m, Number(r.minutes_captured)) : m), Infinity);
+  // The CONTINUOUS SESSION, matching symbol_day's denominator (049). This read
+  // the capture door, so the same short day was measured against 280 minutes
+  // here and 240 there — two answers to one question.
+  const sched = config.market.sessionEndMinutes - config.market.sessionStartMinutes;
+  if (row.partial_symbols === 0 && Number.isFinite(shortest)
+      && shortest < THRESHOLDS.sd_full_min_fraction * sched) {
+    const msg = `${day}: capture ran ${shortest} minutes of a scheduled ${sched} `
+      + `(${Math.round((100 * shortest) / sched)}%) and NOT ONE symbol is labelled PARTIAL. `
+      + 'That is the signature of a denominator that collapsed with the data it '
+      + 'measures — 20 September stored coverage_pct = 100 on 188 minutes. Either '
+      + 'these rows predate rule 2 (migration 049) and are preserved on purpose, or '
+      + 'the scheduled window for this day is wrong and needs a '
+      + 'public.market_session_hours row.';
+    log.error('market_day: a short day with no PARTIAL label', { day, shortest, scheduled: sched });
+    await query(
+      `INSERT INTO data_alarm (trading_date, table_name, alarm, detail)
+       VALUES ($1, 'symbol_day', 'CAPTURE_QUALITY_UNLABELLED', $2)
+       ON CONFLICT DO NOTHING`,
+      [day, JSON.stringify({ shortestMinutes: shortest, scheduledMinutes: sched,
+        pctOfScheduled: Math.round((100 * shortest) / sched), what: msg })]).catch((e) => {
+      // The alarm is best-effort; losing it must not lose the market_day row.
+      log.warn('market_day: could not write the data_alarm row', { day, error: e.message });
+    });
+  }
+
   const values = COLUMNS.map((c) => (row[c] === undefined ? null : row[c]));
   await query(
     `INSERT INTO market_day (${COLUMNS.join(', ')})
@@ -282,6 +351,18 @@ async function compute(tradingDay, runId) {
      ON CONFLICT (trading_date) DO UPDATE SET
        ${COLUMNS.filter((c) => c !== 'trading_date').map((c) => `${c} = EXCLUDED.${c}`).join(', ')}`,
     values);
+
+  /*
+   * The last thing the nightly chain does: ask whether any column the CAPTURE
+   * fills stopped being filled today. It runs here because market_day is the
+   * job that means "the day is finished", and because it already owns a
+   * data_alarm path. It never throws — a collapse detector that can break the
+   * compute would be a worse defect than the one it looks for.
+   */
+  await require('./columnCoverage').check(day).catch((e) => {
+    log.warn('column coverage check failed — the market_day row is unaffected',
+      { day, error: e.message });
+  });
 
   log.info('market_day: written', {
     day,

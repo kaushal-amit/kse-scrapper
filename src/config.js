@@ -96,6 +96,67 @@ function buildConfig() {
    * Defaults to END_TIME when that is earlier, so a narrowed capture window
    * cannot leave the signal window hanging past it.
    */
+  /*
+   * ─── THE CAPTURE WINDOW IS NOT THE SESSION WINDOW ────────────────────────
+   *
+   * START_TIME/END_TIME drive the SCHEDULER, and the after-close jobs are
+   * derived from END_TIME at +1, +5 and +12 minutes. Moving END_TIME to 13:20
+   * to stop capture would move daily.instruments, daily.symbolday and
+   * daily.marketday with it — the exact trap src/scheduler.js's own header
+   * warns about, and the reason those two jobs did not run on 24 September.
+   *
+   * So the window the INGEST enforces is its own pair:
+   *
+   *   08:40  nothing earlier. A pre-open capture with no session label carries
+   *          the PREVIOUS session's cumulative totals — 20 September stored
+   *          1,022 such rows and 79 of 140 symbols still read 17 September's
+   *          trades and volume.
+   *   13:20  nothing at or after. Close-Of-Day starts 13:15, so the final
+   *          print is in; on 24 September the client was still saving at
+   *          16:22, 17,640 price rows and 16,086 depth rows past the close.
+   */
+  const captureStart = parseTime('CAPTURE_START_TIME', '08:40');
+  const captureEnd = parseTime('CAPTURE_END_TIME', '13:20');
+  /*
+   * ─── THE CONTINUOUS SESSION, WHICH IS NOT THE CAPTURE WINDOW (049) ────────
+   *
+   * Continuous trading runs 09:00-13:00: 240 minutes. The capture door is
+   * 08:40-13:20: 280. They are different questions — what may reach the table
+   * versus what counts as capture length — and symbol_day.coverage_pct is the
+   * second one, because the analyses that consume it consume the continuous
+   * session. Pre-open capture is useful and its absence is not a data-quality
+   * failure for anything downstream.
+   *
+   * Conflating them put 13 September at 108% coverage: 259 captured minutes
+   * counted from 08:40, divided by a 240-minute session.
+   */
+  const sessionStart = parseTime('SESSION_START_TIME', '09:00');
+  const sessionEnd = parseTime('SESSION_END_TIME', '13:00');
+  /*
+   * ─── 051 · THE CLOSE-OF-DAY BACKSTOP ─────────────────────────────────────
+   *
+   * The ingest door shuts at 13:20 for the board and opens for the FIRST
+   * Close-Of-Day row per symbol, because the closing print is not reliably in
+   * by then. Measured: 13:15 on 23 September (the one day captured
+   * continuously through the transition), 13:25 on 13 August, 14:43 on 24
+   * September — the last two on the far side of a 15- and a 92-minute gap in
+   * our own capture, so they are LOOKING times, not publication times.
+   *
+   * "Whenever it arrives" is unbounded and a stuck page would deliver a stale
+   * board at 22:00, so it is bounded. The number is set from the one OBSERVED
+   * publication time, 13:15, and NOT from 14:43 — picking a threshold from an
+   * artefact is picking another 13:20 with worse evidence.
+   *
+   * It is deliberately loose because the two errors do not cost the same: a
+   * genuine late publication refused leaves a day with no close at all, while
+   * a stale board accepted arrives marked cod_late and alarmed.
+   */
+  const codBackstop = parseTime('COD_BACKSTOP_TIME', '15:00');
+  if (captureStart.minutes >= captureEnd.minutes) {
+    throw new Error(`CAPTURE_START_TIME (${captureStart.text}) must be before `
+      + `CAPTURE_END_TIME (${captureEnd.text}) — an empty capture window stores nothing at all`);
+  }
+
   const signalsEnd = parseTime('SIGNALS_END_TIME', '13:00');
   if (signalsEnd.minutes > end.minutes) {
     throw new Error(
@@ -174,6 +235,20 @@ function buildConfig() {
     endTime: end.text,
     startMinutes: start.minutes,
     endMinutes: end.minutes,
+    // The INGEST's window (08:40-13:20), separate from the scheduler's above.
+    captureStartTime: captureStart.text,
+    captureEndTime: captureEnd.text,
+    captureStartMinutes: captureStart.minutes,
+    captureEndMinutes: captureEnd.minutes,
+    // CONTINUOUS TRADING (09:00-13:00) — the denominator for capture quality.
+    // Not the ingest door above; see the block beside parseTime.
+    sessionStartTime: sessionStart.text,
+    sessionEndTime: sessionEnd.text,
+    sessionStartMinutes: sessionStart.minutes,
+    sessionEndMinutes: sessionEnd.minutes,
+    // 051 · the latest a closing print may cross the shut door.
+    codBackstopTime: codBackstop.text,
+    codBackstopMinutes: codBackstop.minutes,
     signalsEndTime: signalsEnd.text,
     signalsEndMinutes: signalsEnd.minutes,
     tradingDays,
@@ -195,7 +270,7 @@ function buildConfig() {
       // nothing says so — the boot log simply shows one fewer job than
       // expected. That has now happened twice.
       'signals.fast', 'signals.wakeup', 'signals.score',
-      'daily.instruments', 'daily.symbolday', 'daily.marketday',
+      'daily.instruments', 'daily.symbolday', 'daily.minutesample', 'daily.marketday',
     ]),
   },
 

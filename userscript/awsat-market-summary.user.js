@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AWSAT / DirectFN — Market Summary Capture
 // @namespace    local.trading.tools
-// @version      1.5.2
+// @version      1.6.0
 // @description  Reads the top-panel market summary (Index, Volume, Turnover, Trades, YTD %, Symbols Traded, UPs, Down, Unchanged) once a minute and submits it to Server 1.
 // @match        *://*.awsatbroker.com/*
 // @match        *://awsatbroker.com/*
@@ -27,7 +27,7 @@
   // ── CONFIG ────────────────────────────────────────────────────────────────
   // The running build, shown on the panel: two scripts both reporting
   // 2.0.0 cost a session diagnosing a bug that was already fixed.
-  var VERSION = '1.5.2';
+  var VERSION = '1.6.0';
 
   var SERVER          = 'https://scrapper.99labs.space';
   var TOKEN           = 'CHANGE-ME';               // must equal INGEST_TOKEN
@@ -291,7 +291,41 @@
     }).catch(function () {});
   }
 
+
+  /*
+   * ─── THE CAPTURE WINDOW · 08:40 to 13:20 KUWAIT ──────────────────────────
+   *
+   * No capture script used to stop when the market shut. On 24 September this
+   * one was still saving at 16:22 — the same shut board, every cycle, for
+   * three hours. The other end is worse: a pre-open capture carries NO session
+   * label and the PREVIOUS session's cumulative totals, which is how 20
+   * September stored 17 September's trades and volume for 79 of 140 symbols.
+   *
+   * The SERVER is the authority — it refuses an out-of-window batch by
+   * capturedAt and says why — so a stale copy of this script cannot put bad
+   * rows in the table. This guard is the other half: it stops the browser
+   * burning a cycle, a network round trip and a queue slot on a batch that is
+   * going to be refused.
+   */
+  var CAP_OPEN_MIN = 8 * 60 + 40;     // 08:40 Kuwait
+  var CAP_CLOSE_MIN = 13 * 60 + 20;   // 13:20 Kuwait — Close-Of-Day starts 13:15
+  function inCaptureWindow() {
+    var k = new Date(Date.now() + 3 * 3600 * 1000);   // Kuwait is UTC+3, no DST
+    var dow = k.getUTCDay();
+    if (dow === 5 || dow === 6) return false;         // Friday, Saturday: shut
+    var m = k.getUTCHours() * 60 + k.getUTCMinutes();
+    return m >= CAP_OPEN_MIN && m < CAP_CLOSE_MIN;
+  }
+  function windowNote() {
+    var k = new Date(Date.now() + 3 * 3600 * 1000);
+    var m = k.getUTCHours() * 60 + k.getUTCMinutes();
+    var dow = k.getUTCDay();
+    if (dow === 5 || dow === 6) return 'market shut (weekend) — not capturing';
+    return (m < CAP_OPEN_MIN ? 'before 08:40' : 'after 13:20') + ' Kuwait — not capturing';
+  }
+
   function cycle() {
+    if (!inCaptureWindow()) { stats.lastResult = windowNote(); heartbeat(0, windowNote()); refresh(); return; }
     flushQueue();
     var r = scrape();
     if (!r.labelsMatched.length) { stats.lastResult = 'panel not found'; heartbeat(0, 'panel not found'); refresh(); return; }

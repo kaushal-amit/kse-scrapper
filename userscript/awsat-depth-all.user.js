@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         awsat / DirectFN — Depth for ALL symbols
 // @namespace    local.trading.tools
-// @version      2.4.2
+// @version      2.5.0
 // @description  Level-1 depth for every symbol from the price socket each cycle (no switching, meets the 1-1.5 min ceiling), plus a round-robin full-ladder sweep of the open symbol. Posts to Server 1.
 // @match        *://*.awsatbroker.com/*
 // @match        *://awsatbroker.com/*
@@ -48,7 +48,7 @@
   // ── CONFIG ────────────────────────────────────────────────────────────────
   // The running build, shown on the panel: two scripts both reporting
   // 2.0.0 cost a session diagnosing a bug that was already fixed.
-  var VERSION = '2.4.2';
+  var VERSION = '2.5.0';
 
   var SERVER          = 'https://socket.99labs.space';
   var TOKEN           = 'trading';
@@ -986,7 +986,36 @@
     }).catch(function () {});
   }
 
+
+  /*
+   * ─── THE CAPTURE WINDOW · 08:40 to 13:20 KUWAIT ──────────────────────────
+   *
+   * On 24 September this script was still saving at 16:22 — 16,086 depth rows
+   * after the close, every one the same shut ladder. The SERVER refuses an
+   * out-of-window batch by capturedAt and says why, so a stale copy of this
+   * script cannot put bad rows in the table; this guard stops the browser
+   * sweeping eight ladders every 25 seconds for three hours after the market
+   * has shut.
+   */
+  var CAP_OPEN_MIN = 8 * 60 + 40;     // 08:40 Kuwait
+  var CAP_CLOSE_MIN = 13 * 60 + 20;   // 13:20 Kuwait — Close-Of-Day starts 13:15
+  function inCaptureWindow() {
+    var k = new Date(Date.now() + 3 * 3600 * 1000);   // Kuwait is UTC+3, no DST
+    var dow = k.getUTCDay();
+    if (dow === 5 || dow === 6) return false;
+    var m = k.getUTCHours() * 60 + k.getUTCMinutes();
+    return m >= CAP_OPEN_MIN && m < CAP_CLOSE_MIN;
+  }
+  function windowNote() {
+    var k = new Date(Date.now() + 3 * 3600 * 1000);
+    var m = k.getUTCHours() * 60 + k.getUTCMinutes();
+    var dow = k.getUTCDay();
+    if (dow === 5 || dow === 6) return 'market shut (weekend) — not capturing';
+    return (m < CAP_OPEN_MIN ? 'before 08:40' : 'after 13:20') + ' Kuwait — not capturing';
+  }
+
   function ladderSweep() {
+    if (!inCaptureWindow()) { stats.msg = windowNote(); return; }
     if (sweeping) { stats.msg = 'previous sweep still running'; return; }
     sweeping = true;
     var started = Date.now();

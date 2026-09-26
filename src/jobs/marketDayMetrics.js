@@ -97,6 +97,19 @@ function breadth(rows) {
     pct_advancing_ratio: (enough && directional)
       ? Number(((100 * advancing) / directional).toFixed(4)) : null,
     thin_symbols: rows.filter((r) => r.data_quality === 'THIN').length,
+    /*
+     * 049 · PARTIAL has its own column. It is not folded into thin_symbols:
+     * a short SESSION and a symbol that fell behind its own MARKET are
+     * different failures, and collapsing them to make one column look
+     * populated is how the distinction was lost. 3,365 PARTIAL symbol-days
+     * across 26 days were invisible to thin_symbols, which counts only 'THIN'.
+     *
+     * This reads 0 on every recent day until rule 2 writes. That is correct
+     * and obviously wrong, rather than quietly plausible — and the compute
+     * raises a data_alarm when it is 0 on a day whose capture was short, so it
+     * announces itself instead of waiting to be noticed.
+     */
+    partial_symbols: rows.filter((r) => r.data_quality === 'PARTIAL').length,
   };
 }
 

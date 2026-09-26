@@ -16,7 +16,10 @@ const jobs=require('../../src/jobs');
 // tradingview.history is deliberately NOT a worker job any more: it aggregates
 // minute rows already in the database, so there is no browser to keep off the
 // main thread. Only the jobs that drive a browser need a worker.
-const BROWSERLESS = new Set(['tradingview.history', 'daily.analysis', 'signals.fast', 'signals.wakeup', 'signals.score', 'daily.symbolday', 'daily.marketday', 'daily.instruments']);
+// daily.minutesample joins public.quotes_clean to the depth captures — both
+// already in the database — so like the others here it drives no browser and
+// has nothing to keep off the main thread.
+const BROWSERLESS = new Set(['tradingview.history', 'daily.analysis', 'signals.fast', 'signals.wakeup', 'signals.score', 'daily.symbolday', 'daily.minutesample', 'daily.marketday', 'daily.instruments']);
 for(const name of jobs.jobNames){
   if (BROWSERLESS.has(name)) {
     ck(`${name} runs in-process (no browser)`, !wh.SOURCE_OF[name], wh.SOURCE_OF[name]);

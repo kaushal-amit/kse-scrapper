@@ -10,17 +10,32 @@
  * The L1 columns, for every symbol captured that day — price, volume,
  * movement, tape quality, flow, sessions, quality.
  *
- * The BOOK group stays NULL: bid_p10..p90, offer percentiles, spread_fils_*,
- * refill_ratio, wall_*, bid_age_p50_secs. Depth covers 19 symbols of 142, so
- * computing them would produce a row that is complete for 19 and misleading
- * for 123.
+ * ─── AND MOST OF WHAT THIS PARAGRAPH USED TO DESCRIBE IS GONE (053) ───────
  *
- * The BUDGET columns stay NULL by design: net_per_fil and shares_at_budget are
- * properties of an account, not of a stock. They change when the balance
- * changes and would need recomputing across every historical row. The
- * invariants belong in config and the economics at query time.
+ * It used to say the BOOK group (bid_p10..p90, the offer and spread
+ * percentiles, refill_ratio, wall_*, bid_age_p50_secs) and the BUDGET group
+ * (net_per_fil, shares_at_budget, budget_for_queue_kd, max_budget_kd) "stay
+ * NULL by design" — depth covers 8 to 18 symbols of 142, so filling the book
+ * columns would give a row complete for those and misleading for the rest;
+ * and the budget figures are properties of an ACCOUNT rather than of a stock,
+ * changing whenever the balance does.
  *
- * `family` is CRAWLER or NULL — every other class needs bid_p50.
+ * Both reasons were and are correct, and they explain why those columns were
+ * never FILLED. They never explained why they should EXIST. A column nothing
+ * writes and nothing reads still looks like a measurement, still passes every
+ * IS NOT NULL test nobody wrote, and is still read by a study as though it
+ * meant something — so 053 dropped forty-five of them.
+ *
+ * WHAT SURVIVES UNWRITTEN, AND WHY: eleven columns that spread.symbol_day —
+ * the board's view — selects. Five directly (markup, resumed, lift, hit,
+ * block_ratio) and six as the FIRST branch of a COALESCE over
+ * spread.symbol_day_stats (pct_postable, pct_exitable, exitable_best_hour,
+ * bid_p25, bid_p50, vol_ratio_5d). Those six are not dead: they are the
+ * PREFERRED source, NULL on purpose so the backend's recompute is used, and
+ * filling them here would silently take over from it.
+ *
+ * `family` is CRAWLER or NULL — every other class needs bid_p50, which is one
+ * of the eleven and is therefore still here.
  */
 
 const { query } = require('../db/pool');
@@ -28,6 +43,7 @@ const clock = require('../market/clock');
 const log = require('../logger');
 const M = require('./symbolDayMetrics');
 const T = require('../config/thresholds');
+const { config } = require('../config');
 
 /**
  * CLOSE_TIERS as an ordered array, for the SQL.
@@ -51,7 +67,8 @@ const COLUMNS = [
   'trades_under_100',
   'bought_at_offer', 'sold_at_bid', 'shares_inside_spread',
   'trades_at_offer', 'trades_at_bid', 'pct_at_offer', 'buy_sell_ratio',
-  'minutes_captured', 'coverage_pct', 'data_quality', 'source', 'close_source',
+  'minutes_captured', 'coverage_pct', 'data_quality', 'quality_rule_version',
+  'source', 'close_source',
   'range_source',
   // The shape of the session's trading, not its totals. Logged, never gated.
   'avg_uptick_shares', 'avg_downtick_shares', 'uptick_ratio',
@@ -114,12 +131,185 @@ async function assertOneMarketPerSymbol(day) {
   }
 }
 
-/** The median minute count across the market, for that day. */
-function marketMedianMinutes(bySymbol) {
-  const counts = [...bySymbol.values()].map((rows) => M.minutesCaptured(rows)).sort((a, b) => a - b);
+/*
+ * ============================================================================
+ *  THE REFUSAL · a recompute does not overwrite a label it cannot produce
+ * ============================================================================
+ * 3,496 rows across 27 days carry data_quality = 'PARTIAL'. No commit on any
+ * branch can produce that value — dataQuality() returned FULL or THIN on
+ * release/2026-09, on amit, and on both deployed commits (b29248f, 4588d10).
+ * They are real measurements by a rule that is lost.
+ *
+ * compute() takes a day, so any past day can be recomputed, and the after-close
+ * catch-up added for item #8 exists precisely to reach back to days that were
+ * missed — 14 September, which still holds 120 PARTIAL rows, is one of them.
+ * Without this, the first catch-up run silently converts those labels to rule
+ * 2's and the count of what was lost is unrecoverable.
+ *
+ * So a row already labelled by rule 1 keeps its label, its coverage and its
+ * NULL version. Everything else on the row — prices, volumes, breadth inputs —
+ * updates normally: this refuses the three columns whose meaning would change,
+ * not the recompute.
+ *
+ * It is deliberately not a date cutoff. A date is a guess about which rows are
+ * old; quality_rule_version is the row saying which rule wrote it.
+ */
+const PRESERVED_FROM_RULE_1 = new Set(['data_quality', 'coverage_pct', 'quality_rule_version']);
+const RULE_1_ROW = 'symbol_day.quality_rule_version IS NULL AND symbol_day.data_quality IS NOT NULL';
+
+/** The median minute count across the market, for that day. Same window as the
+ *  per-symbol count, or the two are not comparable. */
+function marketMedianMinutes(bySymbol, bounds = null) {
+  const counts = [...bySymbol.values()].map((rows) => M.minutesCaptured(rows, bounds)).sort((a, b) => a - b);
   if (!counts.length) return 0;
   const mid = Math.floor(counts.length / 2);
   return counts.length % 2 ? counts[mid] : Math.round((counts[mid - 1] + counts[mid]) / 2);
+}
+
+/**
+ * ============================================================================
+ *  THE SCHEDULED CAPTURE WINDOW — the denominator that cannot collapse
+ * ============================================================================
+ * public.market_session_hours holds a row only for days that DIFFER from the
+ * standard window: a half-day, an early close, a late open. Everything else
+ * uses CAPTURE_START_TIME..CAPTURE_END_TIME from config.
+ *
+ * `assumed` is returned and logged rather than hidden. A denominator read from
+ * the calendar and one taken from a default are not the same measurement, and
+ * the whole reason this function exists is that the old denominator was
+ * derived from the data it was measuring. Replacing one invisible assumption
+ * with another would be no better.
+ *
+ * A missing table is not an error here: 049 may not have run yet on a host
+ * that is otherwise fine, and a capture service must not refuse to capture
+ * over it. It falls back to the standard window and says so.
+ */
+/*
+ * ─── THE DENOMINATOR IS THE CONTINUOUS SESSION, NOT THE CAPTURE DOOR ───────
+ *
+ * This read capture_open..capture_close — the INGEST window, 08:40-13:20, 280
+ * minutes. The measure exists to tell an analysis whether a day is usable, and
+ * analyses consume continuous trading: 09:00-13:00, 240 minutes. Counting from
+ * 08:40 against 240 put 13 September at 108%; counting to 13:20 would make a
+ * Close-Of-Day row ingested at 14:43 lengthen the day it closes.
+ *
+ * Both halves of the fraction now use session_open..session_close, and
+ * minutesCaptured() is given the same bounds. Pre-open capture is still
+ * ingested and still useful; its absence is simply not a data-quality failure
+ * for anything downstream.
+ */
+async function scheduledMinutesFor(day) {
+  const fallback = {
+    minutes: config.market.sessionEndMinutes - config.market.sessionStartMinutes,
+    startMinutes: config.market.sessionStartMinutes,
+    endMinutes: config.market.sessionEndMinutes,
+    assumed: true,
+    reason: 'no market_session_hours row — the standard '
+          + `${config.market.sessionStartTime}-${config.market.sessionEndTime} session`,
+  };
+  try {
+    const { rows } = await query(
+      `SELECT (EXTRACT(hour FROM session_open)  * 60 + EXTRACT(minute FROM session_open))  AS open_mins,
+              (EXTRACT(hour FROM session_close) * 60 + EXTRACT(minute FROM session_close)) AS close_mins,
+              reason
+         FROM public.market_session_hours WHERE trading_date = $1`, [day]);
+    if (!rows.length) return fallback;
+    const startMinutes = Number(rows[0].open_mins);
+    const endMinutes = Number(rows[0].close_mins);
+    return { minutes: endMinutes - startMinutes, startMinutes, endMinutes, assumed: false,
+      reason: rows[0].reason || 'a market_session_hours row' };
+  } catch (e) {
+    if (e.code === '42P01' || e.code === '42703') {
+      // 42703 = the table exists from an earlier 049 without session_open.
+      return { ...fallback,
+        reason: `${fallback.reason} (market_session_hours missing or has no session_open — run migration 049)` };
+    }
+    throw e;
+  }
+}
+
+/**
+ * The short-session trigger (049).
+ *
+ * All 47 sessions measured on 25 September were normal-length, so the
+ * 60-minute absolute floor is REASONED AND UNMEASURED: on a normal day
+ * 0.50 x 240 = 120 minutes clears it twice over and it can never fire, and on
+ * a genuinely short scheduled session the proportional test alone would pass a
+ * day with 45 minutes of data. The first short session is therefore the first
+ * observation of the branch, and it must not slip past unnoticed — a caveat in
+ * a document is read once; this fires on its own.
+ */
+const SHORT_SESSION_MINUTES = 240;
+
+/**
+ * ============================================================================
+ *  THE EMPTY BANDS — an alarm, not a comment (049)
+ * ============================================================================
+ * 0.94 and 0.50 sit in bands that are EMPTY across 6,557 symbol-days: nothing
+ * measured between 93% and 95%, nothing between 50% and 52.5%. That is not
+ * luck, it is the failure mode — one client serves every symbol, so a capture
+ * dies at a moment and the whole market loses the same tail, which makes days
+ * cluster and leaves real space between the clusters.
+ *
+ * A DIFFERENT FAILURE MODE WOULD FILL THEM IN. A slow degradation — a feed
+ * getting gradually later rather than stopping — puts symbol-days inside the
+ * band, and the first one is worth knowing about on the day it happens rather
+ * than at the next audit. It does NOT mean the threshold is wrong; it means
+ * the assumption the threshold was chosen under no longer holds.
+ *
+ * So: a cheap data_alarm row. The loud form of a robustness choice — a margin
+ * that is only ever described in a comment is a margin nobody checks.
+ */
+async function alarmOnBandOccupancy(day, built, scheduledMinutes) {
+  if (!(scheduledMinutes > 0) || !built.length) return;
+  const bands = [
+    { name: 'FULL', lo: Number(T.get('sd_full_band_lo')), hi: Number(T.get('sd_full_min_fraction')) },
+    { name: 'PARTIAL', lo: Number(T.get('sd_partial_min_fraction')), hi: Number(T.get('sd_partial_band_hi')) },
+  ];
+  for (const b of bands) {
+    if (!(b.hi > b.lo)) continue;
+    const hits = built
+      .map((r) => ({ symbol: r.symbol, frac: Number(r.minutes_captured) / scheduledMinutes }))
+      // Half-open (lo, hi]. A value exactly on a boundary belongs to one side,
+      // and which side is the whole point of the band.
+      .filter((x) => Number.isFinite(x.frac) && x.frac > b.lo && x.frac <= b.hi);
+    if (!hits.length) continue;
+
+    const msg = `${day}: ${hits.length} symbol-day(s) landed INSIDE the empty `
+      + `${b.name} band (${b.lo}, ${b.hi}]. Measured over 47 sessions to 25 September that `
+      + 'band held nothing at all, because capture failed in quantised steps — the whole '
+      + 'market losing the same tail at the same moment. A value in here means the FAILURE '
+      + 'MODE HAS CHANGED (a slow degradation rather than a clean cut), not that the '
+      + 'threshold is wrong. Re-measure the distribution before moving any boundary.';
+    log.warn('symbol_day: an empty quality band is no longer empty',
+      { day, band: b.name, lo: b.lo, hi: b.hi, count: hits.length,
+        sample: hits.slice(0, 5).map((h) => `${h.symbol} ${(100 * h.frac).toFixed(1)}%`) });
+    await query(
+      `INSERT INTO data_alarm (trading_date, table_name, column_name, alarm, detail)
+       VALUES ($1, 'symbol_day', 'data_quality', 'QUALITY_BAND_OCCUPIED', $2)
+       ON CONFLICT DO NOTHING`,
+      [day, JSON.stringify({ band: b.name, lo: b.lo, hi: b.hi, scheduledMinutes,
+        count: hits.length, symbols: hits.slice(0, 20), what: msg })]).catch((e) => {
+      // Best-effort, exactly like the market_day alarm: losing the alarm must
+      // not lose the rows.
+      log.warn('symbol_day: could not write the band data_alarm row', { day, error: e.message });
+    });
+  }
+}
+
+function noteShortSession(day, sched) {
+  if (sched.assumed || !(sched.minutes > 0) || sched.minutes >= SHORT_SESSION_MINUTES) return false;
+  log.warn('shortSessionFirstObservation', {
+    day,
+    sessionMinutes: sched.minutes,
+    reason: sched.reason,
+    floorMinutes: T.get('sd_thin_absolute_minutes'),
+    partialFloorMinutes: Math.round(T.get('sd_partial_min_fraction') * sched.minutes),
+    note: 'FIRST SHORT SCHEDULED SESSION — the absolute floor has never been '
+        + 'observed doing anything. Check its behaviour deliberately and report: '
+        + 'below 120 scheduled minutes the proportional test stops protecting it.',
+  });
+  return true;
 }
 
 /**
@@ -429,12 +619,13 @@ async function closesFiveSessionsBack(day) {
   return out;
 }
 
-function buildRow(symbol, day, rows, marketMedian) {
+function buildRow(symbol, day, rows, marketMedian, scheduledMinutes = null, bounds = null) {
   const price = M.priceBlock(rows);
   const close = M.closePrice(rows);
   const volume = M.volumeBlock(rows);
   const movement = M.movementBlock(rows);
-  const minutes = M.minutesCaptured(rows);
+  // Same window as the denominator — see minutesCaptured()'s docblock.
+  const minutes = M.minutesCaptured(rows, bounds);
   const closeOfDay = M.hasCloseOfDay(rows);
 
   return {
@@ -471,9 +662,18 @@ function buildRow(symbol, day, rows, marketMedian) {
     pct_at_offer: movement.pct_at_offer,
     buy_sell_ratio: M.buySellRatio(movement),
     minutes_captured: minutes,
-    coverage_pct: marketMedian
-      ? Number(((100 * minutes) / marketMedian).toFixed(2)) : null,
-    data_quality: M.dataQuality(minutes, marketMedian, closeOfDay),
+    /*
+     * Against the SCHEDULED window (049), not the day's own median. The median
+     * collapsed with the thing it measured: 20 September captured 188 minutes
+     * and stored coverage_pct = 100.0, while 15 September captured 233 and
+     * stored 86.3. Both measures divided by the same moving denominator, so
+     * fixing data_quality alone would leave a stored 100% sitting beside a
+     * PARTIAL label, disagreeing with it.
+     */
+    coverage_pct: scheduledMinutes > 0
+      ? Number(((100 * minutes) / scheduledMinutes).toFixed(2)) : null,
+    data_quality: M.dataQuality(minutes, marketMedian, closeOfDay, scheduledMinutes),
+    quality_rule_version: M.QUALITY_RULE_VERSION,
     // Constant today. It exists so the day a TradingView-derived row appears,
     // it cannot be mistaken for a broker one — and any query using `trades`
     // must filter on it, since TradingView rows have no trade count.
@@ -525,9 +725,14 @@ async function compute(tradingDay, runId) {
     return { extracted: 0, inserted: 0, rejected: 0 };
   }
 
-  const marketMedian = marketMedianMinutes(bySymbol);
+  const sched = await scheduledMinutesFor(day);
+  const bounds = { startMinutes: sched.startMinutes, endMinutes: sched.endMinutes };
+  const marketMedian = marketMedianMinutes(bySymbol, bounds);
+  noteShortSession(day, sched);
   log.info('symbol_day: computing', {
     day, symbols: bySymbol.size, marketMedianMinutes: marketMedian,
+    scheduledMinutes: sched.minutes, scheduleSource: sched.reason,
+    denominatorAssumed: sched.assumed,
   });
 
   // Two queries for the whole day, not two per symbol.
@@ -537,7 +742,7 @@ async function compute(tradingDay, runId) {
   const built = [];
   let crossed = 0;
   for (const [symbol, rows] of bySymbol) {
-    const row = buildRow(symbol, day, rows, marketMedian);
+    const row = buildRow(symbol, day, rows, marketMedian, sched.minutes, bounds);
 
     const prev = prevCloses.get(symbol)
       || { prev_close: null, prev_session_used: null, prev_session_gap_days: null };
@@ -561,6 +766,11 @@ async function compute(tradingDay, runId) {
       note: 'two tick regimes in one session — per-fil economics are wrong for part of it',
     });
   }
+
+  // 049 · the empty bands either side of the two boundaries. Runs on the rows
+  // as measured, before the labels are written, because the question is about
+  // the DISTRIBUTION rather than about any one verdict.
+  await alarmOnBandOccupancy(day, built, sched.minutes);
 
   /*
    * F-14 · the streaks are computed AFTER the rows are built, from the sessions
@@ -594,7 +804,9 @@ async function compute(tradingDay, runId) {
       `INSERT INTO symbol_day (${COLUMNS.join(', ')}) VALUES ${tuples.join(', ')}
        ON CONFLICT (symbol, trading_date) DO UPDATE SET
          ${COLUMNS.filter((c) => c !== 'symbol' && c !== 'trading_date')
-    .map((c) => `${c} = EXCLUDED.${c}`).join(', ')}`,
+    .map((c) => (PRESERVED_FROM_RULE_1.has(c)
+      ? `${c} = CASE WHEN ${RULE_1_ROW} THEN symbol_day.${c} ELSE EXCLUDED.${c} END`
+      : `${c} = EXCLUDED.${c}`)).join(', ')}`,
       values);
     inserted += res.rowCount;
   }

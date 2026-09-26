@@ -38,7 +38,13 @@ let p=0,n=0;const ck=(t,c,x)=>{n++;if(c)p++;else console.log('  FAIL:',t,JSON.st
   // +5 from 035: the columns the backend computed and we did not. avg_spread_pct
   // is the one that matters — the raw fils figure ranks a 0.1-tick stock as
   // tighter than a 1-fil stock when it is wider in ticks.
-  ck('112 columns after migration 035', sd.length===112, sd.length);
+  // +1 from 049: quality_rule_version. The column exists because data_quality
+  // holds two generations of label — 3,496 rows written by a rule that is in no
+  // commit, and the rest by rule 2 — and nothing else distinguishes them.
+  // -45 from 053: declared, never written, and read by nothing. The count is
+  // asserted rather than described because this suite is the schema's snapshot
+  // — if a column comes back, or another goes, it says so here first.
+  ck('68 columns after migration 053', sd.length===68, sd.length);
   for (const c of ['avg_spread_fils','avg_spread_pct','days_active','down_days','peak_hour']) {
     ck(c + ' present', !!name(c));
   }
@@ -67,14 +73,30 @@ let p=0,n=0;const ck=(t,c,x)=>{n++;if(c)p++;else console.log('  FAIL:',t,JSON.st
      !!name('prev_session_used') && name('prev_session_used').data_type==='date',
      name('prev_session_used'));
 
-  // Every other percentile group has five points; spread had two.
+  /*
+   * ─── THE PERCENTILE GROUPS ARE GONE, AND THE SYMMETRY WAS THE POINT ──────
+   *
+   * This asserted that spread_fils had five percentile points like bid and
+   * offer, because it once had two and the asymmetry looked like an oversight.
+   * It was fixed by ADDING three columns. Nothing then wrote any of the five,
+   * or any of the ten on bid and offer beyond p25/p50 — depth covers 8 to 18
+   * symbols of 142, so the percentiles were never computable for the market
+   * they claimed to describe.
+   *
+   * 053 dropped thirteen of the fifteen. bid_p25 and bid_p50 survive only
+   * because spread.symbol_day COALESCEs them over spread.symbol_day_stats.
+   *
+   * The lesson is worth more than the symmetry: a group of columns made
+   * consistent with each other is not a group of columns made true. Three were
+   * added to match five, and all five were empty.
+   */
   for (const q of ['p10','p25','p50','p75','p90']) {
-    ck('spread_fils_'+q+' present', !!name('spread_fils_'+q));
+    ck('spread_fils_' + q + ' stayed dropped', !name('spread_fils_' + q), q);
   }
-  const five=(prefix)=>['p10','p25','p50','p75','p90'].filter(q=>name(prefix+q)).length;
-  ck('spread now matches bid and offer at five points',
-     five('spread_fils_')===5 && five('bid_')===5 && five('offer_')===5,
-     {spread:five('spread_fils_'),bid:five('bid_'),offer:five('offer_')});
+  const five = (prefix) => ['p10','p25','p50','p75','p90'].filter((q) => name(prefix + q)).length;
+  ck('bid keeps exactly the two the view reads, offer keeps none',
+     five('bid_') === 2 && five('offer_') === 0 && five('spread_fils_') === 0,
+     { bid: five('bid_'), offer: five('offer_'), spread: five('spread_fils_') });
   ck('primary key columns present', !!name('symbol')&&!!name('trading_date'));
   const {rows:pk}=await db.query(`
     select string_agg(a.attname,',' order by array_position(i.indkey,a.attnum)) k
@@ -87,21 +109,56 @@ let p=0,n=0;const ck=(t,c,x)=>{n++;if(c)p++;else console.log('  FAIL:',t,JSON.st
                   'total_volume','highest_minute_volume','trades','avg_trade_size'])
     ck('survivor present: '+c, !!name(c));
 
-  // the twelve SPREAD columns the audit said were missing
+  /*
+   * The SPREAD columns the original audit said were missing — those of them
+   * that are still here.
+   *
+   * 053 dropped spread_fils_p50, net_per_fil, refill_ratio, auction_vs_last_bid
+   * and cb_events from this list. Nothing ever wrote them and nothing ever read
+   * them: the audit asked for columns, the columns were added, and that was the
+   * end of it. Adding a column is not implementing a measurement, and five of
+   * the twelve sat here for two months proving it.
+   */
   for(const c of ['pct_postable','pct_exitable','bid_p50','moves','up_moves_2plus',
-                  'tiny_pct_up','spread_fils_p50','net_per_fil','refill_ratio',
-                  'buy_sell_ratio','auction_vs_last_bid','coverage_pct','cb_events'])
+                  'tiny_pct_up','buy_sell_ratio','coverage_pct'])
     ck('SPREAD column present: '+c, !!name(c));
+
+  /*
+   * And the eleven unwritten survivors are here BECAUSE spread.symbol_day
+   * selects them — five directly, six as the first branch of a COALESCE over
+   * spread.symbol_day_stats. If one of these disappears the board's view stops
+   * working, so the suite holds them explicitly rather than by a count.
+   */
+  for(const c of ['markup','resumed','lift','hit','block_ratio','pct_postable',
+                  'pct_exitable','exitable_best_hour','bid_p25','bid_p50','vol_ratio_5d'])
+    ck('the board\'s view still has its column: '+c, !!name(c), c);
+
+  /*
+   * 053's own drops must stay dropped. A column re-added by a later migration
+   * "because something wanted it" is how the first 45 arrived.
+   */
+  for(const c of ['spread_fils_p50','net_per_fil','refill_ratio','auction_vs_last_bid',
+                  'cb_events','wall_events','best_hour','ratio_by_hour','tal_price',
+                  'series_break','shares_at_budget','last_qty_p50'])
+    ck('dropped by 053 and still gone: '+c, !name(c), c);
 
   // the retired columns must NOT be back
   for(const c of ['fib_signals','fib_win_pct','bull_swings','total_swings',
                   'est_buyer_vol','buyer_pct','best_earning_time'])
     ck('retired column absent: '+c, !name(c), c);
 
-  ck('jsonb used for the by-hour maps',
-     name('ratio_by_hour').data_type==='jsonb'&&name('wall_prices').data_type==='jsonb');
-  ck('series_break is boolean', name('series_break').data_type==='boolean');
-  ck('best_hour is smallint', name('best_hour').data_type==='smallint');
+  /*
+   * These asserted the TYPES of ratio_by_hour, wall_prices, series_break and
+   * best_hour — jsonb, jsonb, boolean, smallint. All four were dropped by 053:
+   * nothing ever wrote them and nothing ever read them.
+   *
+   * Worth keeping the shape of what was here. A jsonb column correctly typed
+   * and permanently empty passes a type check forever, and a suite that only
+   * asks "is the type right" will never notice. The check that would have
+   * caught these is column-has-a-writer, which did.
+   */
+  for (const c of ['ratio_by_hour','wall_prices','series_break','best_hour'])
+    ck('typed-but-never-written column gone: '+c, !name(c), c);
 
   const {rows:idx}=await db.query(
     "select count(*)::int c from pg_indexes where tablename='symbol_day'");
@@ -114,7 +171,11 @@ let p=0,n=0;const ck=(t,c,x)=>{n++;if(c)p++;else console.log('  FAIL:',t,JSON.st
   // +7 from 030: the broker's summary overwrites the computed breadth on the
   // same row rather than living in a second table, and computed_* keep ours so
   // the disagreement stays queryable.
-  ck('30 columns after migration 030', md.length===30, md.length);
+  // +4 from 049: partial_symbols (PARTIAL was invisible to thin_symbols, which
+  // counts only 'THIN'), no_prev_close (breadth computed it and the compute
+  // deleted it before the write), and the two fingerprint columns that make a
+  // market_day row refuse when the symbol_day beneath it has moved.
+  ck('34 columns after migration 049', md.length===34, md.length);
   ck('broker_seen_at present — what stops a backfill overwriting the exchange count',
      md.some(c=>c.column_name==='broker_seen_at'));
   ck('computed_* kept so "do we disagree often" is a query, not a grep',

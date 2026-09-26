@@ -33,6 +33,15 @@ const num = (envVar, fallback) => {
 
 const THRESHOLDS = {
   /** NO PROTECTION: a touch bid smaller than this has nothing beneath it. CR-37 */
+  /*
+   * How long after the close the nightly catch-up keeps trying before it
+   * gives up and raises a NIGHTLY_JOB_MISSING alarm instead. A job that has
+   * failed for four hours does not need another attempt; it needs somebody to
+   * look at it. Here rather than in the scheduler because a number that
+   * decides when a gate stops trying is a threshold like any other.
+   */
+  catchup_give_up_mins: num('CATCHUP_GIVE_UP_MINUTES', 240),
+
   sig_no_protection_bid: num('SIG_NO_PROTECTION_BID', 20_000),
 
   /** BUYERS 8:5 fires at or above this ratio AND with the price rising. CR-41 */
@@ -113,9 +122,64 @@ const THRESHOLDS = {
 
   /** symbol_day: a print at or under this many shares is a "tiny" one. */
   sd_at_offer_invalidates_pct: num('SD_AT_OFFER_MAX', 90),
+  /*
+   * ─── RULE 2 · CAPTURE QUALITY AGAINST THE SCHEDULED WINDOW (049) ────────
+   *
+   * These live HERE and not in spread.kb_threshold, deliberately, and against
+   * the project's usual "every threshold is a kb row". src/index.js:207 and
+   * this file's own header give the reason: a capture service must not refuse
+   * to capture because a KB row is missing. Making the LABEL of a capture
+   * depend on the backend's schema reintroduces exactly that coupling, in the
+   * one job that runs after the market shuts with nobody watching.
+   *
+   * Rule 1 — whatever wrote the 3,496 PARTIAL rows — divided by that day's own
+   * median, so a day where every symbol stopped together scored 100%. Rule 2
+   * divides by the SCHEDULED window (public.market_session_hours, falling back
+   * to CAPTURE_START_TIME..CAPTURE_END_TIME), which cannot collapse with the
+   * thing it measures.
+   */
+  /**
+   * FULL at or above this fraction of the SCHEDULED CONTINUOUS SESSION.
+   *
+   * 0.94 is the MAXIMUM-MARGIN SEPARATOR, not a round number. Measured 25
+   * September over 6,557 symbol-days in 47 sessions, numerator restricted to
+   * 09:00-13:00: the 93-95% band is EMPTY, and so is 50-52%. Every value in
+   * (0.929, 0.950] partitions the sample identically, so the evidence does not
+   * choose between them — the midpoint of the empty band is the choice that
+   * survives the most measurement error in either direction.
+   *
+   * 0.95 was rejected because it sits EXACTLY on two days' medians (16 Jul and
+   * 24 Sep, both 228/240 = 95.0%): one lost minute flips both to PARTIAL.
+   *
+   * The bands are empty because the data fails in quantised steps — one client
+   * serves every symbol, so a capture dies at a moment and the whole market
+   * loses the same tail. See migration 049's header. A different failure mode
+   * (slow degradation rather than a clean cut) would populate them, which is
+   * why computeSymbolDay raises a data_alarm on any value landing inside one.
+   */
+  sd_full_min_fraction: num('SD_FULL_FRACTION', 0.94),
+  /** PARTIAL down to this fraction of it; below, the session is THIN. */
+  sd_partial_min_fraction: num('SD_PARTIAL_FRACTION', 0.50),
+  /**
+   * The empty bands either side of the two boundaries above, as measured. A
+   * symbol-day landing INSIDE one does not mean the threshold is wrong — it
+   * means the failure mode changed, and that is worth knowing the day it
+   * happens rather than at the next audit. The loud form of a robustness
+   * choice. Half-open, matching the comparisons: (lo, hi].
+   */
+  sd_full_band_lo: num('SD_FULL_BAND_LO', 0.929),
+  sd_partial_band_hi: num('SD_PARTIAL_BAND_HI', 0.525),
   /** symbol_day: fewer minutes than this and the session is THIN outright. */
   sd_thin_absolute_minutes: num('SD_THIN_MINUTES', 60),
-  /** symbol_day: …or under this fraction of the market's median minutes. */
+  /**
+   * symbol_day: …or under this fraction of the market's median minutes.
+   *
+   * RULE 1's median test, kept because it still catches the case rule 2
+   * cannot: one symbol falling behind a market that is otherwise fine. It is
+   * no longer the load-bearing test — a uniform outage makes it unfireable —
+   * and the absolute floor below it is now a true last resort rather than the
+   * only backstop.
+   */
   sd_thin_median_fraction: num('SD_THIN_FRACTION', 0.80),
   /** symbol_day: above this price the 0.1-fil "crawler" pattern cannot occur. */
   sd_crawler_max_price_fils: num('SD_CRAWLER_MAX_PX', 100),
@@ -125,8 +189,17 @@ const THRESHOLDS = {
    * moment the session's hours change, which END_TIME has already done once.
    */
   sd_session_midpoint_hhmm: num('SD_SESSION_MIDPOINT_HHMM', 1115),
-  /** symbol_day: a capture at or after this makes the day's range FULL. */
-  sd_range_full_hhmm: num('SD_RANGE_FULL_HHMM', 1310),
+  /**
+   * symbol_day: a capture at or after this makes the day's range FULL.
+   *
+   * 1300, not 1310. CONTINUOUS TRADING ENDS AT 13:00, so a threshold of 1310
+   * demanded a capture from a session that no longer exists — range_source
+   * could never read FULL for any day ever captured, and nobody noticed
+   * because the column is only ever read as "is it FULL", which was always
+   * false. A gate that can never pass is the same defect as a check that can
+   * never fail.
+   */
+  sd_range_full_hhmm: num('SD_RANGE_FULL_HHMM', 1300),
   /**
    * symbol_day: how many usable sessions back previousCloses may reach for a
    * prev_close. H-K.

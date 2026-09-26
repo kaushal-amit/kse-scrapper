@@ -33,7 +33,58 @@ const srv=app.listen(8817, async()=>{
    * Today's trading day, so the capture is of the session it describes — which
    * is the case the product is built for.
    */
-  const day=clock.tradingDay();
+  /*
+   * ─── F-08 FIXED THE DAY AND LEFT THE CLOCK BEHIND ────────────────────────
+   *
+   * `clock.tradingDay()` returns TODAY in the market's timezone — it does not
+   * roll back to the last day that traded. Every post below still carried
+   * `capturedAt: new Date()`, and ingest.js asks
+   *
+   *     isSessionDay = ... && clock.isTradingDay(captured)
+   *
+   * so on a Friday or a Saturday — Boursa is shut — the capture lands on a
+   * non-trading day, session_state is STALE, and the entire broker-overwrite
+   * path fails: 9/23 standalone, 51/132 in a full run. Measured on Friday
+   * 25 September 2026, and reproduced on the clean branch with none of the
+   * 049 changes present, so it is this suite's defect and not a regression.
+   *
+   * F-08's own note says it "passed on the day it was written and has failed
+   * every day since". This is the same defect one layer down: it passes on the
+   * five days a week the market opens, and a weekend run reads as a product
+   * failure.
+   *
+   * So the suite now owns BOTH halves of the clock. The day is the most recent
+   * ACTUAL trading day, and the capture timestamp is 10:00 Kuwait on THAT day
+   * — inside the session and before the 13:30 CLOSE boundary, which is the
+   * case the product is built for. Deterministic on any calendar day.
+   */
+  const day=(()=>{
+    const d=new Date();
+    for(let i=0;i<14;i+=1){
+      if(clock.isTradingDay(d)) return clock.tradingDay(d);
+      d.setUTCDate(d.getUTCDate()-1);
+    }
+    throw new Error('market-summary fixture: no trading day in the last 14 — check the holiday calendar');
+  })();
+  // 10:00 Kuwait (UTC+3, no DST) on the fixture's own day: LIVE, not CLOSE.
+  // `bump` minutes past 10:00, so successive captures ORDER. The suite's
+  // "last capture wins" check reads the newest capture of the session, and
+  // with every post sharing one timestamp there is no newest.
+  const capturedAt=(bump=0)=>new Date(new Date(`${day}T10:00:00+03:00`).getTime()+bump*60_000).toISOString();
+  /*
+   * And the OTHER half of the clock. checkCapturedAt refuses anything older
+   * than 15 minutes — correct, because a batch stamped hours ago is a
+   * background tab or a replay — which a fixture pinned to the last trading
+   * day trips the moment that day is not today. So the suite moves `now` onto
+   * the capture instead of moving the capture towards now: the freshness rule
+   * is exercised as written, against a clock the suite states out loud.
+   *
+   * clock.now() exists for exactly this and is used nowhere else for a
+   * decision; every other reader of it is asking the same question the market
+   * asks. Restored in the finally block below so no later suite inherits it.
+   */
+  const realNow=clock.now;
+  clock.now=()=>new Date(capturedAt(10));
   const post=(b)=>fetch('http://127.0.0.1:8817/market-summary',{method:'POST',
     headers:{'Content-Type':'application/json',Authorization:'Bearer trading'},
     body:JSON.stringify(b)}).then(async r=>({status:r.status,body:await r.json()}));
@@ -77,7 +128,7 @@ const srv=app.listen(8817, async()=>{
   ck('broker_seen_at is NULL', r.broker_seen_at===null);
 
   // ── the broker speaks: 132/51/61/20 ──
-  const res=await post({batchId:'ms-1',capturedAt:new Date().toISOString(),source:'awsat_client',
+  const res=await post({batchId:'ms-1',capturedAt:capturedAt(),source:'awsat_client',
     summary:{volume:327788687,turnover:88797853,trades:25745,ytdPct:-2.06,
              symbolsTraded:132,ups:51,down:61,unchanged:20,indexClose:9302.73},fieldsFound:9});
   ck('the endpoint accepts it', res.status===200&&res.body.ok, res.body);
@@ -119,19 +170,19 @@ const srv=app.listen(8817, async()=>{
   ck('the rolling windows still recompute', r.breadth_5d_avg!==undefined);
 
   // ── idempotency ──
-  const dup=await post({batchId:'ms-1',capturedAt:new Date().toISOString(),
+  const dup=await post({batchId:'ms-1',capturedAt:capturedAt(),
     summary:{symbolsTraded:999,ups:999,down:1,unchanged:1}});
   ck('a repeated batchId is replayed, not re-applied', dup.body.duplicate===true, dup.body);
   r=await md_();
   ck('and the stored breadth is untouched', r.advancing===51, r.advancing);
 
   // ── an all-null summary is refused permanently ──
-  const bad=await post({batchId:'ms-2',capturedAt:new Date().toISOString(),
+  const bad=await post({batchId:'ms-2',capturedAt:capturedAt(),
     summary:{volume:null,ups:null,down:null,symbolsTraded:null}});
   ck('an all-null summary is a 400, so the client stops retrying', bad.status===400, bad);
 
   // ── last capture wins, one row per day ──
-  await post({batchId:'ms-3',capturedAt:new Date().toISOString(),
+  await post({batchId:'ms-3',capturedAt:capturedAt(5),
     summary:{symbolsTraded:134,ups:70,down:50,unchanged:14}});
   const {rows:cnt}=await db.query('select count(*)::int c from market_day where trading_date=$1',[day]);
   ck('still ONE row for the day', cnt[0].c===1, cnt[0]);
@@ -143,5 +194,6 @@ const srv=app.listen(8817, async()=>{
 
   await clean();
   console.log(`\nmarket summary: ${p}/${n}`);
+  clock.now=realNow;   // no later suite inherits this suite's clock
   srv.close(); await db.close(); process.exit(p===n?0:1);
 });

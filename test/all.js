@@ -68,8 +68,29 @@ function run(file) {
     };
   }
 
+  /*
+   * ─── THE CAPTURE WINDOW IS WIDENED FOR THE SUITE, ON PURPOSE ────────────
+   *
+   * The ingest refuses a batch captured outside 08:40-13:20 Kuwait. Almost
+   * every suite posts with `new Date()`, so without this the whole suite
+   * passes between 08:40 and 13:20 and fails the rest of the day — a
+   * time-of-day-dependent gate, which is the exact class of flake this
+   * repository keeps removing.
+   *
+   * Widening it here does NOT leave the window untested: capture-window
+   * .test.js asserts the real DEFAULTS (08:40 and 13:20, from config with no
+   * env set) and the behaviour at each boundary, with the clock supplied
+   * rather than read. The suites that are not about the window stop caring
+   * what time it is; the one that is, does not widen anything.
+   */
   const res = spawnSync(process.execPath, [path.join(SUITES, file)], {
-    encoding: 'utf8', timeout: 240_000, env: process.env,
+    encoding: 'utf8',
+    timeout: 240_000,
+    env: {
+      ...process.env,
+      CAPTURE_START_TIME: process.env.CAPTURE_START_TIME || '00:00',
+      CAPTURE_END_TIME: process.env.CAPTURE_END_TIME || '23:59',
+    },
   });
   const out = `${res.stdout || ''}${res.stderr || ''}`;
 

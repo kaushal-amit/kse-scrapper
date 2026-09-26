@@ -395,7 +395,43 @@ async function coverageStatus(symbolSet, source) {
   return null;
 }
 
+/**
+ * ─── THE CAPTURE JOBS DO NOT WRITE INTO A *_test DATABASE (26 Sep) ────────
+ *
+ * kse_test could not be rebuilt from kse because a live TradingView process
+ * kept writing into it — a deployment pointed at the wrong DATABASE_URL, which
+ * no amount of care at the far end prevents. Stopping it is an
+ * ENABLED_SCRAPERS change, and a config change is exactly the kind of thing
+ * that comes back after a rebuild.
+ *
+ * So the refusal lives here, where the write is. This is the scraper's side of
+ * the rule test/dbguard.js already enforces for the backend suites: a name
+ * ending in `_test` is a database somebody expects to be able to DROP, and a
+ * capture job filling it is silently making that untrue.
+ *
+ * It REFUSES rather than warning, because a warning on a job that runs every
+ * five minutes is a line nobody reads twice. And it names the database, so the
+ * reason is in the error rather than in somebody's memory of this comment.
+ *
+ * To seed a test database deliberately, run the job with
+ * ALLOW_TEST_DB_WRITES=1 — stated out loud in the environment rather than
+ * discovered by the job not complaining.
+ */
+function refuseTestDatabase(job) {
+  if (process.env.ALLOW_TEST_DB_WRITES === '1') return null;
+  const url = process.env.DATABASE_URL || '';
+  let name = '';
+  try { name = decodeURIComponent(new URL(url).pathname.replace(/^\//, '')); } catch { name = ''; }
+  if (!/_test$/i.test(name)) return null;
+  return `${job} REFUSES to write to "${name}": a database whose name ends in _test is one `
+    + 'somebody expects to be able to drop and rebuild, and a capture job filling it makes '
+    + 'that quietly untrue — this is why kse_test could not be rebuilt from kse. Point '
+    + 'DATABASE_URL at the real database, or set ALLOW_TEST_DB_WRITES=1 to seed it on purpose.';
+}
+
 async function tradingviewQuotes(runId) {
+  const refusal = refuseTestDatabase('tradingview.quotes');
+  if (refusal) { log.error(refusal); throw new Error(refusal); }
   const { quotes, symbols } = await workerHost.runScrape('tradingview.quotes', runId);
   if (!quotes.length) return { extracted: 0, inserted: 0, rejected: 0 };
   const result = await persistQuotes(quotes, symbols, quotes.length);
@@ -715,6 +751,16 @@ async function symbolDay(runId, args) {
     .compute((args && args.date) || clock.tradingDay(), runId);
 }
 
+/**
+ * symbol_minute_sample for one session. Reads public.quotes_clean and the
+ * depth captures, so it runs after the day is closed — but before market_day,
+ * which is the job that means "the day is finished".
+ */
+async function minuteSample(runId, args) {
+  return require('./jobs/computeMinuteSample')
+    .compute((args && args.date) || clock.tradingDay(), runId);
+}
+
 /** market_day for one session. Reads symbol_day, so it runs after it. */
 async function marketDay(runId, args) {
   return require('./jobs/computeMarketDay')
@@ -749,18 +795,58 @@ async function dailyAnalysis(runId, args) {
  * Deliberately not on the schedule: it is slow, it is fragile, and it should be
  * run knowingly for a named range rather than every evening.
  */
-async function tradingviewBackfill(runId) {
+/*
+ * ─── `--date` WAS ACCEPTED, PARSED, AND THROWN AWAY ────────────────────────
+ *
+ * This took `(runId)` where every other dated job in this file takes
+ * `(runId, args)`: tradingviewHistory, symbolDay, marketDay, dailyAnalysis.
+ * The runner parsed `--date`, built `args` and passed it in; the parameter
+ * list dropped it on the floor. So
+ *
+ *     tradingview.backfill --date=2026-08-09
+ *
+ * silently refetched the last 30 days instead, reported success, and left
+ * 9 August exactly as missing as before. A flag that is accepted and ignored
+ * is worse than one that is rejected, because the operator has no way to tell
+ * the difference from the outside.
+ *
+ * `--date` fetches that ONE day; `--from`/`--to` fetch a range; neither keeps
+ * the old rolling window, so the scheduled behaviour is unchanged. The window
+ * is logged either way, naming which of the three decided it.
+ */
+async function tradingviewBackfill(runId, args) {
   const symbols = await repo.activeSymbols(Number(process.env.HISTORY_MAX_SYMBOLS) || 500);
   if (!symbols.length) {
     log.warn('backfill: no symbols known yet — the live scraper must run first');
     return { extracted: 0, inserted: 0, rejected: 0 };
   }
-  const endDay = clock.tradingDay();
   const days = Number(process.env.HISTORY_DAYS) || 30;
   // P6-TV-9 · both ends in the SAME timezone. endDay is the Kuwait trading day
   // and startDay was a UTC slice, so near UTC midnight the window was a day
   // wider at one end than at the other.
-  const startDay = clock.tradingDay(new Date(Date.now() - days * 86400_000));
+  const rolling = {
+    startDay: clock.tradingDay(new Date(Date.now() - days * 86400_000)),
+    endDay: clock.tradingDay(),
+  };
+  const named = (() => {
+    if (args && args.date) return { startDay: args.date, endDay: args.date, why: `--date=${args.date}` };
+    if (args && (args.from || args.to)) {
+      return {
+        startDay: args.from || rolling.startDay,
+        endDay: args.to || rolling.endDay,
+        why: `--from=${args.from || '(rolling start)'} --to=${args.to || '(today)'}`,
+      };
+    }
+    return null;
+  })();
+  const { startDay, endDay } = named || rolling;
+  if (startDay > endDay) {
+    throw new Error(`backfill: ${named ? named.why : 'the rolling window'} gives an empty range `
+      + `(${startDay} > ${endDay}) — refusing rather than fetching nothing and reporting success`);
+  }
+  log.info('backfill: window', {
+    startDay, endDay, source: named ? named.why : `rolling ${days} days (no --date/--from/--to)`,
+  });
 
   const { rows, failures, skipped } = await workerHost.runScrape('tradingview.backfill', runId, {
     symbols, startDay, endDay,
@@ -798,6 +884,7 @@ const JOBS = {
   'daily.analysis': dailyAnalysis,
   'daily.instruments': refreshInstruments,
   'daily.symbolday': symbolDay,
+  'daily.minutesample': minuteSample,
   'daily.marketday': marketDay,
   'signals.fast': fastLoop,
   'signals.wakeup': wakeupScan,

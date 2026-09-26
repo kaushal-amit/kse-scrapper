@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         awsat / DirectFN — Order List → Server 1
 // @namespace    local.trading.tools
-// @version      2.8.1
+// @version      2.10.0
 // @description  Reads the Order List grid by cell-id and posts it to Server 1. No credentials leave the browser.
 // @match        *://*.awsatbroker.com/*
 // @match        *://awsatbroker.com/*
@@ -31,7 +31,7 @@
    * each, so a session went into diagnosing a bug that was already fixed.
    * A build that cannot identify itself is a build nobody can debug.
    */
-  var VERSION = '2.8.1';
+  var VERSION = '2.10.0';
 
   var SERVER = 'https://scrapper.99labs.space';   // Server 1
   var TOKEN  = 'trading';               // must equal INGEST_TOKEN
@@ -394,7 +394,33 @@
           // the column is narrow, and a truncated order id is a different id.
           var value = title || text;
           if (!value) return;
-          if (id === 'ordSts' && title && title !== text) rec.statusReason = title;
+          /*
+           * ─── THE STATUS IS THE SHORT WORD · THE REASON IS THE SENTENCE ────
+           *
+           * `value = title || text` below prefers the TITLE, because a
+           * truncated order id is a different id. For the STATUS cell that
+           * rule is exactly wrong: the title is the broker's full rejection
+           * sentence and the text is the status.
+           *
+           * Measured in public.awsat_order_obs over 14 sessions: 160 rows
+           * whose order_status is "(295): Trade Rule - Price limit exceeded.
+           * Price cannot be less than 237.0000", 156 of "(1296): Trade Rule -
+           * Order value must be more than Normal Market Size of 40624", 80 of
+           * "Insufficient funds! ( Your buying power '156.921' is less than
+           * the order value '159.95' KWD )". Every distinct message became its
+           * own status, so grouping orders by status was meaningless and a
+           * count of rejections could not be taken at all.
+           *
+           * So: the SHORT text is the status, the sentence goes to
+           * status_reason, and a status that is plainly a rejection is
+           * normalised to one word. The broker's own text is never discarded —
+           * it is put where a sentence belongs.
+           */
+          if (id === 'ordSts') {
+            if (title && title !== text) rec.statusReason = title;
+            rec.status = shortStatus(text, title);
+            return;
+          }
           var field = CELL_MAP[id];
           if (field) {
             if (rec[field] == null) { rec[field] = value; hits++; }
@@ -728,6 +754,47 @@
     }).catch(function () {});
   }
 
+
+  /*
+   * The broker's status vocabulary, reduced to something countable.
+   *
+   * Anything that is not one of the terminal's own short words is a REJECTION
+   * or a FAILED CANCEL wearing its message as a name. Two rules, both from the
+   * messages actually observed:
+   *
+   *   · a cancel that did not take  ->  'Cancel failed'
+   *   · anything else unrecognised  ->  'Rejected'
+   *
+   * The sentence itself always survives in status_reason, so nothing is lost
+   * by shortening this — and a status nobody can GROUP BY is a column that
+   * cannot answer "how many orders were rejected today", which is the only
+   * question it exists for.
+   *
+   * A word the terminal adds later falls through as 'Rejected' WITH its text
+   * beside it, which is visible and fixable. The alternative — passing an
+   * unknown word through as a status — is how this column filled with
+   * sentences in the first place.
+   */
+  var KNOWN_STATUS = [
+    'Queued', 'Filled', 'Partially Filled', 'Cancelled', 'Canceled', 'Expired',
+    'Partially Filled Canceled', 'Partially Filled Cancelled', 'Partially Filled Expired',
+    'Rejected', 'Pending', 'Sent To OMS New', 'Sent To OMS Cancel', 'Sent To OMS Replace',
+    'New', 'Replaced', 'Suspended',
+  ];
+  function shortStatus(text, title) {
+    var t = clean(text || '');
+    for (var i = 0; i < KNOWN_STATUS.length; i++) {
+      if (t.toLowerCase() === KNOWN_STATUS[i].toLowerCase()) return KNOWN_STATUS[i];
+    }
+    var all = (t + ' ' + clean(title || '')).toLowerCase();
+    if (!all.trim()) return null;
+    // A cancel the exchange refused is a different event from an order it
+    // refused: the order is still live, and treating it as Rejected would read
+    // as flat when it is not.
+    if (/cancel/.test(all) && /(fail|reject|refus|not\s+allow|unable)/.test(all)) return 'Cancel failed';
+    return 'Rejected';
+  }
+
   function toPayload(rec) {
     var sym = (rec.symbolRaw || '').split(/\s*-\s*/)[0].trim().toUpperCase() || null;
     var q = num(rec.quantity), f = num(rec.filled);
@@ -918,7 +985,41 @@
   // own after login instead of waiting for a manual tab switch.
   setTimeout(function () { if (!ordersWidget().widget) mountOrderList(); }, 4500);
 
+
+  /*
+   * ─── THE CAPTURE WINDOW · 08:40 to 13:20 KUWAIT ──────────────────────────
+   *
+   * No capture script used to stop when the market shut. On 24 September this
+   * one was still saving at 16:22 — the same shut board, every cycle, for
+   * three hours. The other end is worse: a pre-open capture carries NO session
+   * label and the PREVIOUS session's cumulative totals, which is how 20
+   * September stored 17 September's trades and volume for 79 of 140 symbols.
+   *
+   * The SERVER is the authority — it refuses an out-of-window batch by
+   * capturedAt and says why — so a stale copy of this script cannot put bad
+   * rows in the table. This guard is the other half: it stops the browser
+   * burning a cycle, a network round trip and a queue slot on a batch that is
+   * going to be refused.
+   */
+  var CAP_OPEN_MIN = 8 * 60 + 40;     // 08:40 Kuwait
+  var CAP_CLOSE_MIN = 13 * 60 + 20;   // 13:20 Kuwait — Close-Of-Day starts 13:15
+  function inCaptureWindow() {
+    var k = new Date(Date.now() + 3 * 3600 * 1000);   // Kuwait is UTC+3, no DST
+    var dow = k.getUTCDay();
+    if (dow === 5 || dow === 6) return false;         // Friday, Saturday: shut
+    var m = k.getUTCHours() * 60 + k.getUTCMinutes();
+    return m >= CAP_OPEN_MIN && m < CAP_CLOSE_MIN;
+  }
+  function windowNote() {
+    var k = new Date(Date.now() + 3 * 3600 * 1000);
+    var m = k.getUTCHours() * 60 + k.getUTCMinutes();
+    var dow = k.getUTCDay();
+    if (dow === 5 || dow === 6) return 'market shut (weekend) — not capturing';
+    return (m < CAP_OPEN_MIN ? 'before 08:40' : 'after 13:20') + ' Kuwait — not capturing';
+  }
+
   function tick() {
+    if (!inCaptureWindow()) { stats.msg = windowNote(); heartbeat(0, windowNote()); refresh(); return; }
     flush();
 
     readOrders(function (rows, problem) {
@@ -1004,17 +1105,65 @@
        * stats.shortBy is set when the grid's own row count exceeds what was
        * captured (see expectedRowCount).
        */
+      /*
+       * ─── A ROW WITHOUT THE BROKER'S ORDER NUMBER ─────────────────────────
+       *
+       * A row with NO id at all is never sent: it reconciles against nothing,
+       * cannot be matched to a fill, and arrives as a new order on every
+       * capture. That one is unambiguous.
+       *
+       * A row whose id was SYNTHESISED from symbol/side/price/quantity/stamp
+       * is NOT dropped, and this is deliberate. On 2 September the Order List
+       * grid lost its clOrdId column, this script kept a row only
+       * `if (rec.orderId)`, and orders went silent for SIX SESSIONS — the C1
+       * fix and test/suites/order-noid.test.js exist because of it. Dropping
+       * synthetic ids re-creates that outage exactly: when the column is
+       * renamed, EVERY row is synthetic, and the client would post nothing
+       * while reporting itself healthy.
+       *
+       * So they are sent, marked `synthetic: true` (they always were), and
+       * COUNTED here so the panel and the batch both say how many. Migration
+       * 046 is the guard on the other side: order_id may not be null or blank
+       * in the table. The two together are the honest pair — the database
+       * refuses what cannot be identified, and the client says out loud when
+       * the grid has stopped giving it ids.
+       */
+      var sendable = [], noId = 0, synthetic = 0;
+      rows.forEach(function (r) {
+        if (!r.orderId) { noId++; return; }
+        if (r.orderIdSynthetic) synthetic++;
+        sendable.push(r);
+      });
+      stats.noBrokerId = noId;
+      stats.syntheticIds = synthetic;
+      if (noId || synthetic) {
+        stats.msg = (noId ? noId + ' row(s) had NO order id and were not sent. ' : '')
+          + (synthetic ? synthetic + ' of ' + rows.length + ' id(s) SYNTHESISED — the grid\'s id '
+             + 'column may have been renamed again; these are sent and marked synthetic.' : '');
+      }
+
       var batch = {
         batchId: uuid(),
         capturedAt: new Date().toISOString(),
-        partial: stats.shortBy > 0,
-        orders: rows.map(toPayload),
+        /*
+         * A batch that dropped rows IS partial, whatever the scroll said: the
+         * server must not read it as a complete picture of the book and retire
+         * orders that are simply missing from it.
+         */
+        partial: stats.shortBy > 0 || noId > 0,
+        // Said on the batch as well as the panel: the server sees how many of
+        // these rows carry an id it can reconcile against.
+        syntheticIds: synthetic,
+        orders: sendable.map(toPayload),
       };
 
-      heartbeat(rows.length, null);       // alive, with rows — data POST follows
+      heartbeat(sendable.length, null);   // alive, with rows — data POST follows
       submit(batch).then(function (j) {
-        stats.posts++; stats.lastCount = rows.length;
-        stats.msg = 'sent ' + rows.length + ' → inserted ' + (j.inserted != null ? j.inserted : '?')
+        stats.posts++; stats.lastCount = sendable.length;
+        stats.msg = 'sent ' + sendable.length
+          + (noId ? ' (' + noId + ' with NO order id dropped)' : '')
+          + (synthetic ? ' (' + synthetic + ' synthesised)' : '')
+          + ' → inserted ' + (j.inserted != null ? j.inserted : '?')
           + (j.duplicate ? ' (duplicate replayed)' : '')
           + (j.rejected ? ', rejected ' + j.rejected : '');
       }).catch(function (e) {

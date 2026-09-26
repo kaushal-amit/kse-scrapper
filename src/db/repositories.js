@@ -589,7 +589,27 @@ async function recentRuns(limit = 10) {
   return rows;
 }
 
+/**
+ * 051 · which of these symbols ALREADY have a Close-Of-Day row for this day.
+ *
+ * The Close-Of-Day exemption admits the FIRST closing print per symbol per day
+ * past the 13:20 door; everything after it is the same shut board re-posted
+ * every minute — 17,640 rows on 24 September, until 16:22. Enforcing "first"
+ * at the door is one indexed query per late batch, and there are at most a
+ * handful of those a day.
+ */
+async function symbolsWithCloseOfDay(tradingDate, symbols) {
+  if (!symbols || !symbols.length) return [];
+  const { rows } = await query(
+    `SELECT DISTINCT symbol FROM awsat_market_quotes
+      WHERE trading_date = $1 AND session = 'Close-Of-Day'
+        AND upper(symbol) = ANY($2::text[])`,
+    [tradingDate, symbols.map((s) => String(s).toUpperCase())]);
+  return rows.map((r) => r.symbol);
+}
+
 module.exports = {
+  symbolsWithCloseOfDay,
   pool,
   upsertSymbols,
   startRun,

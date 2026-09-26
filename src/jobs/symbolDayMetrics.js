@@ -77,6 +77,8 @@ const TINY_SHARES = T.get('sig_tiny_trade_shares');
 const AT_OFFER_INVALIDATES_RATIO = T.get('sd_at_offer_invalidates_pct');
 const THIN_ABSOLUTE_MINUTES = T.get('sd_thin_absolute_minutes');
 const THIN_MEDIAN_FRACTION = T.get('sd_thin_median_fraction');
+const FULL_MIN_FRACTION = T.get('sd_full_min_fraction');
+const PARTIAL_MIN_FRACTION = T.get('sd_partial_min_fraction');
 const CRAWLER_MAX_PRICE = T.get('sd_crawler_max_price_fils');
 
 const n = (v) => {
@@ -614,35 +616,126 @@ function buySellRatio(movement) {
   return Number((movement.bought_at_offer / movement.sold_at_bid).toFixed(4));
 }
 
-/** Distinct minutes actually captured — the input to data_quality. */
-function minutesCaptured(rows) {
+/**
+ * Distinct minutes captured INSIDE THE CONTINUOUS SESSION — the input to
+ * data_quality and coverage_pct.
+ *
+ * ─── WHY THE WINDOW IS HERE AND NOT ONLY IN THE DENOMINATOR ────────────────
+ * A fraction needs both halves measured over the same window. This counted
+ * every captured minute from 08:40, and the denominator was about to become
+ * the 240-minute continuous session: 13 September then reads 259/240 = 108%.
+ * A coverage over 100% is not a rounding problem, it is two different
+ * questions divided by each other.
+ *
+ * It also makes the Close-Of-Day exemption safe. That row is INGESTED — the
+ * door lets the first terminal-label row through whenever it arrives, because
+ * the venue publishes it at 13:15 on a day we watch continuously and at 14:43
+ * on a day we do not — and EXCLUDED FROM THE COUNT here, because a print
+ * arriving after the bell does not lengthen the session it closes. Ingest door
+ * and measurement window are separate on purpose; see config.market.
+ *
+ * `bounds` is { startMinutes, endMinutes } in Kuwait local minutes-of-day.
+ * Kuwait is UTC+3 with no DST, so the conversion is a constant offset and a
+ * minute bucket is the same bucket in either zone.
+ */
+const KUWAIT_UTC_OFFSET_MINS = 180;
+
+function minutesCaptured(rows, bounds = null) {
+  const lo = bounds ? bounds.startMinutes : null;
+  const hi = bounds ? bounds.endMinutes : null;
   const minutes = new Set();
   for (const r of rows) {
     if (!r.created_at) continue;
-    minutes.add(new Date(r.created_at).toISOString().slice(0, 16));
+    const d = new Date(r.created_at);
+    if (lo != null && hi != null) {
+      const kwMins = (d.getUTCHours() * 60 + d.getUTCMinutes() + KUWAIT_UTC_OFFSET_MINS) % 1440;
+      // Half-open [open, close): 13:00 itself is the bell, not a traded minute.
+      if (kwMins < lo || kwMins >= hi) continue;
+    }
+    minutes.add(d.toISOString().slice(0, 16));
   }
   return minutes.size;
 }
 
 /**
- * FULL or THIN.
+ * ============================================================================
+ *  FULL · PARTIAL · THIN — rule 2 (049)
+ * ============================================================================
+ * The schema has allowed three values since migration 011 and 3,496 rows carry
+ * PARTIAL, but this function could only ever return two of them: the rule that
+ * wrote them exists in no commit on any branch. Rule 2 is a NEW rule, written
+ * deliberately rather than reconstructed — there is no old rule to reproduce,
+ * only its output, and anything tuned until it landed on 14 July's "133" would
+ * be back-fitted to the answer.
  *
- * The median is that DAY'S market median, not a fixed 270: capture length
- * varies market-wide (203 minutes on 26 August, 259 on the 25th), so a fixed
- * denominator would mark every symbol THIN on a short day. Self-calibrating
- * against the market means only symbols that fell behind THEIR OWN market are
- * flagged.
+ * ─── WHY THE DENOMINATOR CHANGED ───────────────────────────────────────────
+ * The old comment here argued for the day's own median over a fixed 270,
+ * because capture length varies market-wide. That is true and it is not what
+ * the median gives you. Dividing a day's capture length by that same day's
+ * capture length is self-referential: when capture dies early for EVERYONE,
+ * the median collapses with it, every symbol scores ~100%, and the fraction
+ * test cannot fire. Measured on `kse`:
  *
- * The absolute floor is the second half. Without it, a day where capture died
- * at 09:20 for everyone gives a tiny median and every symbol reads FULL against
- * a broken baseline.
+ *   20 Sep   188 minutes   coverage 100.0%   FULL      <- the outage day
+ *   15 Sep   233 minutes   coverage  86.3%   PARTIAL
+ *
+ * A shorter day scoring higher. The failure is one-directional and it hides
+ * the worst case: a partial outage is caught because the symbols disagree, a
+ * total outage is invisible because they all agree about being broken.
+ *
+ * `scheduledMinutes` is the day's SCHEDULED capture window, from
+ * public.market_session_hours via the calendar, falling back to the standard
+ * window in config. It cannot move with the data. A genuine half-day gets a
+ * row and a correct denominator rather than reading PARTIAL for ever — which
+ * is why this is the calendar and not a constant.
+ *
+ * ─── THE TWO OLDER TESTS ARE KEPT, DEMOTED ─────────────────────────────────
+ * The median test still catches what rule 2 cannot: ONE symbol falling behind
+ * a market that is otherwise fine. The absolute floor is now a true last
+ * resort rather than the only thing standing between a 188-minute session and
+ * the word FULL.
+ *
+ * @param {number}  minutes           distinct minutes captured for this symbol
+ * @param {number}  marketMedian      that day's median, for the per-symbol test
+ * @param {boolean} closeOfDay        whether the final print was captured
+ * @param {number|null} scheduledMinutes  the scheduled window; null = unknown
  */
-function dataQuality(minutes, marketMedian, closeOfDay) {
+function dataQuality(minutes, marketMedian, closeOfDay, scheduledMinutes = null) {
+  // The last resort, unchanged.
   if (minutes < THIN_ABSOLUTE_MINUTES) return 'THIN';
+  // One symbol behind its own market — the case a scheduled denominator cannot
+  // see, because the market was fine and this symbol was not.
   if (marketMedian && minutes < THIN_MEDIAN_FRACTION * marketMedian) return 'THIN';
+
+  /*
+   * RULE 2. Only when the scheduled window is known: a guessed denominator and
+   * a read one are not the same measurement, and inventing one here is how the
+   * self-referential median got in.
+   */
+  if (scheduledMinutes > 0) {
+    const frac = minutes / scheduledMinutes;
+    if (frac < PARTIAL_MIN_FRACTION) return 'THIN';
+    if (frac < FULL_MIN_FRACTION) return 'PARTIAL';
+  }
+
+  /*
+   * No Close-Of-Day print. This stays THIN rather than becoming PARTIAL: a
+   * session whose final print was never captured has no close, and every
+   * derivation that reaches for one — prev_close, chg_fils, the 5-day range —
+   * is reaching for something that does not exist. That is worse than a short
+   * session, not milder.
+   */
   if (!closeOfDay) return 'THIN';
   return 'FULL';
 }
+
+/**
+ * The rule that produced the labels above. Stored on every row this code
+ * writes, so the column can never again hold two generations of label with
+ * nothing telling them apart. NULL means rule 1 — unrecoverable, preserved,
+ * never overwritten.
+ */
+const QUALITY_RULE_VERSION = 2;
 
 /**
  * family — CRAWLER only.
@@ -696,4 +789,7 @@ module.exports = {
   AT_OFFER_INVALIDATES_RATIO,
   THIN_ABSOLUTE_MINUTES,
   THIN_MEDIAN_FRACTION,
+  FULL_MIN_FRACTION,
+  PARTIAL_MIN_FRACTION,
+  QUALITY_RULE_VERSION,
 };

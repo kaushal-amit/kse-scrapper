@@ -16,6 +16,26 @@ function run(file, html, ms = 9000) {
       { url: 'https://www.awsatbroker.com/', pretendToBeVisual: true });
     const w = dom.window;
     let posted = null;
+    /*
+     * ─── A MID-SESSION CLOCK, SUPPLIED ──────────────────────────────────────
+     *
+     * The capture scripts refuse to capture outside 08:40-13:20 Kuwait. With
+     * the real clock this suite would pass only between those hours and fail
+     * the rest of the day — a time-of-day-dependent gate, which is the class
+     * of flake this repository keeps removing. 10:00 Kuwait on Thursday 24
+     * September 2026, frozen, so the script's own guard is satisfied for a
+     * reason the test states rather than for the hour it happens to run at.
+     *
+     * test/suites/capture-window.test.js is where the guard's boundaries are
+     * asserted; here it is scenery.
+     */
+    const MID_SESSION = Date.UTC(2026, 8, 24, 7, 0, 0);   // 10:00 Kuwait
+    const RealDate = w.Date;
+    class FrozenDate extends RealDate {
+      constructor(...args) { super(...(args.length ? args : [MID_SESSION])); }
+      static now() { return MID_SESSION; }
+    }
+    w.Date = FrozenDate;
     w.crypto = { randomUUID: () => 'test-uuid' };
     w.fetch = (url, opts) => {
       if (/\/ingest\/orders/.test(url)) posted = { url, body: opts && opts.body ? JSON.parse(opts.body) : null };
@@ -27,8 +47,11 @@ function run(file, html, ms = 9000) {
     const guardInterval = (fn, d) => setInterval(() => { try { fn(); } catch (e) {} }, d);
     try {
       new Function('window', 'document', 'fetch', 'crypto', 'setTimeout', 'setInterval',
-        'clearInterval', 'MouseEvent', 'KeyboardEvent', 'Event', src)
-        (w, w.document, w.fetch, w.crypto, guard, guardInterval, clearInterval, w.MouseEvent, w.KeyboardEvent, w.Event);
+        // `Date` is INJECTED, not taken from the realm: the script reads the
+        // clock to decide whether it is inside the capture window, and without
+        // this it would read the machine's.
+        'clearInterval', 'MouseEvent', 'KeyboardEvent', 'Event', 'Date', src)
+        (w, w.document, w.fetch, w.crypto, guard, guardInterval, clearInterval, w.MouseEvent, w.KeyboardEvent, w.Event, FrozenDate);
     } catch (e) {}
     origTimeout(() => {
       const panel = w.document.body.querySelector('div[style*="2147483647"]');
